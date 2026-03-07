@@ -1,0 +1,16 @@
+services:
+  local-model-pro:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: local-model-pro
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEFAULT_MODEL: qwen2.5:7b
+      DEFAULT_TEMPERATURE: "0.2"
+      DEFAULT_NUM_CTX: "4096"
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

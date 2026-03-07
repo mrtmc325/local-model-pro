@@ -46,6 +46,26 @@ Environment variable overrides:
 - `DEFAULT_TEMPERATURE` (default: `0.2`)
 - `DEFAULT_NUM_CTX` (default: `4096`)
 
+## Run with Docker
+
+This setup runs `Local Model Pro` in a container and uses Ollama from your host machine.
+
+```bash
+docker compose up -d --build
+```
+
+Check health:
+
+```bash
+curl http://127.0.0.1:8765/health
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
 ## Run the terminal chat client
 
 In another terminal:
