@@ -34,6 +34,8 @@ def _print_help() -> None:
     print("Commands:")
     print("  /help              Show this help")
     print("  /model <name>      Switch model for this session")
+    print("  /web <on|off>      Enable or disable web assist for prompts")
+    print("  /search <query>    Run a direct web search")
     print("  /reset             Clear chat memory")
     print("  /status            Show server session status")
     print("  /exit              Quit")
@@ -50,13 +52,65 @@ async def _recv_json(ws: websockets.ClientConnection) -> dict[str, Any]:
     return json.loads(raw)
 
 
+def _print_web_results(msg: dict[str, Any]) -> None:
+    query = str(msg.get("query", "")).strip()
+    results = msg.get("results", [])
+    retrieved_at = str(msg.get("retrieved_at", "")).strip()
+    print(f"web> results for: {query}")
+    if retrieved_at:
+        print(f"web> retrieved_at: {retrieved_at}")
+    if not isinstance(results, list) or not results:
+        print("web> no results")
+        return
+    for idx, item in enumerate(results, start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip() or "(untitled)"
+        url = str(item.get("url", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
+        print(f"web> {idx}. {title}")
+        if url:
+            print(f"web>    {url}")
+        if snippet:
+            print(f"web>    {snippet}")
+
+
 async def _consume_status(ws: websockets.ClientConnection) -> None:
     while True:
         msg = await _recv_json(ws)
         msg_type = msg.get("type")
         if msg_type == "status":
-            print(f"status> model={msg.get('model')} messages={msg.get('message_count')}")
+            print(
+                "status> "
+                f"model={msg.get('model')} "
+                f"messages={msg.get('message_count')} "
+                f"web_assist={msg.get('web_assist_enabled')}"
+            )
             return
+        if msg_type == "web_mode":
+            print(f"web> enabled={msg.get('enabled')}")
+            continue
+        if msg_type == "web_results":
+            _print_web_results(msg)
+            continue
+        if msg_type == "info":
+            print(f"info> {msg.get('message')}")
+            continue
+        if msg_type == "error":
+            print(f"error> {msg.get('message')}")
+            return
+
+
+async def _consume_web_search(ws: websockets.ClientConnection) -> None:
+    while True:
+        msg = await _recv_json(ws)
+        msg_type = msg.get("type")
+        if msg_type == "web_results":
+            _print_web_results(msg)
+            return
+        if msg_type == "web_mode":
+            print(f"web> enabled={msg.get('enabled')}")
+            continue
         if msg_type == "info":
             print(f"info> {msg.get('message')}")
             continue
@@ -72,6 +126,15 @@ async def _consume_stream(ws: websockets.ClientConnection) -> None:
         msg_type = msg.get("type")
 
         if msg_type == "start":
+            continue
+        if msg_type == "web_results":
+            print("")
+            _print_web_results(msg)
+            print("ai> ", end="", flush=True)
+            continue
+        if msg_type == "web_mode":
+            print(f"\nweb> enabled={msg.get('enabled')}")
+            print("ai> ", end="", flush=True)
             continue
         if msg_type == "token":
             print(msg.get("text", ""), end="", flush=True)
@@ -110,10 +173,18 @@ async def run_cli(url: str, model: str | None, system_prompt: str | None) -> int
         while True:
             msg = await _recv_json(ws)
             if msg.get("type") == "ready":
-                print(f"ready> model={msg.get('model')}")
+                print(
+                    "ready> "
+                    f"model={msg.get('model')} "
+                    f"web_assist={msg.get('web_assist_enabled')}"
+                )
                 break
             if msg.get("type") == "info":
                 print(f"info> {msg.get('message')}")
+            elif msg.get("type") == "web_mode":
+                print(f"web> enabled={msg.get('enabled')}")
+            elif msg.get("type") == "web_results":
+                _print_web_results(msg)
             elif msg.get("type") == "error":
                 print(f"error> {msg.get('message')}")
 
@@ -146,6 +217,32 @@ async def run_cli(url: str, model: str | None, system_prompt: str | None) -> int
                 msg = await _recv_json(ws)
                 print(f"{msg.get('type')}> {msg.get('message')}")
                 continue
+            if user_input.startswith("/web"):
+                parts = shlex.split(user_input)
+                if len(parts) != 2 or parts[1] not in {"on", "off"}:
+                    print("error> usage: /web <on|off>")
+                    continue
+                await _send(ws, {"type": "set_web_mode", "enabled": parts[1] == "on"})
+                # Expect both web_mode and info payloads.
+                for _ in range(2):
+                    msg = await _recv_json(ws)
+                    msg_type = msg.get("type")
+                    if msg_type == "web_mode":
+                        print(f"web> enabled={msg.get('enabled')}")
+                    elif msg_type == "info":
+                        print(f"info> {msg.get('message')}")
+                    elif msg_type == "error":
+                        print(f"error> {msg.get('message')}")
+                continue
+            if user_input.startswith("/search"):
+                parts = shlex.split(user_input)
+                if len(parts) < 2:
+                    print("error> usage: /search <query>")
+                    continue
+                query = " ".join(parts[1:]).strip()
+                await _send(ws, {"type": "web_search", "query": query})
+                await _consume_web_search(ws)
+                continue
 
             await _send(ws, {"type": "chat", "prompt": user_input})
             await _consume_stream(ws)
@@ -166,4 +263,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

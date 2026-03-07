@@ -144,6 +144,21 @@ body {
   gap: 0.6rem;
 }
 
+.toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.86rem;
+  color: var(--muted);
+  user-select: none;
+}
+
+.toggle-inline input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #4bb38d;
+}
+
 .row {
   display: flex;
   gap: 0.55rem;
@@ -215,6 +230,10 @@ button:disabled {
 #refreshModelsBtn {
   padding: 0.42rem 0.7rem;
   font-size: 0.9rem;
+}
+
+#webSearchBtn {
+  white-space: nowrap;
 }
 
 #resetBtn {

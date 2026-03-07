@@ -9,11 +9,12 @@ It is designed for Apple Silicon setups (like MacBook Pro M1 Pro) using Ollama a
 - Built-in web frontend at `/` for browser chat
 - Downloaded-model picker powered by Ollama `/api/tags`
 - Browser_CLI_Pro-inspired shell/topbar/card layout and theme tokens
+- Built-in web search (`/api/web/search`) with optional web-assist mode for chat prompts
 - FastAPI WebSocket server (`/ws/chat`)
 - Streaming token relay from Ollama (`/api/chat`)
 - Per-connection conversation memory
 - Terminal prompt CLI client
-- Simple runtime commands (`/help`, `/model`, `/reset`, `/status`, `/exit`)
+- Simple runtime commands (`/help`, `/model`, `/web`, `/search`, `/reset`, `/status`, `/exit`)
 
 ## Prerequisites
 
@@ -48,6 +49,8 @@ Environment variable overrides:
 - `DEFAULT_MODEL` (default: `qwen2.5:7b`)
 - `DEFAULT_TEMPERATURE` (default: `0.2`)
 - `DEFAULT_NUM_CTX` (default: `4096`)
+- `WEB_SEARCH_MAX_RESULTS` (default: `5`, max `10`)
+- `WEB_ASSIST_DEFAULT` (default: `false`)
 
 ## Run with Docker
 
@@ -73,8 +76,10 @@ In the frontend:
 
 1. Click `Refresh` to load downloaded Ollama models.
 2. Select a model (or type a tag manually).
-3. Click `Connect`, then chat.
-4. Switch model at runtime with `Use Model`.
+3. Optional: toggle `Web Assist` to inject fresh web search context into each prompt.
+4. Click `Connect`, then chat.
+5. Switch model at runtime with `Use Model`.
+6. Use `Search Web` for direct web lookups without sending a chat prompt.
 
 Stop:
 
@@ -102,19 +107,23 @@ ai> ...
 
 Client -> server:
 
-- `{"type":"hello","model":"qwen2.5:7b","system_prompt":"...optional..."}`
+- `{"type":"hello","model":"qwen2.5:7b","system_prompt":"...optional...","web_assist_enabled":false}`
 - `{"type":"chat","prompt":"..."}`
 - `{"type":"set_model","model":"llama3.1:8b"}`
+- `{"type":"set_web_mode","enabled":true}`
+- `{"type":"web_search","query":"latest weather alert in vermont","max_results":5}`
 - `{"type":"reset"}`
 - `{"type":"status"}`
 
 Server -> client:
 
-- `{"type":"ready","session_id":"...","model":"..."}`
+- `{"type":"ready","session_id":"...","model":"...","web_assist_enabled":false}`
 - `{"type":"start","request_id":"..."}`
 - `{"type":"token","request_id":"...","text":"..."}`
-- `{"type":"done","request_id":"...","model":"..."}`
-- `{"type":"status","model":"...","message_count":N}`
+- `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false}`
+- `{"type":"status","model":"...","message_count":N,"web_assist_enabled":false}`
+- `{"type":"web_mode","enabled":true}`
+- `{"type":"web_results","query":"...","retrieved_at":"...","results":[...]}`
 - `{"type":"info","message":"..."}`
 - `{"type":"error","message":"..."}`
 
@@ -122,6 +131,7 @@ Server -> client:
 
 - `/` -> browser UI
 - `/api/models` -> models detected from local Ollama
+- `/api/web/search?q=<query>` -> direct web search results
 - `/api/service` -> service metadata
 
 ## Notes

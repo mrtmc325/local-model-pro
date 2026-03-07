@@ -48,6 +48,26 @@
             </div>
           </div>
 
+          <div class="field">
+            <div class="field-head">
+              <span>Web Assist</span>
+              <label class="toggle-inline" for="webAssistToggle">
+                <input id="webAssistToggle" type="checkbox" />
+                <span>Enable for chat</span>
+              </label>
+            </div>
+            <div class="row">
+              <input
+                id="webQueryInput"
+                type="text"
+                placeholder="Direct web search query..."
+                autocomplete="off"
+              />
+              <button id="webSearchBtn" type="button">Search Web</button>
+            </div>
+            <div id="webModeMeta" class="field-help">Web assist is off.</div>
+          </div>
+
           <div class="row actions">
             <button id="connectBtn" type="button">Connect</button>
             <button id="resetBtn" type="button">Reset Chat</button>

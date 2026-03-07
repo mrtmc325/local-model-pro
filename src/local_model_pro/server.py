@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import argparse
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from local_model_pro.config import settings
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
+from local_model_pro.web_search import WebSearchClient, WebSearchError, WebSearchResult
 
 app = FastAPI(title="Local Model Pro Server", version="0.1.0")
 
@@ -28,6 +31,7 @@ class ChatSession:
     session_id: str
     model: str
     system_prompt: str | None = None
+    web_assist_enabled: bool = settings.web_assist_default
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -45,8 +49,58 @@ def _safe_text(value: Any) -> str:
     return cleaned
 
 
+def _safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError("Expected a boolean.")
+
+
 async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(json.dumps(payload))
+
+
+def _serialize_web_results(results: list[WebSearchResult]) -> list[dict[str, str]]:
+    return [
+        {
+            "title": item.title,
+            "url": item.url,
+            "snippet": item.snippet,
+        }
+        for item in results
+    ]
+
+
+def _build_web_context(*, query: str, results: list[WebSearchResult]) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    lines = [
+        f"Web context retrieved at {timestamp} for query: {query}",
+        "Use the sources below for current facts. Prefer citing URLs in the answer.",
+    ]
+    for idx, item in enumerate(results, start=1):
+        lines.append(f"{idx}. {item.title}")
+        lines.append(f"   URL: {item.url}")
+        if item.snippet:
+            lines.append(f"   Snippet: {item.snippet}")
+    return "\n".join(lines)
+
+
+async def _run_web_search(
+    web_search: WebSearchClient,
+    *,
+    query: str,
+    max_results: int,
+) -> list[WebSearchResult]:
+    return await asyncio.to_thread(
+        web_search.search,
+        query=query,
+        max_results=max_results,
+    )
 
 
 @app.get("/")
@@ -63,11 +117,13 @@ async def service_info() -> dict[str, Any]:
             "health": "/health",
             "docs": "/docs",
             "models": "/api/models",
+            "web_search": "/api/web/search?q=<query>",
         },
         "websocket": {
             "chat": "/ws/chat",
         },
         "default_model": runtime_default_model,
+        "web_assist_default": settings.web_assist_default,
     }
 
 
@@ -90,12 +146,42 @@ async def list_models() -> dict[str, Any]:
     }
 
 
+@app.get("/api/web/search")
+async def web_search_http(q: str, max_results: int | None = None) -> dict[str, Any]:
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    limit = settings.web_search_max_results if max_results is None else max_results
+    limit = max(1, min(limit, 10))
+    web_search = WebSearchClient()
+    try:
+        results = await _run_web_search(web_search, query=query, max_results=limit)
+    except WebSearchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {
+        "query": query,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "results": _serialize_web_results(results),
+    }
+
+
 @app.get("/ws/chat")
 async def chat_ws_http_hint() -> dict[str, Any]:
     return {
         "detail": "This path expects a WebSocket upgrade.",
         "how_to_connect": "Use a WebSocket client to ws://127.0.0.1:8765/ws/chat",
         "cli_client": "local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b",
+        "message_types": [
+            "hello",
+            "chat",
+            "set_model",
+            "status",
+            "reset",
+            "set_web_mode",
+            "web_search",
+        ],
     }
 
 
@@ -107,6 +193,7 @@ async def chat_ws(websocket: WebSocket) -> None:
         model=runtime_default_model,
     )
     ollama = OllamaClient(base_url=runtime_ollama_base_url)
+    web_search = WebSearchClient()
     await _send_json(
         websocket,
         {
@@ -116,7 +203,12 @@ async def chat_ws(websocket: WebSocket) -> None:
     )
     await _send_json(
         websocket,
-        {"type": "ready", "session_id": session.session_id, "model": session.model},
+        {
+            "type": "ready",
+            "session_id": session.session_id,
+            "model": session.model,
+            "web_assist_enabled": session.web_assist_enabled,
+        },
     )
 
     try:
@@ -137,12 +229,19 @@ async def chat_ws(websocket: WebSocket) -> None:
                 if isinstance(system_prompt, str) and system_prompt.strip():
                     session.system_prompt = system_prompt.strip()
                     session.reset()
+                if "web_assist_enabled" in incoming:
+                    try:
+                        session.web_assist_enabled = _safe_bool(incoming.get("web_assist_enabled"))
+                    except ValueError as exc:
+                        await _send_json(websocket, {"type": "error", "message": str(exc)})
+                        continue
                 await _send_json(
                     websocket,
                     {
                         "type": "ready",
                         "session_id": session.session_id,
                         "model": session.model,
+                        "web_assist_enabled": session.web_assist_enabled,
                     },
                 )
                 continue
@@ -154,6 +253,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "type": "status",
                         "model": session.model,
                         "message_count": len(session.messages),
+                        "web_assist_enabled": session.web_assist_enabled,
                     },
                 )
                 continue
@@ -165,6 +265,67 @@ async def chat_ws(websocket: WebSocket) -> None:
                     await _send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
                 await _send_json(websocket, {"type": "info", "message": f"Model set to {session.model}"})
+                continue
+
+            if msg_type == "set_web_mode":
+                try:
+                    session.web_assist_enabled = _safe_bool(incoming.get("enabled"))
+                except ValueError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "web_mode",
+                        "enabled": session.web_assist_enabled,
+                    },
+                )
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "info",
+                        "message": (
+                            "Web assist enabled for chat prompts."
+                            if session.web_assist_enabled
+                            else "Web assist disabled."
+                        ),
+                    },
+                )
+                continue
+
+            if msg_type == "web_search":
+                try:
+                    query = _safe_text(incoming.get("query"))
+                except ValueError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                raw_limit = incoming.get("max_results")
+                if raw_limit is None:
+                    max_results = settings.web_search_max_results
+                elif isinstance(raw_limit, int):
+                    max_results = raw_limit
+                else:
+                    await _send_json(websocket, {"type": "error", "message": "max_results must be an integer."})
+                    continue
+                max_results = max(1, min(max_results, 10))
+                try:
+                    results = await _run_web_search(
+                        web_search,
+                        query=query,
+                        max_results=max_results,
+                    )
+                except WebSearchError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "web_results",
+                        "query": query,
+                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                        "results": _serialize_web_results(results),
+                    },
+                )
                 continue
 
             if msg_type == "reset":
@@ -187,13 +348,52 @@ async def chat_ws(websocket: WebSocket) -> None:
 
             request_id = str(uuid.uuid4())
             session.messages.append({"role": "user", "content": prompt})
+            model_messages = list(session.messages)
+
+            if session.web_assist_enabled:
+                try:
+                    web_results = await _run_web_search(
+                        web_search,
+                        query=prompt,
+                        max_results=settings.web_search_max_results,
+                    )
+                except WebSearchError as exc:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "info",
+                            "message": f"Web assist unavailable, continuing without web context: {exc}",
+                        },
+                    )
+                else:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "web_results",
+                            "query": prompt,
+                            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                            "results": _serialize_web_results(web_results),
+                            "request_id": request_id,
+                        },
+                    )
+                    history_without_latest = session.messages[:-1]
+                    latest_user_message = session.messages[-1]
+                    model_messages = [
+                        *history_without_latest,
+                        {
+                            "role": "system",
+                            "content": _build_web_context(query=prompt, results=web_results),
+                        },
+                        latest_user_message,
+                    ]
+
             await _send_json(websocket, {"type": "start", "request_id": request_id})
 
             assistant_chunks: list[str] = []
             try:
                 async for chunk in ollama.stream_chat(
                     model=session.model,
-                    messages=session.messages,
+                    messages=model_messages,
                     temperature=settings.default_temperature,
                     num_ctx=settings.default_num_ctx,
                 ):
@@ -224,6 +424,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     "type": "done",
                     "request_id": request_id,
                     "model": session.model,
+                    "web_assist_enabled": session.web_assist_enabled,
                 },
             )
     except WebSocketDisconnect:

@@ -4,6 +4,10 @@ const modelListMeta = document.getElementById("modelListMeta");
 const customModelInput = document.getElementById("customModelInput");
 const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
+const webAssistToggle = document.getElementById("webAssistToggle");
+const webQueryInput = document.getElementById("webQueryInput");
+const webSearchBtn = document.getElementById("webSearchBtn");
+const webModeMeta = document.getElementById("webModeMeta");
 const connectBtn = document.getElementById("connectBtn");
 const resetBtn = document.getElementById("resetBtn");
 const activeModelLabel = document.getElementById("activeModelLabel");
@@ -20,6 +24,7 @@ const state = {
   assistantEl: null,
   currentModel: null,
   availableModels: [],
+  webAssistEnabled: false,
 };
 
 function wsUrl() {
@@ -39,6 +44,45 @@ function bytesToHuman(value) {
     unit += 1;
   }
   return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function webResultsToText(msg) {
+  const query = String(msg.query || "").trim();
+  const retrievedAt = String(msg.retrieved_at || "").trim();
+  const lines = [];
+  if (query) {
+    lines.push(`Web results for: ${query}`);
+  }
+  if (retrievedAt) {
+    lines.push(`Retrieved: ${retrievedAt}`);
+  }
+  const results = Array.isArray(msg.results) ? msg.results : [];
+  if (results.length === 0) {
+    lines.push("No results returned.");
+  } else {
+    results.forEach((item, idx) => {
+      if (!item || typeof item !== "object") {
+        return;
+      }
+      const title = String(item.title || "").trim() || "(untitled)";
+      const url = String(item.url || "").trim();
+      const snippet = String(item.snippet || "").trim();
+      lines.push(`${idx + 1}. ${title}`);
+      if (url) {
+        lines.push(url);
+      }
+      if (snippet) {
+        lines.push(snippet);
+      }
+    });
+  }
+  return lines.join("\n");
+}
+
+function updateWebModeMeta() {
+  webModeMeta.textContent = state.webAssistEnabled
+    ? "Web assist is on. Each chat prompt can include fresh web context."
+    : "Web assist is off.";
 }
 
 function normalizeModelEntry(entry) {
@@ -146,6 +190,7 @@ function setBusy(busy) {
   state.inflight = busy;
   sendBtn.disabled = busy || !state.connected;
   promptInput.disabled = !state.connected;
+  webSearchBtn.disabled = busy || !state.connected;
 }
 
 function selectedModel() {
@@ -229,7 +274,11 @@ function connectWs() {
   ws.onopen = () => {
     setStatus(true, "connected");
     state.connected = true;
-    sendWs({ type: "hello", model });
+    sendWs({
+      type: "hello",
+      model,
+      web_assist_enabled: state.webAssistEnabled,
+    });
     addMessage("system", `Connected. Requested model: ${model}`);
   };
 
@@ -266,8 +315,25 @@ function connectWs() {
         }
         renderModelOptions(modelName);
       }
+      if (typeof message.web_assist_enabled === "boolean") {
+        state.webAssistEnabled = message.web_assist_enabled;
+        webAssistToggle.checked = state.webAssistEnabled;
+        updateWebModeMeta();
+      }
       updateActiveModelLabel(modelName);
       setBusy(false);
+      return;
+    }
+
+    if (msgType === "web_mode") {
+      state.webAssistEnabled = Boolean(message.enabled);
+      webAssistToggle.checked = state.webAssistEnabled;
+      updateWebModeMeta();
+      return;
+    }
+
+    if (msgType === "web_results") {
+      addMessage("system", webResultsToText(message));
       return;
     }
 
@@ -328,6 +394,36 @@ function applyModel() {
   }
 }
 
+function sendWebSearch() {
+  if (!state.connected) {
+    addMessage("system", "Connect first.");
+    return;
+  }
+  const query = webQueryInput.value.trim();
+  if (!query) {
+    addMessage("system", "Enter a web search query.");
+    return;
+  }
+  try {
+    sendWs({ type: "web_search", query });
+  } catch (error) {
+    addMessage("system", `Web search failed: ${error.message}`);
+  }
+}
+
+function toggleWebAssist() {
+  state.webAssistEnabled = webAssistToggle.checked;
+  updateWebModeMeta();
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({ type: "set_web_mode", enabled: state.webAssistEnabled });
+  } catch (error) {
+    addMessage("system", `Web assist update failed: ${error.message}`);
+  }
+}
+
 function resetConversation() {
   chatLog.innerHTML = "";
   state.assistantEl = null;
@@ -367,6 +463,8 @@ function sendPrompt(event) {
 connectBtn.addEventListener("click", connectWs);
 refreshModelsBtn.addEventListener("click", loadModels);
 applyModelBtn.addEventListener("click", applyModel);
+webSearchBtn.addEventListener("click", sendWebSearch);
+webAssistToggle.addEventListener("change", toggleWebAssist);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
 modelFilterInput.addEventListener("input", () => renderModelOptions());
@@ -393,10 +491,18 @@ promptInput.addEventListener("keydown", (event) => {
   }
 });
 
+webQueryInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    sendWebSearch();
+  }
+});
+
 window.addEventListener("beforeunload", () => {
   closeWs();
 });
 
 setStatus(false, "offline");
 setBusy(false);
+updateWebModeMeta();
 loadModels();
