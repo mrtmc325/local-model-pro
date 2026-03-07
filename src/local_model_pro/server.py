@@ -4,10 +4,13 @@ import argparse
 import json
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from local_model_pro.config import settings
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
@@ -16,6 +19,8 @@ app = FastAPI(title="Local Model Pro Server", version="0.1.0")
 
 runtime_default_model = settings.default_model
 runtime_ollama_base_url = settings.ollama_base_url
+static_dir = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 @dataclass
@@ -45,13 +50,19 @@ async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
 
 
 @app.get("/")
-async def root() -> dict[str, Any]:
+async def root() -> FileResponse:
+    return FileResponse(static_dir / "index.html")
+
+
+@app.get("/api/service")
+async def service_info() -> dict[str, Any]:
     return {
         "service": "Local Model Pro",
         "status": "online",
         "http": {
             "health": "/health",
             "docs": "/docs",
+            "models": "/api/models",
         },
         "websocket": {
             "chat": "/ws/chat",
@@ -63,6 +74,20 @@ async def root() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/models")
+async def list_models() -> dict[str, Any]:
+    ollama = OllamaClient(base_url=runtime_ollama_base_url)
+    try:
+        models = await ollama.list_models()
+    except OllamaStreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {
+        "default_model": runtime_default_model,
+        "models": models,
+    }
 
 
 @app.get("/ws/chat")

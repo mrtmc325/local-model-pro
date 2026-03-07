@@ -6,6 +6,9 @@ It is designed for Apple Silicon setups (like MacBook Pro M1 Pro) using Ollama a
 
 ## Features
 
+- Built-in web frontend at `/` for browser chat
+- Downloaded-model picker powered by Ollama `/api/tags`
+- Browser_CLI_Pro-inspired shell/topbar/card layout and theme tokens
 - FastAPI WebSocket server (`/ws/chat`)
 - Streaming token relay from Ollama (`/api/chat`)
 - Per-connection conversation memory
@@ -60,6 +63,19 @@ Check health:
 curl http://127.0.0.1:8765/health
 ```
 
+Open the frontend:
+
+```bash
+open http://127.0.0.1:8765/
+```
+
+In the frontend:
+
+1. Click `Refresh` to load downloaded Ollama models.
+2. Select a model (or type a tag manually).
+3. Click `Connect`, then chat.
+4. Switch model at runtime with `Use Model`.
+
 Stop:
 
 ```bash
@@ -101,6 +117,12 @@ Server -> client:
 - `{"type":"status","model":"...","message_count":N}`
 - `{"type":"info","message":"..."}`
 - `{"type":"error","message":"..."}`
+
+## Frontend Endpoints
+
+- `/` -> browser UI
+- `/api/models` -> models detected from local Ollama
+- `/api/service` -> service metadata
 
 ## Notes
 

@@ -20,6 +20,44 @@ class OllamaClient:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
+    async def list_models(self) -> list[dict[str, Any]]:
+        url = f"{self._base_url}/api/tags"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url)
+
+        if response.status_code != 200:
+            raise OllamaStreamError(
+                f"Ollama error {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise OllamaStreamError("Invalid JSON payload from Ollama /api/tags") from exc
+
+        raw_models = payload.get("models", [])
+        if not isinstance(raw_models, list):
+            raise OllamaStreamError("Unexpected /api/tags payload shape: expected 'models' list")
+
+        models: list[dict[str, Any]] = []
+        for item in raw_models:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            models.append(
+                {
+                    "name": name.strip(),
+                    "size": item.get("size"),
+                    "modified_at": item.get("modified_at"),
+                    "digest": item.get("digest"),
+                }
+            )
+
+        return models
+
     async def stream_chat(
         self,
         *,
@@ -64,4 +102,3 @@ class OllamaClient:
 
                     if item.get("done", False):
                         break
-
