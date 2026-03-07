@@ -44,6 +44,22 @@ async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(json.dumps(payload))
 
 
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {
+        "service": "Local Model Pro",
+        "status": "online",
+        "http": {
+            "health": "/health",
+            "docs": "/docs",
+        },
+        "websocket": {
+            "chat": "/ws/chat",
+        },
+        "default_model": runtime_default_model,
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
