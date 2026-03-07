@@ -19,7 +19,7 @@ It is designed for Apple Silicon setups (like MacBook Pro M1 Pro) using Ollama a
 3. A local model pulled in Ollama, for example:
 
 ```bash
-ollama pull qwen2.5:7b-instruct
+ollama pull qwen2.5:7b
 ```
 
 ## Install
@@ -36,13 +36,13 @@ pip install -e .
 
 ```bash
 source .venv/bin/activate
-local-model-pro-server --host 127.0.0.1 --port 8765 --model qwen2.5:7b-instruct
+local-model-pro-server --host 127.0.0.1 --port 8765 --model qwen2.5:7b
 ```
 
 Environment variable overrides:
 
 - `OLLAMA_BASE_URL` (default: `http://127.0.0.1:11434`)
-- `DEFAULT_MODEL` (default: `qwen2.5:7b-instruct`)
+- `DEFAULT_MODEL` (default: `qwen2.5:7b`)
 - `DEFAULT_TEMPERATURE` (default: `0.2`)
 - `DEFAULT_NUM_CTX` (default: `4096`)
 
@@ -52,7 +52,7 @@ In another terminal:
 
 ```bash
 source .venv/bin/activate
-local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b-instruct
+local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b
 ```
 
 Then chat:
@@ -66,7 +66,7 @@ ai> ...
 
 Client -> server:
 
-- `{"type":"hello","model":"qwen2.5:7b-instruct","system_prompt":"...optional..."}`
+- `{"type":"hello","model":"qwen2.5:7b","system_prompt":"...optional..."}`
 - `{"type":"chat","prompt":"..."}`
 - `{"type":"set_model","model":"llama3.1:8b"}`
 - `{"type":"reset"}`
