@@ -115,7 +115,10 @@ body {
   display: grid;
   grid-template-rows: auto 1fr auto;
   gap: 0.65rem;
-  min-height: 680px;
+  height: clamp(520px, 74vh, 860px);
+  min-height: 0;
+  max-height: 860px;
+  overflow: hidden;
 }
 
 .panel h2,
@@ -207,6 +210,7 @@ button:disabled {
 .chat-log {
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 0.35rem;
   border-radius: 0.75rem;
   border: 1px solid var(--border-subtle);
@@ -220,6 +224,8 @@ button:disabled {
   padding: 0.58rem 0.72rem;
   border-radius: 0.65rem;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   line-height: 1.4;
 }
 
@@ -252,6 +258,8 @@ button:disabled {
 #promptInput {
   min-height: 76px;
   resize: vertical;
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 @media (max-width: 1024px) {
@@ -260,7 +268,8 @@ button:disabled {
   }
 
   .terminal-section {
-    min-height: 540px;
+    height: clamp(480px, 70vh, 720px);
+    max-height: 720px;
   }
 }
 
