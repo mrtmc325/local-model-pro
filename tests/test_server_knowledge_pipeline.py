@@ -37,7 +37,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                 fallback=False,
             )
 
-        async def fake_search_memory(self, *, query: str) -> list[MemoryResult]:  # type: ignore[no-untyped-def]
+        async def fake_search_memory(self, *, query: str, query_plan: QueryPlan | None = None) -> list[MemoryResult]:  # type: ignore[no-untyped-def]
+            _ = query_plan
             calls.append("search_memory")
             return [
                 MemoryResult(

@@ -204,7 +204,10 @@ async def _resolve_assist(
         },
     )
 
-    memory_results = await knowledge.search_memory(query=memory_query)
+    memory_results = await knowledge.search_memory(
+        query=memory_query,
+        query_plan=query_plan,
+    )
     await _send_json(
         websocket,
         {

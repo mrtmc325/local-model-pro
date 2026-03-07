@@ -57,6 +57,28 @@ class RecursivePlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.db_query, "earthquake preparedness go-bag essentials")
         self.assertEqual(plan.web_query, "FEMA earthquake emergency kit checklist 2026")
 
+    async def test_sql_like_query_is_sanitized_to_natural_language(self) -> None:
+        settings = Settings(knowledge_recursion_passes=2)
+        planner = RecursivePlanner(
+            settings=settings,
+            ollama=_FakeOllama(
+                [
+                    '{"reason":"Lookup prior memory","meaning":"Find statement about operator and Katie","purpose":"Recover context from memory"}',
+                    "{\"db_query\":\"SELECT * FROM memories WHERE name = 'Katie'\",\"web_query\":\"SELECT * FROM memories WHERE name = 'Katie'\"}",
+                ]
+            ),
+        )
+
+        plan = await planner.build_plan(
+            prompt="what did my operator say about katie",
+            history=[],
+            model="qwen2.5:7b",
+        )
+
+        self.assertNotIn("SELECT", plan.db_query.upper())
+        self.assertNotIn("SELECT", plan.web_query.upper())
+        self.assertIn("Find statement", plan.db_query)
+
 
 if __name__ == "__main__":
     unittest.main()

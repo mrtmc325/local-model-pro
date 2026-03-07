@@ -21,6 +21,16 @@ class StoredInsight:
     created_at: str
 
 
+@dataclass(frozen=True)
+class StoredTurn:
+    session_id: str
+    speaker: str
+    content: str
+    created_at: str
+    request_id: str | None
+    model: str | None
+
+
 class ConversationStore:
     def __init__(self, *, db_path: str) -> None:
         self._db_path = Path(db_path).expanduser().resolve()
@@ -168,6 +178,86 @@ class ConversationStore:
                 (session_id, use_limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def search_insights_by_terms(
+        self,
+        *,
+        terms: list[str],
+        limit: int = 20,
+    ) -> list[StoredInsight]:
+        normalized_terms = [
+            term.strip().lower()
+            for term in terms
+            if isinstance(term, str) and len(term.strip()) >= 2
+        ]
+        if not normalized_terms:
+            return []
+        use_limit = max(1, min(limit, 200))
+        clauses = " OR ".join(["lower(insight) LIKE ?"] * len(normalized_terms))
+        params = [f"%{term}%" for term in normalized_terms]
+        params.append(use_limit)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT insight_id, session_id, speaker, insight, created_at
+                FROM chat_insights
+                WHERE {clauses}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            StoredInsight(
+                insight_id=str(row["insight_id"]),
+                session_id=str(row["session_id"]),
+                speaker=str(row["speaker"]),
+                insight=str(row["insight"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def search_turns_by_terms(
+        self,
+        *,
+        terms: list[str],
+        limit: int = 20,
+    ) -> list[StoredTurn]:
+        normalized_terms = [
+            term.strip().lower()
+            for term in terms
+            if isinstance(term, str) and len(term.strip()) >= 2
+        ]
+        if not normalized_terms:
+            return []
+        use_limit = max(1, min(limit, 200))
+        clauses = " OR ".join(["lower(content) LIKE ?"] * len(normalized_terms))
+        params = [f"%{term}%" for term in normalized_terms]
+        params.append(use_limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT session_id, speaker, content, created_at, request_id, model
+                FROM chat_turns
+                WHERE speaker IN ('me', 'you') AND ({clauses})
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            StoredTurn(
+                session_id=str(row["session_id"]),
+                speaker=str(row["speaker"]),
+                content=str(row["content"]),
+                created_at=str(row["created_at"]),
+                request_id=str(row["request_id"]) if row["request_id"] else None,
+                model=str(row["model"]) if row["model"] else None,
+            )
+            for row in rows
+        ]
 
     def close(self) -> None:
         with self._lock:
