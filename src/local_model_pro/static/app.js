@@ -4,6 +4,8 @@ const modelListMeta = document.getElementById("modelListMeta");
 const customModelInput = document.getElementById("customModelInput");
 const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
+const knowledgeAssistToggle = document.getElementById("knowledgeAssistToggle");
+const knowledgeModeMeta = document.getElementById("knowledgeModeMeta");
 const webAssistToggle = document.getElementById("webAssistToggle");
 const webQueryInput = document.getElementById("webQueryInput");
 const webSearchBtn = document.getElementById("webSearchBtn");
@@ -25,6 +27,7 @@ const state = {
   currentModel: null,
   availableModels: [],
   webAssistEnabled: false,
+  knowledgeAssistEnabled: true,
 };
 
 function wsUrl() {
@@ -44,6 +47,40 @@ function bytesToHuman(value) {
     unit += 1;
   }
   return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function queryPlanToText(msg) {
+  const lines = ["Recursive query plan:"];
+  lines.push(`reason: ${String(msg.reason || "").trim()}`);
+  lines.push(`meaning: ${String(msg.meaning || "").trim()}`);
+  lines.push(`purpose: ${String(msg.purpose || "").trim()}`);
+  lines.push(`db_query: ${String(msg.db_query || "").trim()}`);
+  lines.push(`web_query: ${String(msg.web_query || "").trim()}`);
+  return lines.join("\n");
+}
+
+function memoryResultsToText(msg) {
+  const query = String(msg.query || "").trim();
+  const lines = [];
+  if (query) {
+    lines.push(`Memory results for: ${query}`);
+  }
+  const results = Array.isArray(msg.results) ? msg.results : [];
+  if (results.length === 0) {
+    lines.push("No memory results returned.");
+  } else {
+    results.forEach((item, idx) => {
+      if (!item || typeof item !== "object") {
+        return;
+      }
+      const insight = String(item.insight || "").trim() || "(empty insight)";
+      const score = Number(item.score || 0).toFixed(3);
+      const source = String(item.source_session || "").trim() || "unknown";
+      lines.push(`${idx + 1}. ${insight}`);
+      lines.push(`score=${score} session=${source}`);
+    });
+  }
+  return lines.join("\n");
 }
 
 function webResultsToText(msg) {
@@ -83,6 +120,12 @@ function updateWebModeMeta() {
   webModeMeta.textContent = state.webAssistEnabled
     ? "Web assist is on. Each chat prompt can include fresh web context."
     : "Web assist is off.";
+}
+
+function updateKnowledgeModeMeta() {
+  knowledgeModeMeta.textContent = state.knowledgeAssistEnabled
+    ? "Knowledge assist is on. Prompts are recursively broken down before memory/web lookup."
+    : "Knowledge assist is off.";
 }
 
 function normalizeModelEntry(entry) {
@@ -278,6 +321,7 @@ function connectWs() {
       type: "hello",
       model,
       web_assist_enabled: state.webAssistEnabled,
+      knowledge_assist_enabled: state.knowledgeAssistEnabled,
     });
     addMessage("system", `Connected. Requested model: ${model}`);
   };
@@ -320,6 +364,11 @@ function connectWs() {
         webAssistToggle.checked = state.webAssistEnabled;
         updateWebModeMeta();
       }
+      if (typeof message.knowledge_assist_enabled === "boolean") {
+        state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
+        knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
+        updateKnowledgeModeMeta();
+      }
       updateActiveModelLabel(modelName);
       setBusy(false);
       return;
@@ -329,6 +378,23 @@ function connectWs() {
       state.webAssistEnabled = Boolean(message.enabled);
       webAssistToggle.checked = state.webAssistEnabled;
       updateWebModeMeta();
+      return;
+    }
+
+    if (msgType === "knowledge_mode") {
+      state.knowledgeAssistEnabled = Boolean(message.enabled);
+      knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
+      updateKnowledgeModeMeta();
+      return;
+    }
+
+    if (msgType === "query_plan") {
+      addMessage("system", queryPlanToText(message));
+      return;
+    }
+
+    if (msgType === "memory_results") {
+      addMessage("system", memoryResultsToText(message));
       return;
     }
 
@@ -358,6 +424,16 @@ function connectWs() {
       if (message.model) {
         state.currentModel = String(message.model);
         updateActiveModelLabel(state.currentModel);
+      }
+      if (typeof message.web_assist_enabled === "boolean") {
+        state.webAssistEnabled = message.web_assist_enabled;
+        webAssistToggle.checked = state.webAssistEnabled;
+        updateWebModeMeta();
+      }
+      if (typeof message.knowledge_assist_enabled === "boolean") {
+        state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
+        knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
+        updateKnowledgeModeMeta();
       }
       return;
     }
@@ -424,6 +500,19 @@ function toggleWebAssist() {
   }
 }
 
+function toggleKnowledgeAssist() {
+  state.knowledgeAssistEnabled = knowledgeAssistToggle.checked;
+  updateKnowledgeModeMeta();
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({ type: "set_knowledge_mode", enabled: state.knowledgeAssistEnabled });
+  } catch (error) {
+    addMessage("system", `Knowledge assist update failed: ${error.message}`);
+  }
+}
+
 function resetConversation() {
   chatLog.innerHTML = "";
   state.assistantEl = null;
@@ -465,6 +554,7 @@ refreshModelsBtn.addEventListener("click", loadModels);
 applyModelBtn.addEventListener("click", applyModel);
 webSearchBtn.addEventListener("click", sendWebSearch);
 webAssistToggle.addEventListener("change", toggleWebAssist);
+knowledgeAssistToggle.addEventListener("change", toggleKnowledgeAssist);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
 modelFilterInput.addEventListener("input", () => renderModelOptions());
@@ -473,7 +563,6 @@ modelSelect.addEventListener("change", () => {
   renderModelOptions(modelSelect.value);
 });
 
-// Prevent accidental model changes when scrolling over the list without focused intent.
 modelSelect.addEventListener(
   "wheel",
   (event) => {
@@ -505,4 +594,5 @@ window.addEventListener("beforeunload", () => {
 setStatus(false, "offline");
 setBusy(false);
 updateWebModeMeta();
+updateKnowledgeModeMeta();
 loadModels();

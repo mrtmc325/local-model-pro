@@ -9,8 +9,32 @@ services:
       DEFAULT_MODEL: qwen2.5:7b
       DEFAULT_TEMPERATURE: "0.2"
       DEFAULT_NUM_CTX: "4096"
+      WEB_ASSIST_DEFAULT: "false"
+      KNOWLEDGE_ASSIST_DEFAULT: "true"
+      KNOWLEDGE_RECURSION_PASSES: "3"
+      SQLITE_DB_PATH: /data/local_model_pro.db
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: local_model_pro_insights
+      EMBEDDING_MODEL: nomic-embed-text
     ports:
       - "8765:8765"
     restart: unless-stopped
+    depends_on:
+      - qdrant
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - local_model_pro_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    container_name: local-model-pro-qdrant
+    ports:
+      - "6333:6333"
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  local_model_pro_data:
+  qdrant_storage:
