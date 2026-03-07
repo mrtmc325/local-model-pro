@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-model-pro"
+version = "0.1.0"
+description = "Local Model Pro: WebSocket chat framework for small Ollama models with a terminal CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0,<1.0.0",
+  "uvicorn>=0.35.0,<1.0.0",
+  "httpx>=0.28.0,<1.0.0",
+  "websockets>=15.0.0,<16.0.0",
+]
+
+[project.scripts]
+local-model-pro-server = "local_model_pro.server:main"
+local-model-pro-cli = "local_model_pro.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
