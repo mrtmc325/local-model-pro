@@ -65,6 +65,15 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/ws/chat")
+async def chat_ws_http_hint() -> dict[str, Any]:
+    return {
+        "detail": "This path expects a WebSocket upgrade.",
+        "how_to_connect": "Use a WebSocket client to ws://127.0.0.1:8765/ws/chat",
+        "cli_client": "local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b",
+    }
+
+
 @app.websocket("/ws/chat")
 async def chat_ws(websocket: WebSocket) -> None:
     await websocket.accept()
