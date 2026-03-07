@@ -22,8 +22,14 @@
 
           <div class="field">
             <span>Downloaded models</span>
-            <div class="row">
-              <select id="modelSelect"></select>
+            <input
+              id="modelFilterInput"
+              type="text"
+              placeholder="Filter models..."
+              autocomplete="off"
+            />
+            <div class="row model-list-row">
+              <select id="modelSelect" size="9" aria-label="Downloaded models"></select>
               <button id="refreshModelsBtn" type="button">Refresh</button>
             </div>
           </div>

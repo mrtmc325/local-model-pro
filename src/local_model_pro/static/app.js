@@ -1,4 +1,5 @@
 const modelSelect = document.getElementById("modelSelect");
+const modelFilterInput = document.getElementById("modelFilterInput");
 const customModelInput = document.getElementById("customModelInput");
 const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
@@ -17,6 +18,7 @@ const state = {
   inflight: false,
   assistantEl: null,
   currentModel: null,
+  availableModels: [],
 };
 
 function wsUrl() {
@@ -36,6 +38,71 @@ function bytesToHuman(value) {
     unit += 1;
   }
   return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function normalizeModelEntry(entry) {
+  return {
+    name: String(entry.name || "").trim(),
+    size: typeof entry.size === "number" ? entry.size : null,
+  };
+}
+
+function modelLabel(model) {
+  return model.size ? `${model.name} (${bytesToHuman(model.size)})` : model.name;
+}
+
+function modelExists(modelName) {
+  return state.availableModels.some((model) => model.name === modelName);
+}
+
+function upsertModel(modelName, size = null) {
+  const normalizedName = String(modelName || "").trim();
+  if (!normalizedName) {
+    return;
+  }
+
+  const existing = state.availableModels.find((model) => model.name === normalizedName);
+  if (existing) {
+    if (typeof size === "number") {
+      existing.size = size;
+    }
+  } else {
+    state.availableModels.push({ name: normalizedName, size });
+    state.availableModels.sort((a, b) => a.name.localeCompare(b.name));
+  }
+}
+
+function renderModelOptions(preferredModel = null) {
+  const filterText = modelFilterInput.value.trim().toLowerCase();
+  const selectedBeforeRender = preferredModel || modelSelect.value || state.currentModel || "";
+
+  const filteredModels = state.availableModels.filter((model) =>
+    model.name.toLowerCase().includes(filterText)
+  );
+
+  modelSelect.innerHTML = "";
+  if (filteredModels.length === 0) {
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = "No models match current filter";
+    emptyOption.disabled = true;
+    emptyOption.selected = true;
+    modelSelect.appendChild(emptyOption);
+    return;
+  }
+
+  filteredModels.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.name;
+    option.textContent = modelLabel(model);
+    option.title = modelLabel(model);
+    modelSelect.appendChild(option);
+  });
+
+  const targetSelection = filteredModels.some((model) => model.name === selectedBeforeRender)
+    ? selectedBeforeRender
+    : filteredModels[0].name;
+  modelSelect.value = targetSelection;
 }
 
 function setStatus(online, labelText) {
@@ -72,21 +139,6 @@ function updateActiveModelLabel(modelName) {
   activeModelLabel.textContent = modelName ? `model: ${modelName}` : "model: n/a";
 }
 
-function upsertModelOption(modelName, size) {
-  const existing = [...modelSelect.options].find((opt) => opt.value === modelName);
-  const label = size ? `${modelName} (${bytesToHuman(size)})` : modelName;
-
-  if (existing) {
-    existing.textContent = label;
-    return;
-  }
-
-  const option = document.createElement("option");
-  option.value = modelName;
-  option.textContent = label;
-  modelSelect.appendChild(option);
-}
-
 async function loadModels() {
   refreshModelsBtn.disabled = true;
   try {
@@ -96,20 +148,20 @@ async function loadModels() {
       throw new Error(payload.detail || "Failed to read model list");
     }
 
-    modelSelect.innerHTML = "";
     const models = Array.isArray(payload.models) ? payload.models : [];
-    models
-      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
-      .forEach((entry) => upsertModelOption(entry.name, entry.size));
+    state.availableModels = models
+      .map(normalizeModelEntry)
+      .filter((entry) => entry.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
 
-    if (models.length === 0) {
+    if (state.availableModels.length === 0) {
+      renderModelOptions();
       addMessage("system", "No local models found in Ollama.");
       return;
     }
 
-    const defaultModel = payload.default_model || models[0].name;
-    const hasDefault = models.some((entry) => entry.name === defaultModel);
-    modelSelect.value = hasDefault ? defaultModel : models[0].name;
+    const defaultModel = String(payload.default_model || state.availableModels[0].name);
+    renderModelOptions(defaultModel);
     customModelInput.value = "";
   } catch (error) {
     addMessage("system", `Model list error: ${error.message}`);
@@ -188,8 +240,10 @@ function connectWs() {
       const modelName = String(message.model || "");
       state.currentModel = modelName;
       if (modelName) {
-        upsertModelOption(modelName);
-        modelSelect.value = modelName;
+        if (!modelExists(modelName)) {
+          upsertModel(modelName);
+        }
+        renderModelOptions(modelName);
       }
       updateActiveModelLabel(modelName);
       setBusy(false);
@@ -241,6 +295,10 @@ function applyModel() {
   }
   try {
     sendWs({ type: "set_model", model });
+    if (!modelExists(model)) {
+      upsertModel(model);
+      renderModelOptions(model);
+    }
     state.currentModel = model;
     updateActiveModelLabel(model);
     customModelInput.value = "";
@@ -290,6 +348,18 @@ refreshModelsBtn.addEventListener("click", loadModels);
 applyModelBtn.addEventListener("click", applyModel);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
+modelFilterInput.addEventListener("input", () => renderModelOptions());
+
+// Prevent accidental model changes when scrolling over the list without focused intent.
+modelSelect.addEventListener(
+  "wheel",
+  (event) => {
+    if (document.activeElement !== modelSelect) {
+      event.preventDefault();
+    }
+  },
+  { passive: false }
+);
 
 promptInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {

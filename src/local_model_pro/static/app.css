@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Nunito+Sans:wght@400;500;600;700&display=swap");
 
 :root {
   --ui-font-scale: 1;
@@ -38,7 +38,7 @@ html {
 }
 
 body {
-  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-family: "Nunito Sans", "Segoe UI", sans-serif;
   color: var(--text);
   background:
     radial-gradient(1200px 600px at 10% -10%, var(--bg-radial-1), transparent 60%),
@@ -62,6 +62,7 @@ body {
 
 .topbar h1 {
   margin: 0;
+  font-weight: 700;
   font-size: clamp(1.4rem, 2.6vw, 2.1rem);
 }
 
@@ -142,6 +143,10 @@ body {
   align-items: center;
 }
 
+.model-list-row {
+  align-items: stretch;
+}
+
 select,
 input,
 textarea,
@@ -190,6 +195,17 @@ button:disabled {
 
 .actions {
   margin-top: 0.2rem;
+}
+
+#modelFilterInput {
+  margin-bottom: 0.2rem;
+}
+
+#modelSelect {
+  min-height: 210px;
+  max-height: 320px;
+  font-size: 0.96rem;
+  line-height: 1.45;
 }
 
 #resetBtn {
