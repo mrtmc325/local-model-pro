@@ -1,5 +1,6 @@
 const modelSelect = document.getElementById("modelSelect");
 const modelFilterInput = document.getElementById("modelFilterInput");
+const modelListMeta = document.getElementById("modelListMeta");
 const customModelInput = document.getElementById("customModelInput");
 const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
@@ -51,6 +52,16 @@ function modelLabel(model) {
   return model.size ? `${model.name} (${bytesToHuman(model.size)})` : model.name;
 }
 
+function updateModelListMeta({ totalCount, shownCount, selectedName }) {
+  if (totalCount === 0) {
+    modelListMeta.textContent = "No downloaded models found.";
+    return;
+  }
+
+  const selectedPart = selectedName ? ` selected: ${selectedName}` : "";
+  modelListMeta.textContent = `${shownCount}/${totalCount} shown.${selectedPart}`;
+}
+
 function modelExists(modelName) {
   return state.availableModels.some((model) => model.name === modelName);
 }
@@ -88,6 +99,11 @@ function renderModelOptions(preferredModel = null) {
     emptyOption.disabled = true;
     emptyOption.selected = true;
     modelSelect.appendChild(emptyOption);
+    updateModelListMeta({
+      totalCount: state.availableModels.length,
+      shownCount: 0,
+      selectedName: "",
+    });
     return;
   }
 
@@ -103,6 +119,11 @@ function renderModelOptions(preferredModel = null) {
     ? selectedBeforeRender
     : filteredModels[0].name;
   modelSelect.value = targetSelection;
+  updateModelListMeta({
+    totalCount: state.availableModels.length,
+    shownCount: filteredModels.length,
+    selectedName: targetSelection,
+  });
 }
 
 function setStatus(online, labelText) {
@@ -349,6 +370,10 @@ applyModelBtn.addEventListener("click", applyModel);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
 modelFilterInput.addEventListener("input", () => renderModelOptions());
+modelSelect.addEventListener("change", () => {
+  customModelInput.value = "";
+  renderModelOptions(modelSelect.value);
+});
 
 // Prevent accidental model changes when scrolling over the list without focused intent.
 modelSelect.addEventListener(

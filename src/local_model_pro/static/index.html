@@ -21,17 +21,18 @@
           <h2>Model Control</h2>
 
           <div class="field">
-            <span>Downloaded models</span>
+            <div class="field-head">
+              <span>Downloaded models</span>
+              <button id="refreshModelsBtn" type="button">Refresh</button>
+            </div>
             <input
               id="modelFilterInput"
               type="text"
               placeholder="Filter models..."
               autocomplete="off"
             />
-            <div class="row model-list-row">
-              <select id="modelSelect" size="9" aria-label="Downloaded models"></select>
-              <button id="refreshModelsBtn" type="button">Refresh</button>
-            </div>
+            <select id="modelSelect" size="8" aria-label="Downloaded models"></select>
+            <div id="modelListMeta" class="field-help"></div>
           </div>
 
           <div class="field">

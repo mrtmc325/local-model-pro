@@ -137,14 +137,17 @@ body {
   font-size: 0.93rem;
 }
 
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
 .row {
   display: flex;
   gap: 0.55rem;
   align-items: center;
-}
-
-.model-list-row {
-  align-items: stretch;
 }
 
 select,
@@ -202,15 +205,26 @@ button:disabled {
 }
 
 #modelSelect {
-  min-height: 210px;
-  max-height: 320px;
+  min-height: 186px;
+  max-height: 300px;
   font-size: 0.96rem;
-  line-height: 1.45;
+  line-height: 1.35;
+  padding: 0.45rem 0.55rem;
+}
+
+#refreshModelsBtn {
+  padding: 0.42rem 0.7rem;
+  font-size: 0.9rem;
 }
 
 #resetBtn {
   background: var(--button-secondary-bg);
   border-color: var(--border-strong);
+}
+
+.field-help {
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .active-model {
