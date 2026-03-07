@@ -1,3 +1,0 @@
-[console_scripts]
-local-model-pro-cli = local_model_pro.cli:main
-local-model-pro-server = local_model_pro.server:main
