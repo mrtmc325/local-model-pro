@@ -88,6 +88,8 @@ Environment variable overrides:
 - `URL_REVIEW_MAX_URLS` (default: `3`)
 - `URL_REVIEW_TIMEOUT_SECONDS` (default: `20`)
 - `URL_REVIEW_MAX_BYTES` (default: `2000000`)
+- `WEB_ASSIST_PAGE_REVIEW_ENABLED` (default: `true`)
+- `WEB_ASSIST_PAGE_REVIEW_MAX_URLS` (default: `2`)
 
 ## Run with Docker Compose
 
@@ -119,6 +121,8 @@ In the frontend:
    - `balanced`: web evidence can be included in chat when `Web Assist` is ON
    - `strict`: chat grounding stays memory-first; web remains available via direct web search
 6. Optional: enable `Web Assist` to include live web context after memory retrieval.
+   - When enabled, top web results are fetched/scraped and summarized into `web_review` context.
+   - Tune depth with `WEB_ASSIST_PAGE_REVIEW_MAX_URLS` (recommended `1-2` for lower latency).
 7. Click `Connect`, then chat.
 8. Use `Search Web` for direct web lookups (memory-first if Knowledge Assist is enabled).
 
@@ -180,6 +184,7 @@ Server -> client:
 - `{"type":"grounding_status","status":"full|partial|insufficient","profile":"balanced","exact_required":true,"overall_confidence":0.81,"note":"..."}`
 - `{"type":"clarify_needed","question":"..."}`
 - `{"type":"url_review_saved","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","raw_file":"...","meaning_file":"...","artifact_id":"...","indexed_count":1,"error":null}]}`
+- `{"type":"web_review_context","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","final_url":"...","title":"...","meaning":"...","key_facts":["..."],"error":null}]}`
 - `{"type":"start","request_id":"..."}`
 - `{"type":"token","request_id":"...","text":"..."}`
 - `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
