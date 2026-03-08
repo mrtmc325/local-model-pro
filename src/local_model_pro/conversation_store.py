@@ -55,6 +55,21 @@ class StoredGroundedEvidence:
     confidence: float
 
 
+@dataclass(frozen=True)
+class StoredMemoryArtifact:
+    artifact_id: str
+    session_id: str
+    actor_id: str
+    request_id: str | None
+    artifact_type: str
+    source_url: str | None
+    author: str | None
+    summary: str | None
+    file_path: str
+    content_hash: str
+    created_at: str
+
+
 class ConversationStore:
     def __init__(self, *, db_path: str) -> None:
         self._db_path = Path(db_path).expanduser().resolve()
@@ -165,6 +180,21 @@ class ConversationStore:
                 FOREIGN KEY(evidence_id) REFERENCES grounded_evidence(evidence_id)
             );
 
+            CREATE TABLE IF NOT EXISTS memory_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL DEFAULT 'anonymous',
+                request_id TEXT,
+                artifact_type TEXT NOT NULL,
+                source_url TEXT,
+                author TEXT,
+                summary TEXT,
+                file_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_session_created
                 ON chat_turns(session_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_insights_session_created
@@ -177,6 +207,10 @@ class ConversationStore:
                 ON grounded_evidence(run_id);
             CREATE INDEX IF NOT EXISTS idx_links_claim
                 ON grounded_evidence_links(claim_id);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session_created
+                ON memory_artifacts(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_actor_created
+                ON memory_artifacts(actor_id, created_at);
             """
         )
 
@@ -196,6 +230,15 @@ class ConversationStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_insights_actor_created ON chat_insights(actor_id, created_at)"
         )
+        self._ensure_column("memory_artifacts", "actor_id", "TEXT NOT NULL DEFAULT 'anonymous'")
+        self._ensure_column("memory_artifacts", "request_id", "TEXT")
+        self._ensure_column("memory_artifacts", "artifact_type", "TEXT NOT NULL DEFAULT 'session_snapshot'")
+        self._ensure_column("memory_artifacts", "source_url", "TEXT")
+        self._ensure_column("memory_artifacts", "author", "TEXT")
+        self._ensure_column("memory_artifacts", "summary", "TEXT")
+        self._ensure_column("memory_artifacts", "file_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("memory_artifacts", "content_hash", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("memory_artifacts", "created_at", "TEXT NOT NULL DEFAULT ''")
 
         self._conn.commit()
 
@@ -605,6 +648,112 @@ class ConversationStore:
                 source_session=str(row["source_session"]) if row["source_session"] else None,
                 created_at=str(row["created_at"]),
                 confidence=float(row["confidence"]),
+            )
+            for row in rows
+        ]
+
+    def add_memory_artifact(
+        self,
+        *,
+        artifact_id: str,
+        session_id: str,
+        actor_id: str,
+        request_id: str | None,
+        artifact_type: str,
+        source_url: str | None,
+        author: str | None,
+        summary: str | None,
+        file_path: str,
+        content_hash: str,
+    ) -> StoredMemoryArtifact:
+        use_actor = (actor_id or "anonymous").strip() or "anonymous"
+        use_type = artifact_type.strip() if artifact_type else "session_snapshot"
+        if not use_type:
+            use_type = "session_snapshot"
+        now = _utc_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO memory_artifacts(
+                    artifact_id,
+                    session_id,
+                    actor_id,
+                    request_id,
+                    artifact_type,
+                    source_url,
+                    author,
+                    summary,
+                    file_path,
+                    content_hash,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    session_id,
+                    use_actor,
+                    request_id,
+                    use_type,
+                    source_url,
+                    author,
+                    summary,
+                    file_path,
+                    content_hash,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE chat_sessions SET updated_at = ?, actor_id = ? WHERE session_id = ?",
+                (now, use_actor, session_id),
+            )
+            self._conn.commit()
+        return StoredMemoryArtifact(
+            artifact_id=artifact_id,
+            session_id=session_id,
+            actor_id=use_actor,
+            request_id=request_id,
+            artifact_type=use_type,
+            source_url=source_url,
+            author=author,
+            summary=summary,
+            file_path=file_path,
+            content_hash=content_hash,
+            created_at=now,
+        )
+
+    def list_memory_artifacts(
+        self,
+        *,
+        session_id: str,
+        limit: int = 100,
+    ) -> list[StoredMemoryArtifact]:
+        use_limit = max(1, min(limit, 500))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT artifact_id, session_id, actor_id, request_id, artifact_type,
+                       source_url, author, summary, file_path, content_hash, created_at
+                FROM memory_artifacts
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (session_id, use_limit),
+            ).fetchall()
+        return [
+            StoredMemoryArtifact(
+                artifact_id=str(row["artifact_id"]),
+                session_id=str(row["session_id"]),
+                actor_id=str(row["actor_id"]),
+                request_id=str(row["request_id"]) if row["request_id"] else None,
+                artifact_type=str(row["artifact_type"]),
+                source_url=str(row["source_url"]) if row["source_url"] else None,
+                author=str(row["author"]) if row["author"] else None,
+                summary=str(row["summary"]) if row["summary"] else None,
+                file_path=str(row["file_path"]),
+                content_hash=str(row["content_hash"]),
+                created_at=str(row["created_at"]),
             )
             for row in rows
         ]

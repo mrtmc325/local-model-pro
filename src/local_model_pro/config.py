@@ -37,6 +37,13 @@ class Settings:
     )
     grounded_timeout_seconds: int = int(os.getenv("GROUNDED_TIMEOUT_SECONDS", "25"))
     default_actor_id: str = os.getenv("DEFAULT_ACTOR_ID", "anonymous").strip() or "anonymous"
+    direct_save_enabled: bool = _env_flag("DIRECT_SAVE_ENABLED", "true")
+    memory_export_dir: str = os.getenv("MEMORY_EXPORT_DIR", "/data/memory_exports").strip() or "/data/memory_exports"
+    direct_save_max_turns: int = int(os.getenv("DIRECT_SAVE_MAX_TURNS", "5000"))
+    url_review_enabled: bool = _env_flag("URL_REVIEW_ENABLED", "true")
+    url_review_max_urls: int = int(os.getenv("URL_REVIEW_MAX_URLS", "3"))
+    url_review_timeout_seconds: int = int(os.getenv("URL_REVIEW_TIMEOUT_SECONDS", "20"))
+    url_review_max_bytes: int = int(os.getenv("URL_REVIEW_MAX_BYTES", "2000000"))
 
 
 settings = Settings()

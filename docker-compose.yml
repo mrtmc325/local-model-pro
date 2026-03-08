@@ -16,6 +16,13 @@ services:
       GROUNDED_PROFILE_DEFAULT: "balanced"
       GROUNDED_TIMEOUT_SECONDS: "25"
       DEFAULT_ACTOR_ID: "anonymous"
+      DIRECT_SAVE_ENABLED: "true"
+      MEMORY_EXPORT_DIR: /data/memory_exports
+      DIRECT_SAVE_MAX_TURNS: "5000"
+      URL_REVIEW_ENABLED: "true"
+      URL_REVIEW_MAX_URLS: "3"
+      URL_REVIEW_TIMEOUT_SECONDS: "20"
+      URL_REVIEW_MAX_BYTES: "2000000"
       SQLITE_DB_PATH: /data/local_model_pro.db
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: local_model_pro_insights

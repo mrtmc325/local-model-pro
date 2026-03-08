@@ -169,6 +169,40 @@ function clarifyToText(msg) {
   return question ? `Clarify needed: ${question}` : "Clarify needed: specify the exact fact to verify.";
 }
 
+function memorySavedToText(msg) {
+  const artifactId = String(msg.artifact_id || "").trim() || "(none)";
+  const filePath = String(msg.file_path || "").trim() || "(none)";
+  const indexedCount = Number(msg.indexed_count || 0);
+  const note = String(msg.note || "").trim();
+  const lines = [`Memory saved: artifact=${artifactId} indexed=${indexedCount} file=${filePath}`];
+  if (note) {
+    lines.push(`note: ${note}`);
+  }
+  return lines.join("\n");
+}
+
+function urlReviewSavedToText(msg) {
+  const items = Array.isArray(msg.items) ? msg.items : [];
+  if (items.length === 0) {
+    return "URL review save: no items";
+  }
+  const lines = ["URL review save results:"];
+  items.forEach((item, idx) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const url = String(item.url || "").trim() || "(unknown url)";
+    const status = String(item.status || "").trim() || "unknown";
+    const indexed = Number(item.indexed_count || 0);
+    const error = String(item.error || "").trim();
+    lines.push(`${idx + 1}. ${url} status=${status} indexed=${indexed}`);
+    if (error) {
+      lines.push(`error: ${error}`);
+    }
+  });
+  return lines.join("\n");
+}
+
 function updateWebModeMeta() {
   if (state.groundedModeEnabled && state.groundedProfile === "strict") {
     webModeMeta.textContent =
@@ -591,6 +625,16 @@ function connectWs() {
 
     if (msgType === "clarify_needed") {
       addMessage("system", clarifyToText(message));
+      return;
+    }
+
+    if (msgType === "memory_saved") {
+      addMessage("system", memorySavedToText(message));
+      return;
+    }
+
+    if (msgType === "url_review_saved") {
+      addMessage("system", urlReviewSavedToText(message));
       return;
     }
 

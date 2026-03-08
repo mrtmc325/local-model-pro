@@ -16,11 +16,14 @@ from fastapi.staticfiles import StaticFiles
 
 from local_model_pro.config import settings
 from local_model_pro.conversation_store import ConversationStore
+from local_model_pro.ingestion_intents import PromptIngestionIntent, parse_prompt_ingestion_intent
 from local_model_pro.knowledge_assist import (
     EvidenceCard,
     GroundedResponse,
     KnowledgeAssistService,
     QueryPlan,
+    SavedMemoryEvent,
+    URLReviewSavedItem,
 )
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
 from local_model_pro.qdrant_memory import MemoryResult, QdrantMemoryIndex
@@ -61,6 +64,14 @@ class AssistResolution:
     web_query: str
     memory_results: list[MemoryResult]
     exact_required: bool
+
+
+@dataclass(frozen=True)
+class IngestionResolution:
+    intent: PromptIngestionIntent
+    save_event: SavedMemoryEvent | None
+    review_items: list[URLReviewSavedItem]
+    review_evidence_cards: list[EvidenceCard]
 
 
 def _safe_text(value: Any) -> str:
@@ -147,6 +158,7 @@ def _serialize_memory_results(
                 "same_user": "memory_same_user",
                 "shared": "memory_shared",
             }[_memory_scope(item, session)],
+            "memory_source_type": item.source_type,
             "actor_scope": _memory_scope(item, session),
             "pii_flag": item.pii_flag,
             "verbatim": item.quote_text,
@@ -185,6 +197,67 @@ def _serialize_evidence_cards(cards: list[EvidenceCard]) -> list[dict[str, Any]]
             }
         )
     return rows
+
+
+def _serialize_url_review_items(items: list[URLReviewSavedItem]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append(
+            {
+                "url": item.url,
+                "status": item.status,
+                "raw_file": item.raw_file,
+                "meaning_file": item.meaning_file,
+                "artifact_id": item.artifact_id,
+                "indexed_count": item.indexed_count,
+                "error": item.error,
+                "final_url": item.final_url,
+                "title": item.title,
+                "meaning": item.meaning,
+                "key_facts": item.key_facts or [],
+            }
+        )
+    return rows
+
+
+def _build_review_context(items: list[URLReviewSavedItem]) -> str:
+    lines = ["Reviewed URL context (meaning + key facts):"]
+    idx = 1
+    for item in items:
+        if item.status != "saved":
+            continue
+        meaning = (item.meaning or "").strip()
+        if not meaning:
+            continue
+        lines.append(f"{idx}. {item.title or item.url}")
+        lines.append(f"   URL: {item.final_url or item.url}")
+        lines.append(f"   Meaning: {meaning}")
+        for fact in (item.key_facts or [])[:4]:
+            lines.append(f"   Fact: {fact}")
+        idx += 1
+    return "\n".join(lines)
+
+
+def _relabel_evidence_cards(cards: list[EvidenceCard], *, start_index: int) -> list[EvidenceCard]:
+    next_index = max(1, start_index)
+    relabeled: list[EvidenceCard] = []
+    for card in cards:
+        relabeled.append(
+            EvidenceCard(
+                evidence_id=card.evidence_id,
+                source_type=card.source_type,
+                actor_scope=card.actor_scope,
+                label=f"E{next_index}",
+                content=card.content,
+                url=card.url,
+                source_session=card.source_session,
+                confidence=card.confidence,
+                pii_flag=card.pii_flag,
+                used_verbatim=card.used_verbatim,
+            )
+        )
+        next_index += 1
+    return relabeled
 
 
 def _build_web_context(*, query: str, results: list[WebSearchResult]) -> str:
@@ -239,6 +312,136 @@ def _schedule_background(coro: Any) -> None:
             return
 
     task.add_done_callback(_swallow_exc)
+
+
+async def _run_pre_assist_ingestion(
+    *,
+    session: ChatSession,
+    prompt: str,
+    request_id: str,
+    websocket: WebSocket,
+    knowledge: KnowledgeAssistService,
+) -> IngestionResolution:
+    intent = parse_prompt_ingestion_intent(prompt, max_urls=max(1, settings.url_review_max_urls))
+    save_event: SavedMemoryEvent | None = None
+    review_items: list[URLReviewSavedItem] = []
+    review_evidence_cards: list[EvidenceCard] = []
+
+    if intent.save_requested:
+        if settings.direct_save_enabled:
+            try:
+                save_event = await knowledge.save_direct_memory(
+                    session_id=session.session_id,
+                    actor_id=session.actor_id,
+                    request_id=request_id,
+                    model=session.model,
+                    save_text=intent.save_text or prompt,
+                    author=intent.author,
+                )
+            except Exception as exc:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "memory_saved",
+                        "request_id": request_id,
+                        "artifact_id": "",
+                        "session_id": session.session_id,
+                        "actor_id": session.actor_id,
+                        "author": intent.author,
+                        "file_path": "",
+                        "indexed_count": 0,
+                        "note": f"Save failed: {exc}",
+                    },
+                )
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "info",
+                        "message": f"Direct save requested but failed: {exc}",
+                    },
+                )
+            else:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "memory_saved",
+                        "request_id": request_id,
+                        "artifact_id": save_event.artifact_id,
+                        "session_id": session.session_id,
+                        "actor_id": session.actor_id,
+                        "author": save_event.author,
+                        "file_path": save_event.file_path,
+                        "indexed_count": save_event.indexed_count,
+                        "note": save_event.note,
+                    },
+                )
+        else:
+            await _send_json(
+                websocket,
+                {
+                    "type": "memory_saved",
+                    "request_id": request_id,
+                    "artifact_id": "",
+                    "session_id": session.session_id,
+                    "actor_id": session.actor_id,
+                    "author": intent.author,
+                    "file_path": "",
+                    "indexed_count": 0,
+                    "note": "Direct save is disabled by configuration.",
+                },
+            )
+
+    if intent.review_requested:
+        if settings.url_review_enabled:
+            review_items, review_evidence_cards = await knowledge.review_and_save_urls(
+                session_id=session.session_id,
+                actor_id=session.actor_id,
+                request_id=request_id,
+                model=session.model,
+                urls=intent.review_urls,
+                author=intent.author,
+            )
+        else:
+            review_items = [
+                URLReviewSavedItem(
+                    url=url,
+                    status="failed",
+                    raw_file=None,
+                    meaning_file=None,
+                    artifact_id=None,
+                    indexed_count=0,
+                    error="URL review is disabled by configuration.",
+                )
+                for url in intent.review_urls
+            ]
+        await _send_json(
+            websocket,
+            {
+                "type": "url_review_saved",
+                "request_id": request_id,
+                "items": _serialize_url_review_items(review_items),
+            },
+        )
+
+        failures = [item for item in review_items if item.status != "saved"]
+        if failures:
+            await _send_json(
+                websocket,
+                {
+                    "type": "info",
+                    "message": (
+                        f"URL review completed with {len(failures)} failure(s). "
+                        "Continuing chat with available context."
+                    ),
+                },
+            )
+
+    return IngestionResolution(
+        intent=intent,
+        save_event=save_event,
+        review_items=review_items,
+        review_evidence_cards=review_evidence_cards,
+    )
 
 
 async def _resolve_assist(
@@ -334,6 +537,7 @@ async def service_info() -> dict[str, Any]:
         "memory": {
             "backend": "sqlite+qdrant",
             "db_path": settings.sqlite_db_path,
+            "export_dir": settings.memory_export_dir,
             "qdrant_url": settings.qdrant_url,
             "qdrant_collection": settings.qdrant_collection,
             "shared_default": True,
@@ -344,6 +548,8 @@ async def service_info() -> dict[str, Any]:
             "grounded_profiles": ["strict", "balanced"],
             "web_assist": True,
             "evidence_panel_events": True,
+            "direct_save": settings.direct_save_enabled,
+            "url_review": settings.url_review_enabled,
         },
     }
 
@@ -419,6 +625,8 @@ async def chat_ws_http_hint() -> dict[str, Any]:
             "grounding_status",
             "evidence_used",
             "clarify_needed",
+            "memory_saved",
+            "url_review_saved",
             "query_plan",
             "memory_results",
             "web_results",
@@ -793,6 +1001,14 @@ async def chat_ws(websocket: WebSocket) -> None:
                 actor_id=session.actor_id,
             )
 
+            ingestion = await _run_pre_assist_ingestion(
+                session=session,
+                prompt=prompt,
+                request_id=request_id,
+                websocket=websocket,
+                knowledge=knowledge,
+            )
+
             session.messages.append({"role": "user", "content": prompt})
             model_messages = list(session.messages)
 
@@ -865,7 +1081,11 @@ async def chat_ws(websocket: WebSocket) -> None:
                     web_results=serialized_web,
                     start_index=1 + len(memory_cards),
                 )
-                evidence_cards = [*memory_cards, *web_cards]
+                review_cards = _relabel_evidence_cards(
+                    ingestion.review_evidence_cards,
+                    start_index=1 + len(memory_cards) + len(web_cards),
+                )
+                evidence_cards = [*memory_cards, *web_cards, *review_cards]
 
                 await knowledge.log_grounded_evidence(run_id=run_id, cards=evidence_cards)
                 await _send_json(
@@ -1004,7 +1224,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                 )
                 continue
 
-            if assist.memory_results or web_results:
+            has_review_context = any(item.status == "saved" and item.meaning for item in ingestion.review_items)
+            if assist.memory_results or web_results or has_review_context:
                 history_without_latest = session.messages[:-1]
                 latest_user_message = session.messages[-1]
                 context_messages: list[dict[str, str]] = []
@@ -1024,6 +1245,14 @@ async def chat_ws(websocket: WebSocket) -> None:
                         {
                             "role": "system",
                             "content": _build_web_context(query=assist.web_query, results=web_results),
+                        }
+                    )
+                review_context = _build_review_context(ingestion.review_items)
+                if has_review_context:
+                    context_messages.append(
+                        {
+                            "role": "system",
+                            "content": review_context,
                         }
                     )
                 model_messages = [

@@ -81,6 +81,13 @@ Environment variable overrides:
 - `GROUNDED_PROFILE_DEFAULT` (default: `balanced`, options: `strict|balanced`)
 - `GROUNDED_TIMEOUT_SECONDS` (default: `25`)
 - `DEFAULT_ACTOR_ID` (default: `anonymous`)
+- `DIRECT_SAVE_ENABLED` (default: `true`)
+- `MEMORY_EXPORT_DIR` (default: `/data/memory_exports`)
+- `DIRECT_SAVE_MAX_TURNS` (default: `5000`)
+- `URL_REVIEW_ENABLED` (default: `true`)
+- `URL_REVIEW_MAX_URLS` (default: `3`)
+- `URL_REVIEW_TIMEOUT_SECONDS` (default: `20`)
+- `URL_REVIEW_MAX_BYTES` (default: `2000000`)
 
 ## Run with Docker Compose
 
@@ -168,9 +175,11 @@ Server -> client:
 - `{"type":"ready","session_id":"...","actor_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
 - `{"type":"query_plan","reason":"...","meaning":"...","purpose":"...","db_query":"...","web_query":"...","fallback":false,"exact_required":true}`
 - `{"type":"memory_results","query":"...","results":[{"insight":"...","score":0.0,"source_session":"...","actor_scope":"same_user","evidence_id":"..."}]}`
+- `{"type":"memory_saved","request_id":"...","artifact_id":"...","session_id":"...","actor_id":"...","author":"...","file_path":"...","indexed_count":2,"note":"..."}`
 - `{"type":"evidence_used","results":[{"label":"E1","source_type":"memory_same_user","confidence":0.88,"content":"...","url":null}]}`
 - `{"type":"grounding_status","status":"full|partial|insufficient","profile":"balanced","exact_required":true,"overall_confidence":0.81,"note":"..."}`
 - `{"type":"clarify_needed","question":"..."}`
+- `{"type":"url_review_saved","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","raw_file":"...","meaning_file":"...","artifact_id":"...","indexed_count":1,"error":null}]}`
 - `{"type":"start","request_id":"..."}`
 - `{"type":"token","request_id":"...","text":"..."}`
 - `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`

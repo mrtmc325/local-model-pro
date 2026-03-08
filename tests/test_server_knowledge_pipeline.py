@@ -9,7 +9,14 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from local_model_pro.conversation_store import ConversationStore
-from local_model_pro.knowledge_assist import GroundedClaim, GroundedResponse, QueryPlan
+from local_model_pro.knowledge_assist import (
+    EvidenceCard,
+    GroundedClaim,
+    GroundedResponse,
+    QueryPlan,
+    SavedMemoryEvent,
+    URLReviewSavedItem,
+)
 from local_model_pro.qdrant_memory import MemoryResult
 from local_model_pro.web_search import WebSearchResult
 
@@ -20,6 +27,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         *,
         web_assist_enabled: bool,
         grounded_mode_enabled: bool,
+        prompt: str = "build a go bag list",
     ) -> tuple[list[str], list[str], list[dict[str, str]], list[dict[str, object]]]:
         from local_model_pro import server
 
@@ -192,7 +200,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                                 }
                             )
                             _ = ws.receive_json()
-                            ws.send_json({"type": "chat", "prompt": "build a go bag list"})
+                            ws.send_json({"type": "chat", "prompt": prompt})
 
                             while True:
                                 msg = ws.receive_json()
@@ -270,6 +278,112 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         grounding_events = [item for item in payloads if item.get("type") == "grounding_status"]
         self.assertTrue(grounding_events)
         self.assertEqual(grounding_events[-1].get("status"), "full")
+
+    def test_save_directive_emits_memory_saved_event(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        async def fake_save_direct_memory(self, **kwargs: object) -> SavedMemoryEvent:  # type: ignore[no-untyped-def]
+            calls.append(kwargs)
+            return SavedMemoryEvent(
+                artifact_id="artifact-1",
+                file_path="/tmp/session_snapshot_x.md",
+                indexed_count=2,
+                note="saved",
+                summary="summary",
+                author="Tristan Conner",
+            )
+
+        with mock.patch(
+            "local_model_pro.knowledge_assist.KnowledgeAssistService.save_direct_memory",
+            new=fake_save_direct_memory,
+        ):
+            _, emitted_types, _, payloads = self._run_chat_and_collect(
+                web_assist_enabled=False,
+                grounded_mode_enabled=False,
+                prompt="save this for later, you are the author Tristan Conner",
+            )
+
+        self.assertTrue(calls)
+        self.assertIn("memory_saved", emitted_types)
+        saved_events = [item for item in payloads if item.get("type") == "memory_saved"]
+        self.assertTrue(saved_events)
+        self.assertEqual(saved_events[-1].get("artifact_id"), "artifact-1")
+        self.assertIn("done", emitted_types)
+
+    def test_review_intent_emits_url_review_saved(self) -> None:
+        review_calls: list[dict[str, object]] = []
+
+        async def fake_review_and_save_urls(self, **kwargs: object):  # type: ignore[no-untyped-def]
+            review_calls.append(kwargs)
+            return (
+                [
+                    URLReviewSavedItem(
+                        url="https://example.com",
+                        status="saved",
+                        raw_file="/tmp/url_raw_x.txt",
+                        meaning_file="/tmp/url_meaning_x.md",
+                        artifact_id="artifact-2",
+                        indexed_count=3,
+                        error=None,
+                        final_url="https://example.com",
+                        title="Example Domain",
+                        meaning="A sample page for testing.",
+                        key_facts=["Example fact"],
+                    )
+                ],
+                [
+                    EvidenceCard(
+                        evidence_id="ev-review-1",
+                        source_type="web_review",
+                        actor_scope="web",
+                        label="E1",
+                        content="Example Domain\\nA sample page for testing.",
+                        url="https://example.com",
+                        source_session=None,
+                        confidence=0.72,
+                        pii_flag=False,
+                        used_verbatim=False,
+                    )
+                ],
+            )
+
+        with mock.patch(
+            "local_model_pro.knowledge_assist.KnowledgeAssistService.review_and_save_urls",
+            new=fake_review_and_save_urls,
+        ):
+            _, emitted_types, _, payloads = self._run_chat_and_collect(
+                web_assist_enabled=False,
+                grounded_mode_enabled=False,
+                prompt="please review https://example.com and summarize",
+            )
+
+        self.assertTrue(review_calls)
+        self.assertIn("url_review_saved", emitted_types)
+        events = [item for item in payloads if item.get("type") == "url_review_saved"]
+        self.assertTrue(events)
+        self.assertIn("items", events[-1])
+        self.assertIn("done", emitted_types)
+
+    def test_plain_url_without_review_intent_does_not_trigger_review_ingest(self) -> None:
+        review_calls: list[dict[str, object]] = []
+
+        async def fake_review_and_save_urls(self, **kwargs: object):  # type: ignore[no-untyped-def]
+            review_calls.append(kwargs)
+            return ([], [])
+
+        with mock.patch(
+            "local_model_pro.knowledge_assist.KnowledgeAssistService.review_and_save_urls",
+            new=fake_review_and_save_urls,
+        ):
+            _, emitted_types, _, _ = self._run_chat_and_collect(
+                web_assist_enabled=False,
+                grounded_mode_enabled=False,
+                prompt="here is a URL https://example.com for context",
+            )
+
+        self.assertFalse(review_calls)
+        self.assertNotIn("url_review_saved", emitted_types)
+        self.assertIn("done", emitted_types)
 
 
 if __name__ == "__main__":

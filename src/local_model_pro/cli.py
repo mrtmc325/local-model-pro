@@ -171,6 +171,37 @@ def _print_clarify_needed(msg: dict[str, Any]) -> None:
     print(f"clarify> {question}")
 
 
+def _print_memory_saved(msg: dict[str, Any]) -> None:
+    artifact_id = str(msg.get("artifact_id", "")).strip() or "(none)"
+    file_path = str(msg.get("file_path", "")).strip() or "(none)"
+    indexed_count = int(msg.get("indexed_count", 0) or 0)
+    note = str(msg.get("note", "")).strip()
+    print(
+        "memory_saved> "
+        f"artifact_id={artifact_id} indexed_count={indexed_count} file={file_path}"
+    )
+    if note:
+        print(f"memory_saved> note={note}")
+
+
+def _print_url_review_saved(msg: dict[str, Any]) -> None:
+    items = msg.get("items", [])
+    print("url_review_saved> items")
+    if not isinstance(items, list) or not items:
+        print("url_review_saved> none")
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        status = str(item.get("status", "")).strip() or "unknown"
+        indexed_count = int(item.get("indexed_count", 0) or 0)
+        error = str(item.get("error", "")).strip()
+        print(f"url_review_saved> {url} status={status} indexed_count={indexed_count}")
+        if error:
+            print(f"url_review_saved>    error={error}")
+
+
 def _print_event(msg: dict[str, Any]) -> str:
     msg_type = str(msg.get("type", ""))
     if msg_type == "web_mode":
@@ -193,6 +224,10 @@ def _print_event(msg: dict[str, Any]) -> str:
         _print_grounding_status(msg)
     elif msg_type == "clarify_needed":
         _print_clarify_needed(msg)
+    elif msg_type == "memory_saved":
+        _print_memory_saved(msg)
+    elif msg_type == "url_review_saved":
+        _print_url_review_saved(msg)
     elif msg_type == "info":
         print(f"info> {msg.get('message')}")
     elif msg_type == "error":
@@ -274,6 +309,8 @@ async def _consume_stream(ws: websockets.ClientConnection) -> None:
             "evidence_used",
             "grounding_status",
             "clarify_needed",
+            "memory_saved",
+            "url_review_saved",
             "info",
         }:
             print("")

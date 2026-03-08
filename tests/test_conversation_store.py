@@ -167,6 +167,35 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertIn("script alpha", evidence[0].content.lower())
             store.close()
 
+    def test_memory_artifact_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "history.db"
+            store = ConversationStore(db_path=str(db_path))
+            store.upsert_session(
+                session_id="sess-artifact",
+                model="qwen2.5:7b",
+                system_prompt=None,
+                actor_id="alice",
+            )
+            artifact = store.add_memory_artifact(
+                artifact_id="artifact-1",
+                session_id="sess-artifact",
+                actor_id="alice",
+                request_id="req-art",
+                artifact_type="session_snapshot",
+                source_url=None,
+                author="Alice",
+                summary="Snapshot summary",
+                file_path="/tmp/snapshot.md",
+                content_hash="abc123",
+            )
+            self.assertEqual(artifact.artifact_id, "artifact-1")
+            artifacts = store.list_memory_artifacts(session_id="sess-artifact", limit=10)
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0].artifact_type, "session_snapshot")
+            self.assertEqual(artifacts[0].author, "Alice")
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

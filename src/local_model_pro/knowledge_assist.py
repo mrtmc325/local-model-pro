@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -13,6 +17,7 @@ from local_model_pro.config import Settings
 from local_model_pro.conversation_store import ConversationStore
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
 from local_model_pro.qdrant_memory import MemoryResult, QdrantError, QdrantMemoryIndex
+from local_model_pro.url_review import ReviewedPage, URLReviewClient, URLReviewError
 
 _SQL_PATTERN = re.compile(r"\b(select|insert|update|delete|from|where|join|drop|table|into|values)\b", re.IGNORECASE)
 _WORD_PATTERN = re.compile(r"[A-Za-z0-9']+")
@@ -117,6 +122,31 @@ class GroundedResponse:
     overall_confidence: float
     clarify_question: str
     note: str
+
+
+@dataclass(frozen=True)
+class SavedMemoryEvent:
+    artifact_id: str
+    file_path: str
+    indexed_count: int
+    note: str
+    summary: str
+    author: str | None
+
+
+@dataclass(frozen=True)
+class URLReviewSavedItem:
+    url: str
+    status: str
+    raw_file: str | None
+    meaning_file: str | None
+    artifact_id: str | None
+    indexed_count: int
+    error: str | None
+    final_url: str | None = None
+    title: str | None = None
+    meaning: str | None = None
+    key_facts: list[str] | None = None
 
 
 class RecursivePlanner:
@@ -376,6 +406,10 @@ class KnowledgeAssistService:
         self._store = store
         self._memory_index = memory_index
         self._planner = RecursivePlanner(settings=settings, ollama=ollama)
+        self._url_review_client = URLReviewClient(
+            timeout_seconds=settings.url_review_timeout_seconds,
+            max_bytes=settings.url_review_max_bytes,
+        )
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
@@ -439,6 +473,10 @@ class KnowledgeAssistService:
 
     @staticmethod
     def source_confidence(source_type: str, base_score: float = 0.65) -> float:
+        if source_type == "manual_save":
+            return min(0.93, max(0.62, base_score + 0.10))
+        if source_type == "web_review":
+            return min(0.86, max(0.50, base_score + 0.06))
         if source_type == "memory_same_session":
             return min(0.95, max(0.65, base_score + 0.18))
         if source_type == "memory_same_user":
@@ -574,6 +612,534 @@ class KnowledgeAssistService:
             pii_flag=pii_flag,
             allow_cross_user=allow_cross_user,
         )
+
+    @staticmethod
+    def _slug(value: str, *, fallback: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+        cleaned = cleaned.strip("._-")
+        return cleaned[:80] or fallback
+
+    def _actor_export_dir(self, actor_id: str) -> Path:
+        base = Path(self._settings.memory_export_dir).expanduser().resolve()
+        actor_slug = self._slug(actor_id or "anonymous", fallback="anonymous")
+        target = base / actor_slug
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _build_metadata_header(metadata: dict[str, str | None], *, content_hash: str) -> str:
+        lines = ["---"]
+        for key, value in metadata.items():
+            safe_value = (value or "").replace("\n", " ").strip()
+            lines.append(f"{key}: {safe_value}")
+        lines.append(f"content_sha256: {content_hash}")
+        lines.append("---")
+        return "\n".join(lines)
+
+    def _write_artifact_file(
+        self,
+        *,
+        actor_id: str,
+        prefix: str,
+        extension: str,
+        metadata: dict[str, str | None],
+        body: str,
+    ) -> tuple[str, str]:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        nonce = uuid.uuid4().hex[:8]
+        file_name = f"{prefix}_{timestamp}_{nonce}.{extension.lstrip('.')}"
+        target_dir = self._actor_export_dir(actor_id)
+        final_path = target_dir / file_name
+        content_hash = self._content_hash(body)
+        header = self._build_metadata_header(metadata, content_hash=content_hash)
+        payload = f"{header}\n\n{body.rstrip()}\n"
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(target_dir),
+            prefix=".tmp_",
+            suffix=".part",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            temp_path = tmp.name
+
+        os.replace(temp_path, final_path)
+        return str(final_path), content_hash
+
+    async def _add_memory_artifact(
+        self,
+        *,
+        artifact_id: str,
+        session_id: str,
+        actor_id: str,
+        request_id: str | None,
+        artifact_type: str,
+        source_url: str | None,
+        author: str | None,
+        summary: str | None,
+        file_path: str,
+        content_hash: str,
+    ) -> None:
+        await asyncio.to_thread(
+            self._store.add_memory_artifact,
+            artifact_id=artifact_id,
+            session_id=session_id,
+            actor_id=actor_id,
+            request_id=request_id,
+            artifact_type=artifact_type,
+            source_url=source_url,
+            author=author,
+            summary=summary,
+            file_path=file_path,
+            content_hash=content_hash,
+        )
+
+    async def _load_turns_for_snapshot(self, *, session_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._store.list_turns,
+            session_id=session_id,
+            limit=max(1, self._settings.direct_save_max_turns),
+        )
+
+    @staticmethod
+    def _format_session_snapshot(turns: list[dict[str, Any]]) -> str:
+        lines: list[str] = ["# Session Snapshot", ""]
+        if not turns:
+            lines.append("No turns available.")
+            return "\n".join(lines)
+
+        for row in turns:
+            speaker = str(row.get("speaker", "unknown")).strip() or "unknown"
+            created_at = str(row.get("created_at", "")).strip()
+            content = str(row.get("content", "")).strip()
+            if not content:
+                continue
+            header = f"## [{speaker}] {created_at}" if created_at else f"## [{speaker}]"
+            lines.append(header)
+            lines.append(content)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _fallback_summary_from_snapshot(snapshot_text: str, save_text: str) -> tuple[str, list[str]]:
+        fallback_line = save_text.strip() or "Saved conversation context for future retrieval."
+        compact = re.sub(r"\s+", " ", snapshot_text).strip()
+        if len(compact) > 260:
+            compact = compact[:257] + "..."
+        meaning = f"{fallback_line} Context: {compact}" if compact else fallback_line
+        return meaning, [fallback_line]
+
+    @staticmethod
+    def _extract_json_array(raw: Any) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            text = re.sub(r"\s+", " ", str(item)).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(text) > 240:
+                text = text[:237] + "..."
+            out.append(text)
+            if len(out) >= 6:
+                break
+        return out
+
+    async def _summarize_direct_save(
+        self,
+        *,
+        save_text: str,
+        snapshot_text: str,
+        model: str,
+    ) -> tuple[str, list[str]]:
+        try:
+            raw = await self._ollama.chat(
+                model=self._settings.knowledge_insight_model or model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize a saved conversation snapshot for memory indexing.\n"
+                            "Return JSON only with keys: meaning, key_facts.\n"
+                            "key_facts must be a JSON array of short strings."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Save request: {save_text}\n\n"
+                            f"Snapshot:\n{snapshot_text[:12000]}"
+                        ),
+                    },
+                ],
+                temperature=0.0,
+                num_ctx=max(2048, min(self._settings.default_num_ctx, 6144)),
+            )
+        except OllamaStreamError:
+            return self._fallback_summary_from_snapshot(snapshot_text, save_text)
+
+        payload = RecursivePlanner._extract_json_object(raw)
+        if not payload:
+            return self._fallback_summary_from_snapshot(snapshot_text, save_text)
+
+        meaning = re.sub(r"\s+", " ", str(payload.get("meaning", ""))).strip()
+        key_facts = self._extract_json_array(payload.get("key_facts"))
+        if not meaning:
+            meaning, fallback_facts = self._fallback_summary_from_snapshot(snapshot_text, save_text)
+            if not key_facts:
+                key_facts = fallback_facts
+        return meaning, key_facts
+
+    async def _index_custom_insights(
+        self,
+        *,
+        session_id: str,
+        actor_id: str,
+        model: str,
+        source_type: str,
+        insights: list[str],
+        quote_text: str,
+    ) -> int:
+        count = 0
+        pii_flag = self._detect_pii(quote_text)
+        allow_cross_user = self._allow_cross_user_for_content(quote_text)
+        for insight in insights:
+            clean = re.sub(r"\s+", " ", insight).strip()
+            if not clean:
+                continue
+            insight_id = str(uuid.uuid4())
+            try:
+                await asyncio.to_thread(
+                    self._store.add_insight,
+                    session_id=session_id,
+                    speaker="me",
+                    insight=clean,
+                    insight_id=insight_id,
+                    actor_id=actor_id,
+                    pii_flag=pii_flag,
+                    allow_cross_user=allow_cross_user,
+                    source_type=source_type,
+                    quote_text=quote_text[:240],
+                )
+                vector = await self._ollama.embed(
+                    model=self._settings.embedding_model,
+                    text=clean,
+                )
+                await self._memory_index.upsert(
+                    point_id=insight_id,
+                    vector=vector,
+                    payload={
+                        "insight_id": insight_id,
+                        "insight": clean,
+                        "source_session": session_id,
+                        "speaker": "me",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "actor_id": actor_id,
+                        "pii_flag": pii_flag,
+                        "allow_cross_user": allow_cross_user,
+                        "source_type": source_type,
+                        "quote_text": quote_text[:240],
+                    },
+                )
+                count += 1
+            except (OllamaStreamError, QdrantError, ValueError):
+                continue
+        return count
+
+    async def save_direct_memory(
+        self,
+        *,
+        session_id: str,
+        actor_id: str,
+        request_id: str,
+        model: str,
+        save_text: str,
+        author: str | None,
+    ) -> SavedMemoryEvent:
+        turns = await self._load_turns_for_snapshot(session_id=session_id)
+        snapshot_text = self._format_session_snapshot(turns)
+        meaning, key_facts = await self._summarize_direct_save(
+            save_text=save_text,
+            snapshot_text=snapshot_text,
+            model=model,
+        )
+
+        file_path, content_hash = self._write_artifact_file(
+            actor_id=actor_id,
+            prefix="session_snapshot",
+            extension="md",
+            metadata={
+                "artifact_type": "session_snapshot",
+                "session_id": session_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "author": author,
+                "source_url": None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            body=snapshot_text,
+        )
+
+        artifact_id = str(uuid.uuid4())
+        await self._add_memory_artifact(
+            artifact_id=artifact_id,
+            session_id=session_id,
+            actor_id=actor_id,
+            request_id=request_id,
+            artifact_type="session_snapshot",
+            source_url=None,
+            author=author,
+            summary=meaning[:500],
+            file_path=file_path,
+            content_hash=content_hash,
+        )
+
+        insights = [meaning]
+        insights.extend(key_facts)
+        if save_text.strip():
+            insights.append(save_text.strip())
+        indexed_count = await self._index_custom_insights(
+            session_id=session_id,
+            actor_id=actor_id,
+            model=model,
+            source_type="manual_save",
+            insights=insights,
+            quote_text=save_text.strip() or meaning,
+        )
+        note = "Session snapshot saved and indexed."
+        if indexed_count == 0:
+            note = "Session snapshot saved, but indexing yielded no records."
+
+        return SavedMemoryEvent(
+            artifact_id=artifact_id,
+            file_path=file_path,
+            indexed_count=indexed_count,
+            note=note,
+            summary=meaning,
+            author=author,
+        )
+
+    @staticmethod
+    def _fallback_page_meaning(page: ReviewedPage) -> tuple[str, list[str]]:
+        text = re.sub(r"\s+", " ", page.text).strip()
+        if len(text) > 700:
+            text = text[:697] + "..."
+        meaning = f"{page.title}: {text}" if text else page.title
+        facts: list[str] = []
+        for line in page.text.splitlines():
+            clean = re.sub(r"\s+", " ", line).strip()
+            if len(clean) < 20:
+                continue
+            facts.append(clean[:220])
+            if len(facts) >= 4:
+                break
+        if not facts and meaning:
+            facts.append(meaning[:220])
+        return meaning, facts
+
+    async def _summarize_reviewed_page(
+        self,
+        *,
+        page: ReviewedPage,
+        model: str,
+    ) -> tuple[str, list[str]]:
+        try:
+            raw = await self._ollama.chat(
+                model=self._settings.knowledge_insight_model or model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize reviewed web page content for memory retrieval.\n"
+                            "Return JSON only with keys: meaning, key_facts.\n"
+                            "key_facts must be concise factual bullets."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"URL: {page.final_url}\n"
+                            f"Title: {page.title}\n"
+                            f"Content:\n{page.text[:12000]}"
+                        ),
+                    },
+                ],
+                temperature=0.0,
+                num_ctx=max(2048, min(self._settings.default_num_ctx, 6144)),
+            )
+        except OllamaStreamError:
+            return self._fallback_page_meaning(page)
+
+        payload = RecursivePlanner._extract_json_object(raw)
+        if not payload:
+            return self._fallback_page_meaning(page)
+
+        meaning = re.sub(r"\s+", " ", str(payload.get("meaning", ""))).strip()
+        key_facts = self._extract_json_array(payload.get("key_facts"))
+        if not meaning:
+            meaning, fallback_facts = self._fallback_page_meaning(page)
+            if not key_facts:
+                key_facts = fallback_facts
+        return meaning, key_facts
+
+    async def review_and_save_urls(
+        self,
+        *,
+        session_id: str,
+        actor_id: str,
+        request_id: str,
+        model: str,
+        urls: list[str],
+        author: str | None = None,
+        start_index: int = 1,
+    ) -> tuple[list[URLReviewSavedItem], list[EvidenceCard]]:
+        items: list[URLReviewSavedItem] = []
+        evidence_cards: list[EvidenceCard] = []
+        next_label = max(1, start_index)
+        for raw_url in urls[: max(1, self._settings.url_review_max_urls)]:
+            try:
+                page = await self._url_review_client.fetch(url=raw_url)
+                meaning, key_facts = await self._summarize_reviewed_page(page=page, model=model)
+
+                raw_file, raw_hash = self._write_artifact_file(
+                    actor_id=actor_id,
+                    prefix="url_raw",
+                    extension="txt",
+                    metadata={
+                        "artifact_type": "url_raw",
+                        "session_id": session_id,
+                        "actor_id": actor_id,
+                        "request_id": request_id,
+                        "author": author,
+                        "source_url": page.final_url,
+                        "created_at": page.fetched_at,
+                    },
+                    body=page.text,
+                )
+
+                meaning_body_lines = [f"# {page.title}", "", f"URL: {page.final_url}", "", "## Meaning", meaning, ""]
+                if key_facts:
+                    meaning_body_lines.append("## Key Facts")
+                    for fact in key_facts:
+                        meaning_body_lines.append(f"- {fact}")
+                    meaning_body_lines.append("")
+                meaning_body = "\n".join(meaning_body_lines).rstrip() + "\n"
+                meaning_file, meaning_hash = self._write_artifact_file(
+                    actor_id=actor_id,
+                    prefix="url_meaning",
+                    extension="md",
+                    metadata={
+                        "artifact_type": "url_meaning",
+                        "session_id": session_id,
+                        "actor_id": actor_id,
+                        "request_id": request_id,
+                        "author": author,
+                        "source_url": page.final_url,
+                        "created_at": page.fetched_at,
+                    },
+                    body=meaning_body,
+                )
+
+                raw_artifact_id = str(uuid.uuid4())
+                await self._add_memory_artifact(
+                    artifact_id=raw_artifact_id,
+                    session_id=session_id,
+                    actor_id=actor_id,
+                    request_id=request_id,
+                    artifact_type="url_raw",
+                    source_url=page.final_url,
+                    author=author,
+                    summary=page.title[:240],
+                    file_path=raw_file,
+                    content_hash=raw_hash,
+                )
+                meaning_artifact_id = str(uuid.uuid4())
+                await self._add_memory_artifact(
+                    artifact_id=meaning_artifact_id,
+                    session_id=session_id,
+                    actor_id=actor_id,
+                    request_id=request_id,
+                    artifact_type="url_meaning",
+                    source_url=page.final_url,
+                    author=author,
+                    summary=meaning[:500],
+                    file_path=meaning_file,
+                    content_hash=meaning_hash,
+                )
+
+                insights = [f"{page.title}: {meaning}"]
+                insights.extend(key_facts)
+                indexed_count = await self._index_custom_insights(
+                    session_id=session_id,
+                    actor_id=actor_id,
+                    model=model,
+                    source_type="web_review",
+                    insights=insights,
+                    quote_text=f"{page.title} {meaning}",
+                )
+
+                source_type = "web_review"
+                label = f"E{next_label}"
+                next_label += 1
+                content_bits = [page.title, meaning]
+                for fact in key_facts[:4]:
+                    content_bits.append(f"fact: {fact}")
+                evidence_cards.append(
+                    EvidenceCard(
+                        evidence_id=f"web-review:{uuid.uuid4().hex[:8]}",
+                        source_type=source_type,
+                        actor_scope="web",
+                        label=label,
+                        content="\n".join(content_bits),
+                        url=page.final_url,
+                        source_session=None,
+                        confidence=self.source_confidence("web_review", base_score=0.72),
+                        pii_flag=False,
+                        used_verbatim=False,
+                    )
+                )
+
+                items.append(
+                    URLReviewSavedItem(
+                        url=raw_url,
+                        status="saved",
+                        raw_file=raw_file,
+                        meaning_file=meaning_file,
+                        artifact_id=meaning_artifact_id,
+                        indexed_count=indexed_count,
+                        error=None,
+                        final_url=page.final_url,
+                        title=page.title,
+                        meaning=meaning,
+                        key_facts=key_facts,
+                    )
+                )
+            except (URLReviewError, OSError, ValueError) as exc:
+                items.append(
+                    URLReviewSavedItem(
+                        url=raw_url,
+                        status="failed",
+                        raw_file=None,
+                        meaning_file=None,
+                        artifact_id=None,
+                        indexed_count=0,
+                        error=str(exc),
+                    )
+                )
+        return items, evidence_cards
 
     async def build_query_plan(
         self,
@@ -943,7 +1509,9 @@ class KnowledgeAssistService:
             snippet = str(row.get("snippet", "")).strip()
             if not url:
                 continue
-            source_type = self.classify_source_type_for_url(url)
+            source_type = str(row.get("source_type", "")).strip() or self.classify_source_type_for_url(url)
+            if not source_type.startswith("web_"):
+                source_type = self.classify_source_type_for_url(url)
             tag_hint = "user story / forum" if source_type == "web_user_story_forum" else source_type.replace("web_", "")
             label = f"E{idx}"
             cards.append(
