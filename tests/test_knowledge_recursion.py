@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
 from local_model_pro.config import Settings
 from local_model_pro.knowledge_assist import RecursivePlanner
@@ -78,6 +79,30 @@ class RecursivePlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SELECT", plan.db_query.upper())
         self.assertNotIn("SELECT", plan.web_query.upper())
         self.assertIn("Find statement", plan.db_query)
+
+    async def test_this_year_prompt_is_normalized_to_current_year(self) -> None:
+        settings = Settings(knowledge_recursion_passes=2)
+        planner = RecursivePlanner(
+            settings=settings,
+            ollama=_FakeOllama(
+                [
+                    '{"reason":"recency request","meaning":"current-year events","purpose":"find current-year events"}',
+                    '{"db_query":"what happened between us and iran in 2023","web_query":"recent events us iran 2023"}',
+                ]
+            ),
+        )
+
+        plan = await planner.build_plan(
+            prompt="what happened between US and Iran this year?",
+            history=[],
+            model="qwen2.5:7b",
+        )
+
+        current_year = str(datetime.now(timezone.utc).year)
+        self.assertIn(current_year, plan.db_query)
+        self.assertIn(current_year, plan.web_query)
+        self.assertNotIn("2023", plan.db_query)
+        self.assertNotIn("2023", plan.web_query)
 
 
 if __name__ == "__main__":

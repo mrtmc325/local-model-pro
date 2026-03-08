@@ -70,6 +70,51 @@ class MemoryLookupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Katie", results[0].insight)
             store.close()
 
+    async def test_search_memory_dedupes_duplicate_insights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConversationStore(db_path=str(Path(tmpdir) / "history.db"))
+            session_id = "dedupe-session"
+            store.upsert_session(
+                session_id=session_id,
+                model="qwen2.5:7b",
+                system_prompt=None,
+                actor_id="tester",
+            )
+            duplicate_text = "Recent events between US and Iran in 2026."
+            store.add_insight(
+                session_id=session_id,
+                speaker="me",
+                insight=duplicate_text,
+                actor_id="tester",
+            )
+            store.add_insight(
+                session_id=session_id,
+                speaker="me",
+                insight=duplicate_text,
+                actor_id="tester",
+            )
+
+            service = KnowledgeAssistService(
+                settings=Settings(knowledge_memory_top_k=5, knowledge_memory_score_threshold=0.2),
+                ollama=_EmbedFailingOllama(),  # type: ignore[arg-type]
+                store=store,
+                memory_index=_NoopMemoryIndex(),  # type: ignore[arg-type]
+            )
+
+            results = await service.search_memory(
+                query="recent events between us and iran this year",
+                actor_id="tester",
+                current_session_id=session_id,
+                query_plan=None,
+            )
+            normalized = {item.insight.strip().lower() for item in results}
+            self.assertEqual(len(normalized), len(results))
+            store.close()
+
+    def test_exact_request_detects_relative_time_terms(self) -> None:
+        self.assertTrue(KnowledgeAssistService.is_exact_concrete_request("what happened this year?", None))
+        self.assertTrue(KnowledgeAssistService.is_exact_concrete_request("latest updates on policy", None))
+
 
 if __name__ == "__main__":
     unittest.main()

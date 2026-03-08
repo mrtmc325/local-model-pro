@@ -26,6 +26,11 @@ _EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_PATTERN = re.compile(r"\b(?:\+?\d{1,2}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}\b")
 _NEGATION_PATTERN = re.compile(r"\b(no|not|never|none|without|isn't|aren't|wasn't|weren't)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"\b\d[\d,./:-]*\b")
+_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+_RELATIVE_THIS_YEAR_PATTERN = re.compile(
+    r"\b(this year|current year|year to date|ytd|so far this year)\b",
+    re.IGNORECASE,
+)
 _STOP_WORDS = {
     "a",
     "an",
@@ -78,6 +83,25 @@ _MEDIA_HINTS = {
     "bbc.com",
     "cnn.com",
     "theguardian.com",
+}
+_META_MEMORY_NOISE_HINTS = {
+    "for accurate details",
+    "best to refer to recent news",
+    "check recent news sources",
+    "official statements",
+    "no specific information available",
+    "lacks supporting evidence",
+}
+_RECENCY_HINTS = {
+    "this year",
+    "current year",
+    "year to date",
+    "ytd",
+    "today",
+    "this month",
+    "this week",
+    "latest",
+    "recent",
 }
 
 
@@ -212,6 +236,25 @@ class RecursivePlanner:
             normalized = f"{normalized[:277]}..."
         return normalized
 
+    @staticmethod
+    def _normalize_relative_time_references(prompt: str, candidate: str) -> str:
+        prompt_text = (prompt or "").strip().lower()
+        query_text = (candidate or "").strip()
+        if not query_text:
+            return query_text
+
+        current_year = str(datetime.now(timezone.utc).year)
+        if _RELATIVE_THIS_YEAR_PATTERN.search(prompt_text):
+            if _YEAR_PATTERN.search(query_text):
+                query_text = _YEAR_PATTERN.sub(current_year, query_text)
+            elif current_year not in query_text:
+                query_text = f"{query_text} {current_year}"
+
+        if "today" in prompt_text and "today" not in query_text.lower():
+            query_text = f"{query_text} today"
+
+        return re.sub(r"\s+", " ", query_text).strip()
+
     def _fallback(self, prompt: str) -> QueryPlan:
         text = prompt.strip()
         return QueryPlan(
@@ -325,12 +368,14 @@ class RecursivePlanner:
             meaning=meaning,
             purpose=purpose,
         )
+        db_query = self._normalize_relative_time_references(prompt, db_query)
         web_query = self._sanitize_lookup_query(
             self._normalize_string(pass2.get("web_query")) or prompt,
             prompt=prompt,
             meaning=meaning,
             purpose=purpose,
         )
+        web_query = self._normalize_relative_time_references(prompt, web_query)
         if passes == 2:
             return QueryPlan(
                 reason=reason,
@@ -378,17 +423,23 @@ class RecursivePlanner:
             reason=final_reason,
             meaning=final_meaning,
             purpose=final_purpose,
-            db_query=self._sanitize_lookup_query(
-                self._normalize_string(pass3.get("db_query")) or db_query,
-                prompt=prompt,
-                meaning=final_meaning,
-                purpose=final_purpose,
+            db_query=self._normalize_relative_time_references(
+                prompt,
+                self._sanitize_lookup_query(
+                    self._normalize_string(pass3.get("db_query")) or db_query,
+                    prompt=prompt,
+                    meaning=final_meaning,
+                    purpose=final_purpose,
+                ),
             ),
-            web_query=self._sanitize_lookup_query(
-                self._normalize_string(pass3.get("web_query")) or web_query,
-                prompt=prompt,
-                meaning=final_meaning,
-                purpose=final_purpose,
+            web_query=self._normalize_relative_time_references(
+                prompt,
+                self._sanitize_lookup_query(
+                    self._normalize_string(pass3.get("web_query")) or web_query,
+                    prompt=prompt,
+                    meaning=final_meaning,
+                    purpose=final_purpose,
+                ),
             ),
             fallback=False,
         )
@@ -480,11 +531,11 @@ class KnowledgeAssistService:
         if source_type == "web_review":
             return min(0.86, max(0.50, base_score + 0.06))
         if source_type == "memory_same_session":
-            return min(0.95, max(0.65, base_score + 0.18))
+            return min(0.90, max(0.60, base_score + 0.08))
         if source_type == "memory_same_user":
-            return min(0.92, max(0.60, base_score + 0.12))
+            return min(0.88, max(0.56, base_score + 0.08))
         if source_type == "memory_shared":
-            return min(0.88, max(0.50, base_score + 0.08))
+            return min(0.84, max(0.46, base_score + 0.04))
         if source_type == "web_official":
             return min(0.90, max(0.58, base_score + 0.12))
         if source_type == "web_media":
@@ -1297,6 +1348,46 @@ class KnowledgeAssistService:
             return False
         return bool(allow_cross_user)
 
+    @staticmethod
+    def _is_meta_memory_noise(item: MemoryResult) -> bool:
+        text = f"{item.insight} {item.quote_text or ''}".lower()
+        return any(phrase in text for phrase in _META_MEMORY_NOISE_HINTS)
+
+    @staticmethod
+    def _query_has_recency_intent(query: str, query_plan: QueryPlan | None = None) -> bool:
+        combined = " ".join(
+            part.strip().lower()
+            for part in [
+                query or "",
+                query_plan.db_query if query_plan else "",
+                query_plan.web_query if query_plan else "",
+                query_plan.meaning if query_plan else "",
+                query_plan.purpose if query_plan else "",
+            ]
+            if part
+        )
+        return any(hint in combined for hint in _RECENCY_HINTS)
+
+    def _apply_memory_quality_adjustment(
+        self,
+        *,
+        candidate: MemoryResult,
+        score: float,
+        recency_intent: bool,
+    ) -> float:
+        adjusted = score
+        if self._is_meta_memory_noise(candidate):
+            adjusted -= 0.18
+            if candidate.source_type == "insight":
+                adjusted -= 0.06
+            if recency_intent:
+                adjusted -= 0.08
+        return max(0.0, min(1.0, adjusted))
+
+    @staticmethod
+    def _insight_dedupe_key(item: MemoryResult) -> str:
+        return re.sub(r"\s+", " ", item.insight).strip().lower()
+
     async def search_memory(
         self,
         *,
@@ -1309,6 +1400,7 @@ class KnowledgeAssistService:
         if not normalized:
             return []
 
+        recency_intent = self._query_has_recency_intent(normalized, query_plan)
         expanded_queries = self._expand_memory_queries(query=normalized, query_plan=query_plan)
         terms = self._extract_terms(" ".join(expanded_queries), max_terms=28)
         results_map: dict[str, MemoryResult] = {}
@@ -1340,7 +1432,11 @@ class KnowledgeAssistService:
                 candidate = MemoryResult(
                     evidence_id=item.evidence_id,
                     insight=item.insight,
-                    score=combined_score,
+                    score=self._apply_memory_quality_adjustment(
+                        candidate=item,
+                        score=combined_score,
+                        recency_intent=recency_intent,
+                    ),
                     source_session=item.source_session,
                     speaker=item.speaker,
                     created_at=item.created_at,
@@ -1366,10 +1462,27 @@ class KnowledgeAssistService:
         for insight in lexical_insights:
             overlap = self._term_overlap_score(f"{insight.insight} {insight.quote_text or ''}", terms)
             score = min(0.25 + overlap * 0.55, 0.90)
-            candidate = MemoryResult(
+            base_candidate = MemoryResult(
                 evidence_id=insight.insight_id,
                 insight=insight.insight,
                 score=score,
+                source_session=insight.session_id,
+                speaker=insight.speaker,
+                created_at=insight.created_at,
+                actor_id=insight.actor_id,
+                pii_flag=insight.pii_flag,
+                allow_cross_user=insight.allow_cross_user,
+                source_type=insight.source_type,
+                quote_text=insight.quote_text,
+            )
+            candidate = MemoryResult(
+                evidence_id=insight.insight_id,
+                insight=insight.insight,
+                score=self._apply_memory_quality_adjustment(
+                    candidate=base_candidate,
+                    score=score,
+                    recency_intent=recency_intent,
+                ),
                 source_session=insight.session_id,
                 speaker=insight.speaker,
                 created_at=insight.created_at,
@@ -1431,7 +1544,18 @@ class KnowledgeAssistService:
                 item.created_at,
             )
         )
-        return ranked[: self._settings.knowledge_memory_top_k]
+        deduped: list[MemoryResult] = []
+        seen_insights: set[str] = set()
+        for item in ranked:
+            dedupe_key = self._insight_dedupe_key(item)
+            if dedupe_key and dedupe_key in seen_insights:
+                continue
+            if dedupe_key:
+                seen_insights.add(dedupe_key)
+            deduped.append(item)
+            if len(deduped) >= self._settings.knowledge_memory_top_k:
+                break
+        return deduped
 
     @staticmethod
     def is_exact_concrete_request(prompt: str, plan: QueryPlan | None) -> bool:
@@ -1448,6 +1572,13 @@ class KnowledgeAssistService:
             "specific",
             "verbatim",
             "quote",
+            "this year",
+            "current year",
+            "year to date",
+            "today",
+            "this week",
+            "this month",
+            "latest",
         ]
         return any(cue in text for cue in cues)
 
