@@ -15,10 +15,16 @@ It is designed for Apple Silicon setups (like MacBook Pro M1 Pro) using Ollama a
   - 3-pass recursive intent/query planning (`reason`, `meaning`, `purpose`)
   - Memory-first lookup against shared local insights (Qdrant)
   - Optional web lookup after memory retrieval
+- New `Grounded Mode` (default ON):
+  - Forces Knowledge Assist ON
+  - Profiles: `strict` (memory-first only for chat) and `balanced` (memory + optional web for chat)
+  - Claim/evidence grounding with confidence, citations, and conflict signaling
+  - Clarifying-question fallback for exact requests when evidence is weak/conflicting
+  - Auditable grounded claim/evidence ledger in SQLite
 - Persistent transcript storage in SQLite using `me` / `you` speaker format
 - Insights-only retrieval policy (raw transcripts are not injected into generation context)
 - Terminal prompt CLI client
-- Runtime commands (`/help`, `/model`, `/web`, `/knowledge`, `/search`, `/reset`, `/status`, `/exit`)
+- Runtime commands (`/help`, `/model`, `/web`, `/knowledge`, `/grounded`, `/profile`, `/search`, `/reset`, `/status`, `/exit`)
 
 ## Prerequisites
 
@@ -71,6 +77,10 @@ Environment variable overrides:
 - `KNOWLEDGE_MEMORY_TOP_K` (default: `5`)
 - `KNOWLEDGE_MEMORY_SCORE_THRESHOLD` (default: `0.25`)
 - `EMBEDDING_MODEL` (default: `nomic-embed-text`)
+- `GROUNDED_MODE_DEFAULT` (default: `true`)
+- `GROUNDED_PROFILE_DEFAULT` (default: `balanced`, options: `strict|balanced`)
+- `GROUNDED_TIMEOUT_SECONDS` (default: `25`)
+- `DEFAULT_ACTOR_ID` (default: `anonymous`)
 
 ## Run with Docker Compose
 
@@ -97,9 +107,13 @@ In the frontend:
 1. Click `Refresh` to load downloaded Ollama models.
 2. Select a model (or type a tag manually).
 3. Keep `Knowledge Assist` enabled to run recursive prompt breakdown and shared-memory retrieval.
-4. Optional: enable `Web Assist` to include live web context after memory retrieval.
-5. Click `Connect`, then chat.
-6. Use `Search Web` for direct web lookups (still memory-first if Knowledge Assist is enabled).
+4. Keep `Grounded Mode` enabled to enforce evidence + confidence behavior.
+5. Choose profile:
+   - `balanced`: web evidence can be included in chat when `Web Assist` is ON
+   - `strict`: chat grounding stays memory-first; web remains available via direct web search
+6. Optional: enable `Web Assist` to include live web context after memory retrieval.
+7. Click `Connect`, then chat.
+8. Use `Search Web` for direct web lookups (memory-first if Knowledge Assist is enabled).
 
 Stop:
 
@@ -113,7 +127,7 @@ In another terminal:
 
 ```bash
 source .venv/bin/activate
-local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b --knowledge-assist on --web-assist off
+local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b --knowledge-assist on --grounded-mode on --grounded-profile balanced --web-assist off
 ```
 
 ## Retrieval order
@@ -126,30 +140,45 @@ For each prompt when `Knowledge Assist` is enabled:
 
 Only insight abstractions are used from shared memory. Raw transcript text is persisted but not directly injected into model context.
 
+When `Grounded Mode` is enabled:
+
+1. Knowledge recursion (`reason/meaning/purpose`) runs first.
+2. Local memory retrieval runs before web retrieval.
+3. Grounding evaluates claims against evidence cards.
+4. Responses include source/confidence line, claim confidence section, and source footer.
+5. Exact concrete requests fail closed with a clarifying question when evidence is weak/conflicting.
+
 ## Wire Protocol (JSON over WebSocket)
 
 Client -> server:
 
-- `{"type":"hello","model":"qwen2.5:7b","system_prompt":"...optional...","web_assist_enabled":false,"knowledge_assist_enabled":true}`
+- `{"type":"hello","model":"qwen2.5:7b","actor_id":"anonymous","system_prompt":"...optional...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
 - `{"type":"chat","prompt":"..."}`
 - `{"type":"set_model","model":"llama3.1:8b"}`
 - `{"type":"set_web_mode","enabled":true}`
 - `{"type":"set_knowledge_mode","enabled":true}`
+- `{"type":"set_grounded_mode","enabled":true}`
+- `{"type":"set_grounded_profile","profile":"strict"}`
 - `{"type":"web_search","query":"latest weather alert in vermont","max_results":5}`
 - `{"type":"reset"}`
 - `{"type":"status"}`
 
 Server -> client:
 
-- `{"type":"ready","session_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true}`
-- `{"type":"query_plan","reason":"...","meaning":"...","purpose":"...","db_query":"...","web_query":"...","fallback":false}`
-- `{"type":"memory_results","query":"...","results":[{"insight":"...","score":0.0,"source_session":"..."}]}`
+- `{"type":"ready","session_id":"...","actor_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
+- `{"type":"query_plan","reason":"...","meaning":"...","purpose":"...","db_query":"...","web_query":"...","fallback":false,"exact_required":true}`
+- `{"type":"memory_results","query":"...","results":[{"insight":"...","score":0.0,"source_session":"...","actor_scope":"same_user","evidence_id":"..."}]}`
+- `{"type":"evidence_used","results":[{"label":"E1","source_type":"memory_same_user","confidence":0.88,"content":"...","url":null}]}`
+- `{"type":"grounding_status","status":"full|partial|insufficient","profile":"balanced","exact_required":true,"overall_confidence":0.81,"note":"..."}`
+- `{"type":"clarify_needed","question":"..."}`
 - `{"type":"start","request_id":"..."}`
 - `{"type":"token","request_id":"...","text":"..."}`
-- `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true}`
-- `{"type":"status","model":"...","message_count":N,"web_assist_enabled":false,"knowledge_assist_enabled":true}`
+- `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
+- `{"type":"status","model":"...","message_count":N,"web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
 - `{"type":"web_mode","enabled":true}`
 - `{"type":"knowledge_mode","enabled":true}`
+- `{"type":"grounded_mode","enabled":true}`
+- `{"type":"grounded_profile","profile":"strict"}`
 - `{"type":"web_results","query":"...","retrieved_at":"...","results":[...]}`
 - `{"type":"info","message":"..."}`
 - `{"type":"error","message":"..."}`

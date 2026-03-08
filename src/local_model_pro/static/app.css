@@ -122,6 +122,13 @@ body {
   overflow: hidden;
 }
 
+.console-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 330px);
+  gap: 0.6rem;
+}
+
 .panel h2,
 .terminal-section h2 {
   margin: 0;
@@ -222,9 +229,11 @@ button:disabled {
 #modelSelect {
   min-height: 186px;
   max-height: 300px;
-  font-size: 0.96rem;
+  font-size: 0.93rem;
   line-height: 1.35;
   padding: 0.45rem 0.55rem;
+  font-family: "Nunito Sans", "Segoe UI", sans-serif;
+  letter-spacing: 0.01em;
 }
 
 #refreshModelsBtn {
@@ -266,6 +275,67 @@ button:disabled {
   background: var(--surface-2);
   display: grid;
   gap: 0.55rem;
+}
+
+.evidence-panel {
+  min-height: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  background: rgba(13, 28, 43, 0.88);
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.evidence-head {
+  padding: 0.6rem 0.65rem 0.45rem;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.evidence-log {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.48rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.evidence-empty {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.evidence-item {
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.55rem;
+  background: rgba(10, 22, 34, 0.7);
+  padding: 0.42rem 0.5rem;
+  display: grid;
+  gap: 0.24rem;
+}
+
+.evidence-meta {
+  font-size: 0.77rem;
+  color: #bdd2e4;
+}
+
+.evidence-content {
+  font-size: 0.81rem;
+  color: var(--text);
+  line-height: 1.33;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.evidence-link {
+  color: #92d6ff;
+  text-decoration: none;
+  font-size: 0.77rem;
+}
+
+.evidence-link:hover {
+  text-decoration: underline;
 }
 
 .msg {
@@ -319,6 +389,11 @@ button:disabled {
   .terminal-section {
     height: clamp(480px, 70vh, 720px);
     max-height: 720px;
+  }
+
+  .console-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(240px, 1fr) minmax(120px, 190px);
   }
 }
 

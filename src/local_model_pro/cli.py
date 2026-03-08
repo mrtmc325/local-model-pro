@@ -43,6 +43,18 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["on", "off"],
         help="Enable knowledge assist by default at connect time (default: on)",
     )
+    parser.add_argument(
+        "--grounded-mode",
+        default="on",
+        choices=["on", "off"],
+        help="Enable grounded mode by default at connect time (default: on)",
+    )
+    parser.add_argument(
+        "--grounded-profile",
+        default="balanced",
+        choices=["strict", "balanced"],
+        help="Grounded profile for responses (default: balanced)",
+    )
     return parser
 
 
@@ -52,6 +64,8 @@ def _print_help() -> None:
     print("  /model <name>           Switch model for this session")
     print("  /web <on|off>           Enable or disable web assist for prompts")
     print("  /knowledge <on|off>     Enable or disable recursive knowledge assist")
+    print("  /grounded <on|off>      Enable or disable grounded mode")
+    print("  /profile <strict|balanced>  Set grounded profile")
     print("  /search <query>         Run a direct web search")
     print("  /reset                  Clear chat memory")
     print("  /status                 Show server session status")
@@ -118,6 +132,94 @@ def _print_web_results(msg: dict[str, Any]) -> None:
             print(f"web>    {snippet}")
 
 
+def _print_evidence_used(msg: dict[str, Any]) -> None:
+    results = msg.get("results", [])
+    print("evidence> used")
+    if not isinstance(results, list) or not results:
+        print("evidence> none")
+        return
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label", "")).strip() or "E?"
+        source_type = str(item.get("source_type", "")).strip() or "unknown"
+        confidence = item.get("confidence", 0.0)
+        url = str(item.get("url", "")).strip()
+        source_session = str(item.get("source_session", "")).strip()
+        print(f"evidence> {label} {source_type} conf={confidence}")
+        if url:
+            print(f"evidence>    {url}")
+        elif source_session:
+            print(f"evidence>    session={source_session}")
+
+
+def _print_grounding_status(msg: dict[str, Any]) -> None:
+    print(
+        "grounding> "
+        f"status={msg.get('status')} "
+        f"profile={msg.get('profile')} "
+        f"exact_required={msg.get('exact_required')} "
+        f"overall_confidence={msg.get('overall_confidence')}"
+    )
+    note = str(msg.get("note", "")).strip()
+    if note:
+        print(f"grounding> note={note}")
+
+
+def _print_clarify_needed(msg: dict[str, Any]) -> None:
+    question = str(msg.get("question", "")).strip() or "Please clarify the exact fact to verify."
+    print(f"clarify> {question}")
+
+
+def _print_event(msg: dict[str, Any]) -> str:
+    msg_type = str(msg.get("type", ""))
+    if msg_type == "web_mode":
+        print(f"web> enabled={msg.get('enabled')}")
+    elif msg_type == "knowledge_mode":
+        print(f"knowledge> enabled={msg.get('enabled')}")
+    elif msg_type == "grounded_mode":
+        print(f"grounded> enabled={msg.get('enabled')}")
+    elif msg_type == "grounded_profile":
+        print(f"grounded> profile={msg.get('profile')}")
+    elif msg_type == "query_plan":
+        _print_query_plan(msg)
+    elif msg_type == "memory_results":
+        _print_memory_results(msg)
+    elif msg_type == "web_results":
+        _print_web_results(msg)
+    elif msg_type == "evidence_used":
+        _print_evidence_used(msg)
+    elif msg_type == "grounding_status":
+        _print_grounding_status(msg)
+    elif msg_type == "clarify_needed":
+        _print_clarify_needed(msg)
+    elif msg_type == "info":
+        print(f"info> {msg.get('message')}")
+    elif msg_type == "error":
+        print(f"error> {msg.get('message')}")
+    return msg_type
+
+
+async def _consume_mode_update(
+    ws: websockets.ClientConnection,
+    *,
+    expected_type: str,
+) -> None:
+    saw_expected = False
+    for _ in range(4):
+        try:
+            msg = await asyncio.wait_for(_recv_json(ws), timeout=0.8 if not saw_expected else 0.2)
+        except TimeoutError:
+            break
+        msg_type = _print_event(msg)
+        if msg_type == expected_type:
+            saw_expected = True
+        if msg_type == "error":
+            break
+    if not saw_expected:
+        print(f"info> no {expected_type} event received")
+
+
 async def _consume_status(ws: websockets.ClientConnection) -> None:
     while True:
         msg = await _recv_json(ws)
@@ -128,60 +230,28 @@ async def _consume_status(ws: websockets.ClientConnection) -> None:
                 f"model={msg.get('model')} "
                 f"messages={msg.get('message_count')} "
                 f"web_assist={msg.get('web_assist_enabled')} "
-                f"knowledge_assist={msg.get('knowledge_assist_enabled')}"
+                f"knowledge_assist={msg.get('knowledge_assist_enabled')} "
+                f"grounded_mode={msg.get('grounded_mode_enabled')} "
+                f"grounded_profile={msg.get('grounded_profile')}"
             )
             return
-        if msg_type == "web_mode":
-            print(f"web> enabled={msg.get('enabled')}")
-            continue
-        if msg_type == "knowledge_mode":
-            print(f"knowledge> enabled={msg.get('enabled')}")
-            continue
-        if msg_type == "query_plan":
-            _print_query_plan(msg)
-            continue
-        if msg_type == "memory_results":
-            _print_memory_results(msg)
-            continue
-        if msg_type == "web_results":
-            _print_web_results(msg)
-            continue
-        if msg_type == "info":
-            print(f"info> {msg.get('message')}")
-            continue
+        _print_event(msg)
         if msg_type == "error":
-            print(f"error> {msg.get('message')}")
             return
 
 
 async def _consume_web_search(ws: websockets.ClientConnection) -> None:
     saw_web_results = False
     while True:
-        msg = await _recv_json(ws)
+        try:
+            msg = await asyncio.wait_for(_recv_json(ws), timeout=2.0 if not saw_web_results else 0.25)
+        except TimeoutError:
+            return
         msg_type = msg.get("type")
-        if msg_type == "query_plan":
-            _print_query_plan(msg)
-            continue
-        if msg_type == "memory_results":
-            _print_memory_results(msg)
-            continue
+        _print_event(msg)
         if msg_type == "web_results":
-            _print_web_results(msg)
             saw_web_results = True
-            return
-        if msg_type == "web_mode":
-            print(f"web> enabled={msg.get('enabled')}")
-            continue
-        if msg_type == "knowledge_mode":
-            print(f"knowledge> enabled={msg.get('enabled')}")
-            continue
-        if msg_type == "info":
-            print(f"info> {msg.get('message')}")
-            continue
-        if msg_type == "error":
-            print(f"error> {msg.get('message')}")
-            return
-        if saw_web_results:
+        elif msg_type == "error":
             return
 
 
@@ -193,27 +263,21 @@ async def _consume_stream(ws: websockets.ClientConnection) -> None:
 
         if msg_type == "start":
             continue
-        if msg_type == "query_plan":
+        if msg_type in {
+            "query_plan",
+            "memory_results",
+            "web_results",
+            "web_mode",
+            "knowledge_mode",
+            "grounded_mode",
+            "grounded_profile",
+            "evidence_used",
+            "grounding_status",
+            "clarify_needed",
+            "info",
+        }:
             print("")
-            _print_query_plan(msg)
-            print("ai> ", end="", flush=True)
-            continue
-        if msg_type == "memory_results":
-            print("")
-            _print_memory_results(msg)
-            print("ai> ", end="", flush=True)
-            continue
-        if msg_type == "web_results":
-            print("")
-            _print_web_results(msg)
-            print("ai> ", end="", flush=True)
-            continue
-        if msg_type == "web_mode":
-            print(f"\nweb> enabled={msg.get('enabled')}")
-            print("ai> ", end="", flush=True)
-            continue
-        if msg_type == "knowledge_mode":
-            print(f"\nknowledge> enabled={msg.get('enabled')}")
+            _print_event(msg)
             print("ai> ", end="", flush=True)
             continue
         if msg_type == "token":
@@ -222,12 +286,9 @@ async def _consume_stream(ws: websockets.ClientConnection) -> None:
         if msg_type == "done":
             print("")
             return
-        if msg_type == "info":
-            print(f"\ninfo> {msg.get('message')}")
-            print("ai> ", end="", flush=True)
-            continue
         if msg_type == "error":
-            print(f"\nerror> {msg.get('message')}")
+            print("")
+            _print_event(msg)
             return
 
 
@@ -238,6 +299,8 @@ async def run_cli(
     *,
     web_assist: bool,
     knowledge_assist: bool,
+    grounded_mode: bool,
+    grounded_profile: str,
 ) -> int:
     print(f"Connecting to {url}")
     async with websockets.connect(url, max_size=None) as ws:
@@ -252,6 +315,8 @@ async def run_cli(
             "type": "hello",
             "web_assist_enabled": web_assist,
             "knowledge_assist_enabled": knowledge_assist,
+            "grounded_mode_enabled": grounded_mode,
+            "grounded_profile": grounded_profile,
         }
         if model:
             hello_payload["model"] = model
@@ -267,23 +332,12 @@ async def run_cli(
                     "ready> "
                     f"model={msg.get('model')} "
                     f"web_assist={msg.get('web_assist_enabled')} "
-                    f"knowledge_assist={msg.get('knowledge_assist_enabled')}"
+                    f"knowledge_assist={msg.get('knowledge_assist_enabled')} "
+                    f"grounded_mode={msg.get('grounded_mode_enabled')} "
+                    f"grounded_profile={msg.get('grounded_profile')}"
                 )
                 break
-            if msg_type == "info":
-                print(f"info> {msg.get('message')}")
-            elif msg_type == "web_mode":
-                print(f"web> enabled={msg.get('enabled')}")
-            elif msg_type == "knowledge_mode":
-                print(f"knowledge> enabled={msg.get('enabled')}")
-            elif msg_type == "query_plan":
-                _print_query_plan(msg)
-            elif msg_type == "memory_results":
-                _print_memory_results(msg)
-            elif msg_type == "web_results":
-                _print_web_results(msg)
-            elif msg_type == "error":
-                print(f"error> {msg.get('message')}")
+            _print_event(msg)
 
         _print_help()
 
@@ -320,15 +374,7 @@ async def run_cli(
                     print("error> usage: /web <on|off>")
                     continue
                 await _send(ws, {"type": "set_web_mode", "enabled": parts[1] == "on"})
-                for _ in range(2):
-                    msg = await _recv_json(ws)
-                    msg_type = msg.get("type")
-                    if msg_type == "web_mode":
-                        print(f"web> enabled={msg.get('enabled')}")
-                    elif msg_type == "info":
-                        print(f"info> {msg.get('message')}")
-                    elif msg_type == "error":
-                        print(f"error> {msg.get('message')}")
+                await _consume_mode_update(ws, expected_type="web_mode")
                 continue
             if user_input.startswith("/knowledge"):
                 parts = shlex.split(user_input)
@@ -336,15 +382,23 @@ async def run_cli(
                     print("error> usage: /knowledge <on|off>")
                     continue
                 await _send(ws, {"type": "set_knowledge_mode", "enabled": parts[1] == "on"})
-                for _ in range(2):
-                    msg = await _recv_json(ws)
-                    msg_type = msg.get("type")
-                    if msg_type == "knowledge_mode":
-                        print(f"knowledge> enabled={msg.get('enabled')}")
-                    elif msg_type == "info":
-                        print(f"info> {msg.get('message')}")
-                    elif msg_type == "error":
-                        print(f"error> {msg.get('message')}")
+                await _consume_mode_update(ws, expected_type="knowledge_mode")
+                continue
+            if user_input.startswith("/grounded"):
+                parts = shlex.split(user_input)
+                if len(parts) != 2 or parts[1] not in {"on", "off"}:
+                    print("error> usage: /grounded <on|off>")
+                    continue
+                await _send(ws, {"type": "set_grounded_mode", "enabled": parts[1] == "on"})
+                await _consume_mode_update(ws, expected_type="grounded_mode")
+                continue
+            if user_input.startswith("/profile"):
+                parts = shlex.split(user_input)
+                if len(parts) != 2 or parts[1] not in {"strict", "balanced"}:
+                    print("error> usage: /profile <strict|balanced>")
+                    continue
+                await _send(ws, {"type": "set_grounded_profile", "profile": parts[1]})
+                await _consume_mode_update(ws, expected_type="grounded_profile")
                 continue
             if user_input.startswith("/search"):
                 parts = shlex.split(user_input)
@@ -371,6 +425,8 @@ def main() -> None:
                 args.system_prompt,
                 web_assist=_flag(args.web_assist),
                 knowledge_assist=_flag(args.knowledge_assist),
+                grounded_mode=_flag(args.grounded_mode),
+                grounded_profile=args.grounded_profile,
             )
         )
     except KeyboardInterrupt:

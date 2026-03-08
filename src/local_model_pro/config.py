@@ -29,6 +29,14 @@ class Settings:
         os.getenv("KNOWLEDGE_MEMORY_SCORE_THRESHOLD", "0.25")
     )
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+    grounded_mode_default: bool = _env_flag("GROUNDED_MODE_DEFAULT", "true")
+    grounded_profile_default: str = (
+        os.getenv("GROUNDED_PROFILE_DEFAULT", "balanced").strip().lower()
+        if os.getenv("GROUNDED_PROFILE_DEFAULT", "balanced").strip().lower() in {"strict", "balanced"}
+        else "balanced"
+    )
+    grounded_timeout_seconds: int = int(os.getenv("GROUNDED_TIMEOUT_SECONDS", "25"))
+    default_actor_id: str = os.getenv("DEFAULT_ACTOR_ID", "anonymous").strip() or "anonymous"
 
 
 settings = Settings()

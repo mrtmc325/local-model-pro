@@ -8,11 +8,17 @@ import httpx
 
 @dataclass(frozen=True)
 class MemoryResult:
+    evidence_id: str
     insight: str
     score: float
     source_session: str
     speaker: str
     created_at: str
+    actor_id: str
+    pii_flag: bool
+    allow_cross_user: bool
+    source_type: str
+    quote_text: str | None
 
 
 class QdrantError(RuntimeError):
@@ -144,6 +150,12 @@ class QdrantMemoryIndex:
             source_session = str(payload_obj.get("source_session", "")).strip()
             speaker = str(payload_obj.get("speaker", "")).strip()
             created_at = str(payload_obj.get("created_at", "")).strip()
+            actor_id = str(payload_obj.get("actor_id", "anonymous")).strip() or "anonymous"
+            source_type = str(payload_obj.get("source_type", "insight")).strip() or "insight"
+            quote_text = payload_obj.get("quote_text")
+            if quote_text is not None:
+                quote_text = str(quote_text)
+
             if not insight or not source_session:
                 continue
             score_raw = item.get("score", 0.0)
@@ -151,14 +163,22 @@ class QdrantMemoryIndex:
                 score = float(score_raw)
             except (TypeError, ValueError):
                 score = 0.0
+            evidence_id = str(payload_obj.get("insight_id") or item.get("id") or "").strip()
+            if not evidence_id:
+                continue
             results.append(
                 MemoryResult(
+                    evidence_id=evidence_id,
                     insight=insight,
                     score=score,
                     source_session=source_session,
                     speaker=speaker or "unknown",
                     created_at=created_at,
+                    actor_id=actor_id,
+                    pii_flag=bool(payload_obj.get("pii_flag", False)),
+                    allow_cross_user=bool(payload_obj.get("allow_cross_user", True)),
+                    source_type=source_type,
+                    quote_text=quote_text,
                 )
             )
         return results
-

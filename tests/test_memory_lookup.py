@@ -31,11 +31,17 @@ class MemoryLookupTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ConversationStore(db_path=str(Path(tmpdir) / "history.db"))
             session_id = "shared-memory-1"
-            store.upsert_session(session_id=session_id, model="qwen2.5:7b", system_prompt=None)
+            store.upsert_session(
+                session_id=session_id,
+                model="qwen2.5:7b",
+                system_prompt=None,
+                actor_id="tester",
+            )
             store.add_insight(
                 session_id=session_id,
                 speaker="me",
                 insight="Operator described Katie as central to success and motivation.",
+                actor_id="tester",
             )
 
             service = KnowledgeAssistService(
@@ -53,7 +59,12 @@ class MemoryLookupTests(unittest.IsolatedAsyncioTestCase):
                 web_query="what did operator say about Katie",
                 fallback=False,
             )
-            results = await service.search_memory(query=plan.db_query, query_plan=plan)
+            results = await service.search_memory(
+                query=plan.db_query,
+                actor_id="tester",
+                current_session_id=session_id,
+                query_plan=plan,
+            )
 
             self.assertGreaterEqual(len(results), 1)
             self.assertIn("Katie", results[0].insight)

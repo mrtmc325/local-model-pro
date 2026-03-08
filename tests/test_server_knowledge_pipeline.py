@@ -9,7 +9,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from local_model_pro.conversation_store import ConversationStore
-from local_model_pro.knowledge_assist import QueryPlan
+from local_model_pro.knowledge_assist import GroundedClaim, GroundedResponse, QueryPlan
 from local_model_pro.qdrant_memory import MemoryResult
 from local_model_pro.web_search import WebSearchResult
 
@@ -19,14 +19,18 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self,
         *,
         web_assist_enabled: bool,
-    ) -> tuple[list[str], list[str], list[dict[str, str]]]:
+        grounded_mode_enabled: bool,
+    ) -> tuple[list[str], list[str], list[dict[str, str]], list[dict[str, object]]]:
         from local_model_pro import server
 
         calls: list[str] = []
         emitted_types: list[str] = []
         streamed_messages: list[dict[str, str]] = []
+        emitted_payloads: list[dict[str, object]] = []
 
         async def fake_build_query_plan(self, *, prompt: str, history: list[dict[str, str]], model: str) -> QueryPlan:  # type: ignore[no-untyped-def]
+            _ = history
+            _ = model
             calls.append("build_query_plan")
             return QueryPlan(
                 reason="reason",
@@ -37,16 +41,32 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                 fallback=False,
             )
 
-        async def fake_search_memory(self, *, query: str, query_plan: QueryPlan | None = None) -> list[MemoryResult]:  # type: ignore[no-untyped-def]
+        async def fake_search_memory(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            query: str,
+            actor_id: str,
+            current_session_id: str,
+            query_plan: QueryPlan | None = None,
+        ) -> list[MemoryResult]:
+            _ = query
+            _ = actor_id
+            _ = current_session_id
             _ = query_plan
             calls.append("search_memory")
             return [
                 MemoryResult(
+                    evidence_id="mem-1",
                     insight="Generalized checklist pattern for emergency prep.",
                     score=0.92,
                     source_session="shared-1",
                     speaker="me",
                     created_at="2026-03-07T00:00:00Z",
+                    actor_id="other-user",
+                    pii_flag=False,
+                    allow_cross_user=True,
+                    source_type="insight",
+                    quote_text="generalized checklist pattern",
                 )
             ]
 
@@ -61,6 +81,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
 
         async def fake_run_web_search(web_search: object, *, query: str, max_results: int) -> list[WebSearchResult]:  # type: ignore[no-untyped-def]
             _ = web_search
+            _ = query
             _ = max_results
             calls.append("web_search")
             return [
@@ -77,6 +98,41 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             _ = num_ctx
             streamed_messages.extend(messages)
             yield "ok"
+
+        async def fake_generate_grounded_response(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            prompt: str,
+            model: str,
+            grounded_profile: str,
+            exact_required: bool,
+            evidence_cards: list[object],
+        ) -> GroundedResponse:
+            _ = prompt
+            _ = model
+            _ = grounded_profile
+            _ = exact_required
+            _ = evidence_cards
+            calls.append("generate_grounded_response")
+            return GroundedResponse(
+                status="full",
+                answer_text="Source: memory_same_session | Confidence: 0.91\nGrounded answer [E1].",
+                claims=[
+                    GroundedClaim(
+                        claim_id="claim-1",
+                        text="Grounded answer.",
+                        evidence_ids=["E1"],
+                        confidence=0.91,
+                        status="grounded",
+                    )
+                ],
+                overall_confidence=0.91,
+                clarify_question="",
+                note="ok",
+            )
+
+        async def fake_log(*_: object, **__: object) -> None:  # type: ignore[no-untyped-def]
+            return None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             original_store = server.conversation_store
@@ -99,6 +155,21 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                     "local_model_pro.knowledge_assist.KnowledgeAssistService.index_turn_insights",
                     new=fake_index_turn_insights,
                 ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.generate_grounded_response",
+                    new=fake_generate_grounded_response,
+                ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.log_grounded_run_start",
+                    new=fake_log,
+                ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.log_grounded_evidence",
+                    new=fake_log,
+                ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.log_grounded_claims",
+                    new=fake_log,
+                ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.log_grounded_run_finish",
+                    new=fake_log,
+                ), mock.patch(
                     "local_model_pro.server._run_web_search",
                     new=fake_run_web_search,
                 ), mock.patch(
@@ -115,6 +186,9 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                                     "model": "qwen2.5:7b",
                                     "knowledge_assist_enabled": True,
                                     "web_assist_enabled": web_assist_enabled,
+                                    "grounded_mode_enabled": grounded_mode_enabled,
+                                    "grounded_profile": "balanced",
+                                    "actor_id": "tester",
                                 }
                             )
                             _ = ws.receive_json()
@@ -124,16 +198,20 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                                 msg = ws.receive_json()
                                 msg_type = str(msg.get("type", ""))
                                 emitted_types.append(msg_type)
+                                emitted_payloads.append(msg)
                                 if msg_type == "done":
                                     break
             finally:
                 temp_store.close()
                 server.conversation_store = original_store
 
-        return calls, emitted_types, streamed_messages
+        return calls, emitted_types, streamed_messages, emitted_payloads
 
     def test_chat_pipeline_order_with_web_enabled(self) -> None:
-        calls, emitted_types, _ = self._run_chat_and_collect(web_assist_enabled=True)
+        calls, emitted_types, _, _ = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+        )
 
         # Memory retrieval is always executed before web lookup.
         self.assertEqual(calls[:3], ["build_query_plan", "search_memory", "web_search"])
@@ -143,7 +221,10 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertIn("done", emitted_types)
 
     def test_chat_pipeline_order_with_web_disabled(self) -> None:
-        calls, emitted_types, streamed_messages = self._run_chat_and_collect(web_assist_enabled=False)
+        calls, emitted_types, streamed_messages, _ = self._run_chat_and_collect(
+            web_assist_enabled=False,
+            grounded_mode_enabled=False,
+        )
 
         self.assertEqual(calls[:2], ["build_query_plan", "search_memory"])
         self.assertNotIn("web_search", calls)
@@ -152,10 +233,43 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertNotIn("web_results", emitted_types)
         self.assertIn("done", emitted_types)
 
-        # Privacy policy: generation context receives abstracted insights, not raw transcript dumps.
+        # Privacy path: streamed context gets memory insights, not arbitrary transcript dumps.
         joined = json.dumps(streamed_messages)
         self.assertIn("Generalized checklist pattern for emergency prep.", joined)
         self.assertNotIn("raw direct transcript", joined)
+
+    def test_grounded_chat_emits_evidence_and_grounding_status_with_web(self) -> None:
+        calls, emitted_types, _, _ = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=True,
+        )
+
+        self.assertEqual(calls[:4], ["build_query_plan", "search_memory", "web_search", "generate_grounded_response"])
+        self.assertIn("query_plan", emitted_types)
+        self.assertIn("memory_results", emitted_types)
+        self.assertIn("web_results", emitted_types)
+        self.assertIn("evidence_used", emitted_types)
+        self.assertIn("grounding_status", emitted_types)
+        self.assertIn("done", emitted_types)
+
+    def test_grounded_chat_without_web_still_emits_memory_and_grounding(self) -> None:
+        calls, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=False,
+            grounded_mode_enabled=True,
+        )
+
+        self.assertEqual(calls[:3], ["build_query_plan", "search_memory", "generate_grounded_response"])
+        self.assertNotIn("web_search", calls)
+        self.assertIn("query_plan", emitted_types)
+        self.assertIn("memory_results", emitted_types)
+        self.assertNotIn("web_results", emitted_types)
+        self.assertIn("evidence_used", emitted_types)
+        self.assertIn("grounding_status", emitted_types)
+        self.assertIn("done", emitted_types)
+
+        grounding_events = [item for item in payloads if item.get("type") == "grounding_status"]
+        self.assertTrue(grounding_events)
+        self.assertEqual(grounding_events[-1].get("status"), "full")
 
 
 if __name__ == "__main__":

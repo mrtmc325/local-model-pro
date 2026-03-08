@@ -6,6 +6,9 @@ const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
 const knowledgeAssistToggle = document.getElementById("knowledgeAssistToggle");
 const knowledgeModeMeta = document.getElementById("knowledgeModeMeta");
+const groundedModeToggle = document.getElementById("groundedModeToggle");
+const groundedProfileSelect = document.getElementById("groundedProfileSelect");
+const groundedModeMeta = document.getElementById("groundedModeMeta");
 const webAssistToggle = document.getElementById("webAssistToggle");
 const webQueryInput = document.getElementById("webQueryInput");
 const webSearchBtn = document.getElementById("webSearchBtn");
@@ -15,6 +18,7 @@ const resetBtn = document.getElementById("resetBtn");
 const activeModelLabel = document.getElementById("activeModelLabel");
 const statusBadge = document.getElementById("statusBadge");
 const chatLog = document.getElementById("chatLog");
+const evidenceLog = document.getElementById("evidenceLog");
 const chatForm = document.getElementById("chatForm");
 const promptInput = document.getElementById("promptInput");
 const sendBtn = document.getElementById("sendBtn");
@@ -28,6 +32,8 @@ const state = {
   availableModels: [],
   webAssistEnabled: false,
   knowledgeAssistEnabled: true,
+  groundedModeEnabled: true,
+  groundedProfile: "balanced",
 };
 
 function wsUrl() {
@@ -51,6 +57,8 @@ function bytesToHuman(value) {
 
 function queryPlanToText(msg) {
   const lines = ["Recursive query plan:"];
+  const exactRequired = Boolean(msg.exact_required);
+  lines.push(`exact_required: ${exactRequired}`);
   lines.push(`reason: ${String(msg.reason || "").trim()}`);
   lines.push(`meaning: ${String(msg.meaning || "").trim()}`);
   lines.push(`purpose: ${String(msg.purpose || "").trim()}`);
@@ -76,8 +84,9 @@ function memoryResultsToText(msg) {
       const insight = String(item.insight || "").trim() || "(empty insight)";
       const score = Number(item.score || 0).toFixed(3);
       const source = String(item.source_session || "").trim() || "unknown";
+      const scope = String(item.actor_scope || "").trim();
       lines.push(`${idx + 1}. ${insight}`);
-      lines.push(`score=${score} session=${source}`);
+      lines.push(`score=${score} session=${source}${scope ? ` scope=${scope}` : ""}`);
     });
   }
   return lines.join("\n");
@@ -104,9 +113,14 @@ function webResultsToText(msg) {
       const title = String(item.title || "").trim() || "(untitled)";
       const url = String(item.url || "").trim();
       const snippet = String(item.snippet || "").trim();
+      const sourceTag = String(item.source_tag || "").trim();
+      const confidence = Number(item.confidence || 0).toFixed(2);
       lines.push(`${idx + 1}. ${title}`);
       if (url) {
         lines.push(url);
+      }
+      if (sourceTag) {
+        lines.push(`source=${sourceTag} confidence=${confidence}`);
       }
       if (snippet) {
         lines.push(snippet);
@@ -116,16 +130,84 @@ function webResultsToText(msg) {
   return lines.join("\n");
 }
 
+function evidenceUsedToText(msg) {
+  const results = Array.isArray(msg.results) ? msg.results : [];
+  if (results.length === 0) {
+    return "Evidence used: none";
+  }
+  const lines = ["Evidence used:"];
+  results.forEach((item) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const label = String(item.label || "").trim() || "E?";
+    const sourceType = String(item.source_type || "").trim() || "unknown";
+    const confidence = Number(item.confidence || 0).toFixed(2);
+    const scope = String(item.actor_scope || "").trim();
+    lines.push(`${label} ${sourceType} conf=${confidence}${scope ? ` scope=${scope}` : ""}`);
+  });
+  return lines.join("\n");
+}
+
+function groundingStatusToText(msg) {
+  const profile = String(msg.profile || state.groundedProfile);
+  const status = String(msg.status || "unknown");
+  const confidence = Number(msg.overall_confidence || 0).toFixed(2);
+  const exactRequired = Boolean(msg.exact_required);
+  const note = String(msg.note || "").trim();
+  const lines = [
+    `Grounding status: ${status} (profile=${profile}, exact_required=${exactRequired}, confidence=${confidence})`,
+  ];
+  if (note) {
+    lines.push(`note: ${note}`);
+  }
+  return lines.join("\n");
+}
+
+function clarifyToText(msg) {
+  const question = String(msg.question || "").trim();
+  return question ? `Clarify needed: ${question}` : "Clarify needed: specify the exact fact to verify.";
+}
+
 function updateWebModeMeta() {
+  if (state.groundedModeEnabled && state.groundedProfile === "strict") {
+    webModeMeta.textContent =
+      "Web assist is available for direct web search. Strict grounded chat does not inject web evidence automatically.";
+    return;
+  }
   webModeMeta.textContent = state.webAssistEnabled
     ? "Web assist is on. Each chat prompt can include fresh web context."
     : "Web assist is off.";
 }
 
 function updateKnowledgeModeMeta() {
+  if (state.groundedModeEnabled) {
+    knowledgeModeMeta.textContent =
+      "Knowledge assist is forced on by Grounded mode for recursion + memory-first retrieval.";
+    return;
+  }
   knowledgeModeMeta.textContent = state.knowledgeAssistEnabled
     ? "Knowledge assist is on. Prompts are recursively broken down before memory/web lookup."
     : "Knowledge assist is off.";
+}
+
+function updateGroundedModeMeta() {
+  if (!state.groundedModeEnabled) {
+    groundedModeMeta.textContent = "Grounded mode is off. Responses may use normal best-effort generation.";
+    return;
+  }
+  if (state.groundedProfile === "strict") {
+    groundedModeMeta.textContent =
+      "Grounded mode is on (strict). Knowledge Assist is forced on. Chat responses rely on memory evidence first without automatic web injection.";
+    return;
+  }
+  groundedModeMeta.textContent =
+    "Grounded mode is on (balanced). Knowledge Assist is forced on. Web evidence can be included when Web Assist is enabled.";
+}
+
+function syncKnowledgeToggleState() {
+  knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
+  knowledgeAssistToggle.disabled = state.groundedModeEnabled;
 }
 
 function normalizeModelEntry(entry) {
@@ -229,6 +311,64 @@ function addMessage(role, text) {
   return el;
 }
 
+function renderEvidence(results) {
+  evidenceLog.innerHTML = "";
+  if (!Array.isArray(results) || results.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "evidence-empty";
+    empty.textContent = "No evidence yet.";
+    evidenceLog.appendChild(empty);
+    return;
+  }
+
+  results.forEach((item) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const card = document.createElement("div");
+    card.className = "evidence-item";
+
+    const label = String(item.label || "").trim() || "E?";
+    const sourceType = String(item.source_type || "").trim() || "unknown";
+    const confidence = Number(item.confidence || 0).toFixed(2);
+    const actorScope = String(item.actor_scope || "").trim();
+    const evidenceId = String(item.evidence_id || "").trim();
+
+    const meta = document.createElement("div");
+    meta.className = "evidence-meta";
+    meta.textContent = `${label} ${sourceType} conf=${confidence}${actorScope ? ` scope=${actorScope}` : ""}`;
+    card.appendChild(meta);
+
+    if (evidenceId) {
+      const evidenceMeta = document.createElement("div");
+      evidenceMeta.className = "evidence-meta";
+      evidenceMeta.textContent = `id=${evidenceId}`;
+      card.appendChild(evidenceMeta);
+    }
+
+    const content = String(item.content || "").trim();
+    if (content) {
+      const contentEl = document.createElement("div");
+      contentEl.className = "evidence-content";
+      contentEl.textContent = content;
+      card.appendChild(contentEl);
+    }
+
+    const url = String(item.url || "").trim();
+    if (url) {
+      const link = document.createElement("a");
+      link.className = "evidence-link";
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      link.textContent = url;
+      card.appendChild(link);
+    }
+
+    evidenceLog.appendChild(card);
+  });
+}
+
 function setBusy(busy) {
   state.inflight = busy;
   sendBtn.disabled = busy || !state.connected;
@@ -322,6 +462,8 @@ function connectWs() {
       model,
       web_assist_enabled: state.webAssistEnabled,
       knowledge_assist_enabled: state.knowledgeAssistEnabled,
+      grounded_mode_enabled: state.groundedModeEnabled,
+      grounded_profile: state.groundedProfile,
     });
     addMessage("system", `Connected. Requested model: ${model}`);
   };
@@ -366,9 +508,18 @@ function connectWs() {
       }
       if (typeof message.knowledge_assist_enabled === "boolean") {
         state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
-        knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
-        updateKnowledgeModeMeta();
       }
+      if (typeof message.grounded_mode_enabled === "boolean") {
+        state.groundedModeEnabled = message.grounded_mode_enabled;
+        groundedModeToggle.checked = state.groundedModeEnabled;
+      }
+      if (typeof message.grounded_profile === "string" && message.grounded_profile) {
+        state.groundedProfile = message.grounded_profile;
+        groundedProfileSelect.value = state.groundedProfile;
+      }
+      syncKnowledgeToggleState();
+      updateKnowledgeModeMeta();
+      updateGroundedModeMeta();
       updateActiveModelLabel(modelName);
       setBusy(false);
       return;
@@ -383,8 +534,32 @@ function connectWs() {
 
     if (msgType === "knowledge_mode") {
       state.knowledgeAssistEnabled = Boolean(message.enabled);
-      knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
+      syncKnowledgeToggleState();
       updateKnowledgeModeMeta();
+      return;
+    }
+
+    if (msgType === "grounded_mode") {
+      state.groundedModeEnabled = Boolean(message.enabled);
+      groundedModeToggle.checked = state.groundedModeEnabled;
+      if (state.groundedModeEnabled) {
+        state.knowledgeAssistEnabled = true;
+      }
+      syncKnowledgeToggleState();
+      updateKnowledgeModeMeta();
+      updateGroundedModeMeta();
+      updateWebModeMeta();
+      return;
+    }
+
+    if (msgType === "grounded_profile") {
+      const profile = String(message.profile || "").trim();
+      if (profile === "strict" || profile === "balanced") {
+        state.groundedProfile = profile;
+        groundedProfileSelect.value = profile;
+      }
+      updateGroundedModeMeta();
+      updateWebModeMeta();
       return;
     }
 
@@ -400,6 +575,22 @@ function connectWs() {
 
     if (msgType === "web_results") {
       addMessage("system", webResultsToText(message));
+      return;
+    }
+
+    if (msgType === "evidence_used") {
+      addMessage("system", evidenceUsedToText(message));
+      renderEvidence(message.results);
+      return;
+    }
+
+    if (msgType === "grounding_status") {
+      addMessage("system", groundingStatusToText(message));
+      return;
+    }
+
+    if (msgType === "clarify_needed") {
+      addMessage("system", clarifyToText(message));
       return;
     }
 
@@ -432,9 +623,19 @@ function connectWs() {
       }
       if (typeof message.knowledge_assist_enabled === "boolean") {
         state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
-        knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
-        updateKnowledgeModeMeta();
       }
+      if (typeof message.grounded_mode_enabled === "boolean") {
+        state.groundedModeEnabled = message.grounded_mode_enabled;
+        groundedModeToggle.checked = state.groundedModeEnabled;
+      }
+      if (typeof message.grounded_profile === "string" && message.grounded_profile) {
+        state.groundedProfile = message.grounded_profile;
+        groundedProfileSelect.value = state.groundedProfile;
+      }
+      syncKnowledgeToggleState();
+      updateKnowledgeModeMeta();
+      updateGroundedModeMeta();
+      updateWebModeMeta();
       return;
     }
 
@@ -513,8 +714,43 @@ function toggleKnowledgeAssist() {
   }
 }
 
+function toggleGroundedMode() {
+  state.groundedModeEnabled = groundedModeToggle.checked;
+  if (state.groundedModeEnabled) {
+    state.knowledgeAssistEnabled = true;
+  }
+  syncKnowledgeToggleState();
+  updateKnowledgeModeMeta();
+  updateGroundedModeMeta();
+  updateWebModeMeta();
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({ type: "set_grounded_mode", enabled: state.groundedModeEnabled });
+  } catch (error) {
+    addMessage("system", `Grounded mode update failed: ${error.message}`);
+  }
+}
+
+function setGroundedProfile() {
+  const profile = groundedProfileSelect.value === "strict" ? "strict" : "balanced";
+  state.groundedProfile = profile;
+  updateGroundedModeMeta();
+  updateWebModeMeta();
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({ type: "set_grounded_profile", profile });
+  } catch (error) {
+    addMessage("system", `Grounded profile update failed: ${error.message}`);
+  }
+}
+
 function resetConversation() {
   chatLog.innerHTML = "";
+  renderEvidence([]);
   state.assistantEl = null;
   if (!state.connected) {
     addMessage("system", "Local chat view cleared.");
@@ -555,6 +791,8 @@ applyModelBtn.addEventListener("click", applyModel);
 webSearchBtn.addEventListener("click", sendWebSearch);
 webAssistToggle.addEventListener("change", toggleWebAssist);
 knowledgeAssistToggle.addEventListener("change", toggleKnowledgeAssist);
+groundedModeToggle.addEventListener("change", toggleGroundedMode);
+groundedProfileSelect.addEventListener("change", setGroundedProfile);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
 modelFilterInput.addEventListener("input", () => renderModelOptions());
@@ -595,4 +833,7 @@ setStatus(false, "offline");
 setBusy(false);
 updateWebModeMeta();
 updateKnowledgeModeMeta();
+updateGroundedModeMeta();
+syncKnowledgeToggleState();
+renderEvidence([]);
 loadModels();

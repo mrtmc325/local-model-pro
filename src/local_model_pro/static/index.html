@@ -63,6 +63,26 @@
 
           <div class="field">
             <div class="field-head">
+              <span>Grounded Mode</span>
+              <label class="toggle-inline" for="groundedModeToggle">
+                <input id="groundedModeToggle" type="checkbox" checked />
+                <span>Enable for chat</span>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field-help" for="groundedProfileSelect">Profile</label>
+              <select id="groundedProfileSelect" aria-label="Grounded mode profile">
+                <option value="balanced" selected>balanced</option>
+                <option value="strict">strict</option>
+              </select>
+            </div>
+            <div id="groundedModeMeta" class="field-help">
+              Grounded mode is on. Balanced profile can use web evidence after memory retrieval.
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="field-head">
               <span>Web Assist</span>
               <label class="toggle-inline" for="webAssistToggle">
                 <input id="webAssistToggle" type="checkbox" />
@@ -91,7 +111,13 @@
 
         <section class="card terminal-section">
           <h2>Chat Console</h2>
-          <div id="chatLog" class="chat-log" aria-live="polite"></div>
+          <div class="console-grid">
+            <div id="chatLog" class="chat-log" aria-live="polite"></div>
+            <aside class="evidence-panel">
+              <div class="evidence-head">Evidence used</div>
+              <div id="evidenceLog" class="evidence-log"></div>
+            </aside>
+          </div>
           <form id="chatForm" class="composer">
             <textarea
               id="promptInput"

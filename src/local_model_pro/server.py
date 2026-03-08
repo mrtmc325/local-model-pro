@@ -16,7 +16,12 @@ from fastapi.staticfiles import StaticFiles
 
 from local_model_pro.config import settings
 from local_model_pro.conversation_store import ConversationStore
-from local_model_pro.knowledge_assist import KnowledgeAssistService, QueryPlan
+from local_model_pro.knowledge_assist import (
+    EvidenceCard,
+    GroundedResponse,
+    KnowledgeAssistService,
+    QueryPlan,
+)
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
 from local_model_pro.qdrant_memory import MemoryResult, QdrantMemoryIndex
 from local_model_pro.web_search import WebSearchClient, WebSearchError, WebSearchResult
@@ -35,9 +40,12 @@ conversation_store = ConversationStore(db_path=settings.sqlite_db_path)
 class ChatSession:
     session_id: str
     model: str
+    actor_id: str = settings.default_actor_id
     system_prompt: str | None = None
     web_assist_enabled: bool = settings.web_assist_default
     knowledge_assist_enabled: bool = settings.knowledge_assist_default
+    grounded_mode_enabled: bool = settings.grounded_mode_default
+    grounded_profile: str = settings.grounded_profile_default
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -52,6 +60,7 @@ class AssistResolution:
     memory_query: str
     web_query: str
     memory_results: list[MemoryResult]
+    exact_required: bool
 
 
 def _safe_text(value: Any) -> str:
@@ -75,22 +84,57 @@ def _safe_bool(value: Any) -> bool:
     raise ValueError("Expected a boolean.")
 
 
+def _safe_profile(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Expected grounded profile string.")
+    profile = value.strip().lower()
+    if profile not in {"strict", "balanced"}:
+        raise ValueError("grounded_profile must be one of: strict, balanced")
+    return profile
+
+
+def _chunks(text: str, chunk_size: int = 64) -> list[str]:
+    if not text:
+        return []
+    return [text[idx : idx + chunk_size] for idx in range(0, len(text), chunk_size)]
+
+
+def _memory_scope(item: MemoryResult, session: ChatSession) -> str:
+    if item.source_session == session.session_id:
+        return "same_session"
+    if item.actor_id == session.actor_id:
+        return "same_user"
+    return "shared"
+
+
 async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(json.dumps(payload))
 
 
-def _serialize_web_results(results: list[WebSearchResult]) -> list[dict[str, str]]:
-    return [
-        {
-            "title": item.title,
-            "url": item.url,
-            "snippet": item.snippet,
-        }
-        for item in results
-    ]
+def _serialize_web_results(results: list[WebSearchResult]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in results:
+        source_type = KnowledgeAssistService.classify_source_type_for_url(item.url)
+        out.append(
+            {
+                "title": item.title,
+                "url": item.url,
+                "snippet": item.snippet,
+                "source_type": source_type,
+                "source_tag": "user story / forum"
+                if source_type == "web_user_story_forum"
+                else source_type.replace("web_", ""),
+                "confidence": KnowledgeAssistService.source_confidence(source_type, 0.64),
+            }
+        )
+    return out
 
 
-def _serialize_memory_results(results: list[MemoryResult]) -> list[dict[str, Any]]:
+def _serialize_memory_results(
+    results: list[MemoryResult],
+    *,
+    session: ChatSession,
+) -> list[dict[str, Any]]:
     return [
         {
             "insight": item.insight,
@@ -98,6 +142,15 @@ def _serialize_memory_results(results: list[MemoryResult]) -> list[dict[str, Any
             "source_session": item.source_session,
             "speaker": item.speaker,
             "created_at": item.created_at,
+            "source_type": {
+                "same_session": "memory_same_session",
+                "same_user": "memory_same_user",
+                "shared": "memory_shared",
+            }[_memory_scope(item, session)],
+            "actor_scope": _memory_scope(item, session),
+            "pii_flag": item.pii_flag,
+            "verbatim": item.quote_text,
+            "evidence_id": item.evidence_id,
         }
         for item in results
     ]
@@ -114,6 +167,26 @@ def _serialize_query_plan(plan: QueryPlan) -> dict[str, Any]:
     }
 
 
+def _serialize_evidence_cards(cards: list[EvidenceCard]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for card in cards:
+        rows.append(
+            {
+                "label": card.label,
+                "evidence_id": card.evidence_id,
+                "source_type": card.source_type,
+                "actor_scope": card.actor_scope,
+                "content": card.content,
+                "url": card.url,
+                "source_session": card.source_session,
+                "confidence": card.confidence,
+                "pii_flag": card.pii_flag,
+                "used_verbatim": card.used_verbatim,
+            }
+        )
+    return rows
+
+
 def _build_web_context(*, query: str, results: list[WebSearchResult]) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     lines = [
@@ -128,16 +201,18 @@ def _build_web_context(*, query: str, results: list[WebSearchResult]) -> str:
     return "\n".join(lines)
 
 
-def _build_memory_context(*, query: str, results: list[MemoryResult]) -> str:
+def _build_memory_context(*, query: str, results: list[MemoryResult], session: ChatSession) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     lines = [
         f"Knowledge memory retrieved at {timestamp} for query: {query}",
-        "Use these abstracted insights as supporting context. Do not assume they are direct quotes.",
+        "Use these memory records as supporting context; quotes are allowed where marked verbatim.",
     ]
     for idx, item in enumerate(results, start=1):
+        scope = _memory_scope(item, session)
         lines.append(f"{idx}. Insight: {item.insight}")
-        lines.append(f"   Score: {item.score:.3f}")
-        lines.append(f"   Source session: {item.source_session}")
+        lines.append(f"   Scope: {scope}  Score: {item.score:.3f}")
+        if item.quote_text and scope in {"same_session", "same_user"}:
+            lines.append(f"   Verbatim quote: {item.quote_text}")
     return "\n".join(lines)
 
 
@@ -185,6 +260,7 @@ async def _resolve_assist(
             memory_query=memory_query,
             web_query=web_query,
             memory_results=memory_results,
+            exact_required=False,
         )
 
     query_plan = await knowledge.build_query_plan(
@@ -194,18 +270,22 @@ async def _resolve_assist(
     )
     memory_query = query_plan.db_query.strip() or prompt
     web_query = query_plan.web_query.strip() or prompt
+    exact_required = knowledge.is_exact_concrete_request(prompt, query_plan)
 
     await _send_json(
         websocket,
         {
             "type": "query_plan",
             "request_id": request_id,
+            "exact_required": exact_required,
             **_serialize_query_plan(query_plan),
         },
     )
 
     memory_results = await knowledge.search_memory(
         query=memory_query,
+        actor_id=session.actor_id,
+        current_session_id=session.session_id,
         query_plan=query_plan,
     )
     await _send_json(
@@ -214,7 +294,7 @@ async def _resolve_assist(
             "type": "memory_results",
             "request_id": request_id,
             "query": memory_query,
-            "results": _serialize_memory_results(memory_results),
+            "results": _serialize_memory_results(memory_results, session=session),
         },
     )
 
@@ -223,6 +303,7 @@ async def _resolve_assist(
         memory_query=memory_query,
         web_query=web_query,
         memory_results=memory_results,
+        exact_required=exact_required,
     )
 
 
@@ -248,11 +329,21 @@ async def service_info() -> dict[str, Any]:
         "default_model": runtime_default_model,
         "web_assist_default": settings.web_assist_default,
         "knowledge_assist_default": settings.knowledge_assist_default,
+        "grounded_mode_default": settings.grounded_mode_default,
+        "grounded_profile_default": settings.grounded_profile_default,
         "memory": {
             "backend": "sqlite+qdrant",
             "db_path": settings.sqlite_db_path,
             "qdrant_url": settings.qdrant_url,
             "qdrant_collection": settings.qdrant_collection,
+            "shared_default": True,
+        },
+        "capabilities": {
+            "knowledge_assist": True,
+            "grounded_mode": True,
+            "grounded_profiles": ["strict", "balanced"],
+            "web_assist": True,
+            "evidence_panel_events": True,
         },
     }
 
@@ -311,6 +402,8 @@ async def chat_ws_http_hint() -> dict[str, Any]:
             "reset",
             "set_web_mode",
             "set_knowledge_mode",
+            "set_grounded_mode",
+            "set_grounded_profile",
             "web_search",
         ],
         "event_types": [
@@ -321,6 +414,11 @@ async def chat_ws_http_hint() -> dict[str, Any]:
             "done",
             "web_mode",
             "knowledge_mode",
+            "grounded_mode",
+            "grounded_profile",
+            "grounding_status",
+            "evidence_used",
+            "clarify_needed",
             "query_plan",
             "memory_results",
             "web_results",
@@ -337,6 +435,11 @@ async def chat_ws(websocket: WebSocket) -> None:
         session_id=str(uuid.uuid4()),
         model=runtime_default_model,
     )
+    if session.grounded_profile not in {"strict", "balanced"}:
+        session.grounded_profile = "balanced"
+    if session.grounded_mode_enabled:
+        session.knowledge_assist_enabled = True
+
     ollama = OllamaClient(base_url=runtime_ollama_base_url)
     web_search = WebSearchClient()
     knowledge = KnowledgeAssistService(
@@ -353,6 +456,7 @@ async def chat_ws(websocket: WebSocket) -> None:
         session_id=session.session_id,
         model=session.model,
         system_prompt=session.system_prompt,
+        actor_id=session.actor_id,
     )
 
     await _send_json(
@@ -367,9 +471,12 @@ async def chat_ws(websocket: WebSocket) -> None:
         {
             "type": "ready",
             "session_id": session.session_id,
+            "actor_id": session.actor_id,
             "model": session.model,
             "web_assist_enabled": session.web_assist_enabled,
             "knowledge_assist_enabled": session.knowledge_assist_enabled,
+            "grounded_mode_enabled": session.grounded_mode_enabled,
+            "grounded_profile": session.grounded_profile,
         },
     )
 
@@ -387,6 +494,9 @@ async def chat_ws(websocket: WebSocket) -> None:
                 model = incoming.get("model")
                 if isinstance(model, str) and model.strip():
                     session.model = model.strip()
+                actor_id = incoming.get("actor_id")
+                if isinstance(actor_id, str) and actor_id.strip():
+                    session.actor_id = actor_id.strip()
                 system_prompt = incoming.get("system_prompt")
                 if isinstance(system_prompt, str) and system_prompt.strip():
                     session.system_prompt = system_prompt.strip()
@@ -405,19 +515,38 @@ async def chat_ws(websocket: WebSocket) -> None:
                     except ValueError as exc:
                         await _send_json(websocket, {"type": "error", "message": str(exc)})
                         continue
+                if "grounded_mode_enabled" in incoming:
+                    try:
+                        session.grounded_mode_enabled = _safe_bool(incoming.get("grounded_mode_enabled"))
+                    except ValueError as exc:
+                        await _send_json(websocket, {"type": "error", "message": str(exc)})
+                        continue
+                if "grounded_profile" in incoming:
+                    try:
+                        session.grounded_profile = _safe_profile(incoming.get("grounded_profile"))
+                    except ValueError as exc:
+                        await _send_json(websocket, {"type": "error", "message": str(exc)})
+                        continue
+                if session.grounded_mode_enabled:
+                    session.knowledge_assist_enabled = True
+
                 await knowledge.save_session(
                     session_id=session.session_id,
                     model=session.model,
                     system_prompt=session.system_prompt,
+                    actor_id=session.actor_id,
                 )
                 await _send_json(
                     websocket,
                     {
                         "type": "ready",
                         "session_id": session.session_id,
+                        "actor_id": session.actor_id,
                         "model": session.model,
                         "web_assist_enabled": session.web_assist_enabled,
                         "knowledge_assist_enabled": session.knowledge_assist_enabled,
+                        "grounded_mode_enabled": session.grounded_mode_enabled,
+                        "grounded_profile": session.grounded_profile,
                     },
                 )
                 continue
@@ -427,10 +556,13 @@ async def chat_ws(websocket: WebSocket) -> None:
                     websocket,
                     {
                         "type": "status",
+                        "actor_id": session.actor_id,
                         "model": session.model,
                         "message_count": len(session.messages),
                         "web_assist_enabled": session.web_assist_enabled,
                         "knowledge_assist_enabled": session.knowledge_assist_enabled,
+                        "grounded_mode_enabled": session.grounded_mode_enabled,
+                        "grounded_profile": session.grounded_profile,
                     },
                 )
                 continue
@@ -445,6 +577,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     session_id=session.session_id,
                     model=session.model,
                     system_prompt=session.system_prompt,
+                    actor_id=session.actor_id,
                 )
                 await _send_json(websocket, {"type": "info", "message": f"Model set to {session.model}"})
                 continue
@@ -455,19 +588,13 @@ async def chat_ws(websocket: WebSocket) -> None:
                 except ValueError as exc:
                     await _send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "web_mode",
-                        "enabled": session.web_assist_enabled,
-                    },
-                )
+                await _send_json(websocket, {"type": "web_mode", "enabled": session.web_assist_enabled})
                 await _send_json(
                     websocket,
                     {
                         "type": "info",
                         "message": (
-                            "Web assist enabled for chat prompts."
+                            "Web assist enabled for prompts."
                             if session.web_assist_enabled
                             else "Web assist disabled."
                         ),
@@ -477,15 +604,38 @@ async def chat_ws(websocket: WebSocket) -> None:
 
             if msg_type == "set_knowledge_mode":
                 try:
-                    session.knowledge_assist_enabled = _safe_bool(incoming.get("enabled"))
+                    desired = _safe_bool(incoming.get("enabled"))
                 except ValueError as exc:
                     await _send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
+                if session.grounded_mode_enabled and not desired:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "info",
+                            "message": "Grounded mode forces Knowledge Assist on.",
+                        },
+                    )
+                    await _send_json(websocket, {"type": "knowledge_mode", "enabled": True})
+                    continue
+                session.knowledge_assist_enabled = desired
+                await _send_json(websocket, {"type": "knowledge_mode", "enabled": session.knowledge_assist_enabled})
+                continue
+
+            if msg_type == "set_grounded_mode":
+                try:
+                    session.grounded_mode_enabled = _safe_bool(incoming.get("enabled"))
+                except ValueError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                if session.grounded_mode_enabled:
+                    session.knowledge_assist_enabled = True
+                    await _send_json(websocket, {"type": "knowledge_mode", "enabled": True})
                 await _send_json(
                     websocket,
                     {
-                        "type": "knowledge_mode",
-                        "enabled": session.knowledge_assist_enabled,
+                        "type": "grounded_mode",
+                        "enabled": session.grounded_mode_enabled,
                     },
                 )
                 await _send_json(
@@ -493,10 +643,25 @@ async def chat_ws(websocket: WebSocket) -> None:
                     {
                         "type": "info",
                         "message": (
-                            "Knowledge assist enabled for recursive retrieval."
-                            if session.knowledge_assist_enabled
-                            else "Knowledge assist disabled."
+                            "Grounded mode enabled."
+                            if session.grounded_mode_enabled
+                            else "Grounded mode disabled."
                         ),
+                    },
+                )
+                continue
+
+            if msg_type == "set_grounded_profile":
+                try:
+                    session.grounded_profile = _safe_profile(incoming.get("profile"))
+                except ValueError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "grounded_profile",
+                        "profile": session.grounded_profile,
                     },
                 )
                 continue
@@ -535,6 +700,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                 except WebSearchError as exc:
                     await _send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
+
+                serialized_web = _serialize_web_results(results)
                 await _send_json(
                     websocket,
                     {
@@ -542,9 +709,60 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "query": assist.web_query,
                         "original_query": query,
                         "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                        "results": _serialize_web_results(results),
+                        "results": serialized_web,
                     },
                 )
+
+                if session.grounded_mode_enabled:
+                    run_id = str(uuid.uuid4())
+                    await knowledge.log_grounded_run_start(
+                        run_id=run_id,
+                        session_id=session.session_id,
+                        actor_id=session.actor_id,
+                        mode="grounded_web",
+                        profile=session.grounded_profile,
+                        prompt=query,
+                    )
+                    memory_cards = knowledge.memory_to_evidence_cards(
+                        memory_results=assist.memory_results,
+                        actor_id=session.actor_id,
+                        current_session_id=session.session_id,
+                        start_index=1,
+                    )
+                    web_cards = knowledge.web_to_evidence_cards(
+                        web_results=serialized_web,
+                        start_index=1 + len(memory_cards),
+                    )
+                    cards = [*memory_cards, *web_cards]
+                    await knowledge.log_grounded_evidence(run_id=run_id, cards=cards)
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "evidence_used",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "results": _serialize_evidence_cards(cards),
+                        },
+                    )
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "grounding_status",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "action": "web_search",
+                            "status": "full",
+                            "profile": session.grounded_profile,
+                            "exact_required": assist.exact_required,
+                            "overall_confidence": sum(item.confidence for item in cards) / max(1, len(cards)),
+                            "note": "Web results are annotated with source tags and confidence.",
+                        },
+                    )
+                    await knowledge.log_grounded_run_finish(
+                        run_id=run_id,
+                        status="full",
+                        note="Web evidence emitted.",
+                    )
                 continue
 
             if msg_type == "reset":
@@ -572,6 +790,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                 content=prompt,
                 request_id=request_id,
                 model=session.model,
+                actor_id=session.actor_id,
             )
 
             session.messages.append({"role": "user", "content": prompt})
@@ -585,8 +804,15 @@ async def chat_ws(websocket: WebSocket) -> None:
                 knowledge=knowledge,
             )
 
+            use_web_for_chat = (
+                session.web_assist_enabled
+                and (
+                    not session.grounded_mode_enabled
+                    or session.grounded_profile == "balanced"
+                )
+            )
             web_results: list[WebSearchResult] = []
-            if session.web_assist_enabled:
+            if use_web_for_chat:
                 try:
                     web_results = await _run_web_search(
                         web_search,
@@ -614,6 +840,170 @@ async def chat_ws(websocket: WebSocket) -> None:
                         },
                     )
 
+            if session.grounded_mode_enabled:
+                if not session.knowledge_assist_enabled:
+                    session.knowledge_assist_enabled = True
+
+                run_id = str(uuid.uuid4())
+                await knowledge.log_grounded_run_start(
+                    run_id=run_id,
+                    session_id=session.session_id,
+                    actor_id=session.actor_id,
+                    mode="grounded",
+                    profile=session.grounded_profile,
+                    prompt=prompt,
+                )
+
+                memory_cards = knowledge.memory_to_evidence_cards(
+                    memory_results=assist.memory_results,
+                    actor_id=session.actor_id,
+                    current_session_id=session.session_id,
+                    start_index=1,
+                )
+                serialized_web = _serialize_web_results(web_results)
+                web_cards = knowledge.web_to_evidence_cards(
+                    web_results=serialized_web,
+                    start_index=1 + len(memory_cards),
+                )
+                evidence_cards = [*memory_cards, *web_cards]
+
+                await knowledge.log_grounded_evidence(run_id=run_id, cards=evidence_cards)
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "evidence_used",
+                        "request_id": request_id,
+                        "run_id": run_id,
+                        "results": _serialize_evidence_cards(evidence_cards),
+                    },
+                )
+
+                try:
+                    grounded: GroundedResponse = await asyncio.wait_for(
+                        knowledge.generate_grounded_response(
+                            prompt=prompt,
+                            model=session.model,
+                            grounded_profile=session.grounded_profile,
+                            exact_required=assist.exact_required,
+                            evidence_cards=evidence_cards,
+                        ),
+                        timeout=max(5, settings.grounded_timeout_seconds),
+                    )
+                except asyncio.TimeoutError:
+                    grounded = GroundedResponse(
+                        status="insufficient",
+                        answer_text="",
+                        claims=[],
+                        overall_confidence=0.0,
+                        clarify_question="Grounded mode timed out. What exact field or fact should I verify first?",
+                        note="Timed out while grounding.",
+                    )
+
+                await knowledge.log_grounded_claims(
+                    run_id=run_id,
+                    claims=grounded.claims,
+                    cards=evidence_cards,
+                    is_exact_required=assist.exact_required,
+                )
+                await knowledge.log_grounded_run_finish(
+                    run_id=run_id,
+                    status=grounded.status,
+                    note=grounded.note,
+                )
+
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "grounding_status",
+                        "request_id": request_id,
+                        "run_id": run_id,
+                        "status": grounded.status,
+                        "profile": session.grounded_profile,
+                        "exact_required": assist.exact_required,
+                        "overall_confidence": grounded.overall_confidence,
+                        "note": grounded.note,
+                    },
+                )
+
+                if grounded.status == "insufficient":
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "clarify_needed",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "question": grounded.clarify_question,
+                        },
+                    )
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "done",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "model": session.model,
+                            "web_assist_enabled": session.web_assist_enabled,
+                            "knowledge_assist_enabled": session.knowledge_assist_enabled,
+                            "grounded_mode_enabled": session.grounded_mode_enabled,
+                            "grounded_profile": session.grounded_profile,
+                        },
+                    )
+                    continue
+
+                await _send_json(websocket, {"type": "start", "request_id": request_id, "run_id": run_id})
+                for chunk in _chunks(grounded.answer_text):
+                    await _send_json(
+                        websocket,
+                        {"type": "token", "request_id": request_id, "run_id": run_id, "text": chunk},
+                    )
+
+                assistant_text = grounded.answer_text.strip()
+                if assistant_text:
+                    session.messages.append({"role": "assistant", "content": assistant_text})
+                    await knowledge.save_turn(
+                        session_id=session.session_id,
+                        speaker="you",
+                        content=assistant_text,
+                        request_id=request_id,
+                        model=session.model,
+                        actor_id=session.actor_id,
+                    )
+
+                _schedule_background(
+                    knowledge.index_turn_insights(
+                        session_id=session.session_id,
+                        speaker="me",
+                        content=prompt,
+                        model=session.model,
+                        actor_id=session.actor_id,
+                    )
+                )
+                if assistant_text:
+                    _schedule_background(
+                        knowledge.index_turn_insights(
+                            session_id=session.session_id,
+                            speaker="you",
+                            content=assistant_text,
+                            model=session.model,
+                            actor_id=session.actor_id,
+                        )
+                    )
+
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "done",
+                        "request_id": request_id,
+                        "run_id": run_id,
+                        "model": session.model,
+                        "web_assist_enabled": session.web_assist_enabled,
+                        "knowledge_assist_enabled": session.knowledge_assist_enabled,
+                        "grounded_mode_enabled": session.grounded_mode_enabled,
+                        "grounded_profile": session.grounded_profile,
+                    },
+                )
+                continue
+
             if assist.memory_results or web_results:
                 history_without_latest = session.messages[:-1]
                 latest_user_message = session.messages[-1]
@@ -625,6 +1015,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                             "content": _build_memory_context(
                                 query=assist.memory_query,
                                 results=assist.memory_results,
+                                session=session,
                             ),
                         }
                     )
@@ -676,6 +1067,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     content=assistant_text,
                     request_id=request_id,
                     model=session.model,
+                    actor_id=session.actor_id,
                 )
 
             if session.knowledge_assist_enabled:
@@ -685,6 +1077,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         speaker="me",
                         content=prompt,
                         model=session.model,
+                        actor_id=session.actor_id,
                     )
                 )
                 if assistant_text:
@@ -694,6 +1087,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                             speaker="you",
                             content=assistant_text,
                             model=session.model,
+                            actor_id=session.actor_id,
                         )
                     )
 
@@ -705,6 +1099,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                     "model": session.model,
                     "web_assist_enabled": session.web_assist_enabled,
                     "knowledge_assist_enabled": session.knowledge_assist_enabled,
+                    "grounded_mode_enabled": session.grounded_mode_enabled,
+                    "grounded_profile": session.grounded_profile,
                 },
             )
     except WebSocketDisconnect:
