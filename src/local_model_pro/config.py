@@ -44,6 +44,8 @@ class Settings:
     url_review_max_urls: int = int(os.getenv("URL_REVIEW_MAX_URLS", "3"))
     url_review_timeout_seconds: int = int(os.getenv("URL_REVIEW_TIMEOUT_SECONDS", "20"))
     url_review_max_bytes: int = int(os.getenv("URL_REVIEW_MAX_BYTES", "2000000"))
+    web_assist_page_review_enabled: bool = _env_flag("WEB_ASSIST_PAGE_REVIEW_ENABLED", "true")
+    web_assist_page_review_max_urls: int = int(os.getenv("WEB_ASSIST_PAGE_REVIEW_MAX_URLS", "2"))
 
 
 settings = Settings()

@@ -3,13 +3,14 @@ from __future__ import annotations
 import socket
 import tempfile
 import unittest
+import asyncio
 from pathlib import Path
 from unittest import mock
 
 from local_model_pro.config import Settings
 from local_model_pro.conversation_store import ConversationStore
 from local_model_pro.knowledge_assist import KnowledgeAssistService
-from local_model_pro.url_review import URLReviewClient, URLReviewError
+from local_model_pro.url_review import ReviewedPage, URLReviewClient, URLReviewError
 
 
 class _FakeOllama:
@@ -116,6 +117,87 @@ class URLReviewFailureModeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(items[0].status, "failed")
             self.assertIn("max allowed size", str(items[0].error))
+
+    async def test_review_web_results_for_context_success_without_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = Path(tmpdir) / "exports"
+            service = await self._build_service(tmpdir)
+            service._url_review_client.fetch = mock.AsyncMock(  # type: ignore[attr-defined]
+                return_value=ReviewedPage(
+                    requested_url="https://example.com",
+                    final_url="https://example.com",
+                    title="Example Domain",
+                    text="Example body text for reviewed web context.",
+                    content_type="text/html",
+                    fetched_at="2026-03-07T00:00:00Z",
+                )
+            )
+
+            items, cards = await service.review_web_results_for_context(
+                model="qwen2.5:7b",
+                web_results=[{"url": "https://example.com", "title": "Example Domain", "snippet": "Example snippet"}],
+                max_urls=1,
+            )
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].status, "saved")
+            self.assertIsNone(items[0].artifact_id)
+            self.assertIsNone(items[0].raw_file)
+            self.assertIsNone(items[0].meaning_file)
+            self.assertEqual(len(cards), 1)
+            self.assertEqual(cards[0].source_type, "web_review")
+            self.assertFalse(export_dir.exists())
+
+    async def test_review_web_results_for_context_handles_fetch_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = await self._build_service(tmpdir)
+            service._url_review_client.fetch = mock.AsyncMock(  # type: ignore[attr-defined]
+                side_effect=URLReviewError("request timed out")
+            )
+
+            items, cards = await service.review_web_results_for_context(
+                model="qwen2.5:7b",
+                web_results=[{"url": "https://example.com"}],
+                max_urls=1,
+            )
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].status, "failed")
+            self.assertIn("timed out", str(items[0].error))
+            self.assertEqual(cards, [])
+
+    async def test_review_web_results_for_context_summary_timeout_uses_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = await self._build_service(tmpdir)
+            service._url_review_client.fetch = mock.AsyncMock(  # type: ignore[attr-defined]
+                return_value=ReviewedPage(
+                    requested_url="https://example.com",
+                    final_url="https://example.com",
+                    title="Example Domain",
+                    text="Fallback content line one.\nFallback content line two.",
+                    content_type="text/html",
+                    fetched_at="2026-03-07T00:00:00Z",
+                )
+            )
+
+            async def fake_summarize(*, page: ReviewedPage, model: str):  # type: ignore[no-untyped-def]
+                _ = page
+                _ = model
+                raise asyncio.TimeoutError()
+
+            service._summarize_reviewed_page = fake_summarize  # type: ignore[method-assign,assignment]
+
+            items, cards = await service.review_web_results_for_context(
+                model="qwen2.5:7b",
+                web_results=[{"url": "https://example.com"}],
+                max_urls=1,
+            )
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].status, "saved")
+            self.assertTrue(items[0].meaning)
+            self.assertEqual(len(cards), 1)
+            self.assertIn("Example Domain", cards[0].content)
 
 
 if __name__ == "__main__":

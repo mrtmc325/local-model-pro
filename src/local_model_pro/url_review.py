@@ -167,50 +167,55 @@ class URLReviewClient:
             )
         }
 
-        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=False) as client:
-            for _ in range(_MAX_REDIRECTS + 1):
-                current_url = self._validate_url(current_url)
-                async with client.stream("GET", current_url) as response:
-                    status = int(response.status_code)
-                    if status in {301, 302, 303, 307, 308}:
-                        redirect_to = response.headers.get("Location", "").strip()
-                        if not redirect_to:
-                            raise URLReviewError("Redirect response missing Location header.")
-                        current_url = urljoin(current_url, redirect_to)
-                        continue
-                    if status >= 400:
-                        raise URLReviewError(f"Remote host returned HTTP {status}.")
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=False) as client:
+                for _ in range(_MAX_REDIRECTS + 1):
+                    current_url = self._validate_url(current_url)
+                    async with client.stream("GET", current_url) as response:
+                        status = int(response.status_code)
+                        if status in {301, 302, 303, 307, 308}:
+                            redirect_to = response.headers.get("Location", "").strip()
+                            if not redirect_to:
+                                raise URLReviewError("Redirect response missing Location header.")
+                            current_url = urljoin(current_url, redirect_to)
+                            continue
+                        if status >= 400:
+                            raise URLReviewError(f"Remote host returned HTTP {status}.")
 
-                    content_type = response.headers.get("Content-Type", "").strip()
-                    if not self._is_supported_content_type(content_type):
-                        raise URLReviewError("Unsupported content type for review.")
+                        content_type = response.headers.get("Content-Type", "").strip()
+                        if not self._is_supported_content_type(content_type):
+                            raise URLReviewError("Unsupported content type for review.")
 
-                    content_length = response.headers.get("Content-Length", "").strip()
-                    if content_length:
-                        try:
-                            if int(content_length) > self._max_bytes:
-                                raise URLReviewError("Remote response is larger than allowed size.")
-                        except ValueError:
-                            pass
+                        content_length = response.headers.get("Content-Length", "").strip()
+                        if content_length:
+                            try:
+                                if int(content_length) > self._max_bytes:
+                                    raise URLReviewError("Remote response is larger than allowed size.")
+                            except ValueError:
+                                pass
 
-                    buffer = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        buffer.extend(chunk)
-                        if len(buffer) > self._max_bytes:
-                            raise URLReviewError("Remote response exceeded max allowed size.")
+                        buffer = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            buffer.extend(chunk)
+                            if len(buffer) > self._max_bytes:
+                                raise URLReviewError("Remote response exceeded max allowed size.")
 
-                    raw_text = self._decode_body(bytes(buffer), content_type)
-                    title, page_text = self._extract_text(raw_text, content_type)
-                    if not page_text.strip():
-                        raise URLReviewError("Reviewed page did not yield readable text.")
+                        raw_text = self._decode_body(bytes(buffer), content_type)
+                        title, page_text = self._extract_text(raw_text, content_type)
+                        if not page_text.strip():
+                            raise URLReviewError("Reviewed page did not yield readable text.")
 
-                    return ReviewedPage(
-                        requested_url=url,
-                        final_url=current_url,
-                        title=title,
-                        text=page_text,
-                        content_type=content_type,
-                        fetched_at=datetime.now(timezone.utc).isoformat(),
-                    )
+                        return ReviewedPage(
+                            requested_url=url,
+                            final_url=current_url,
+                            title=title,
+                            text=page_text,
+                            content_type=content_type,
+                            fetched_at=datetime.now(timezone.utc).isoformat(),
+                        )
+        except httpx.TimeoutException as exc:
+            raise URLReviewError("Request timed out while fetching URL.") from exc
+        except httpx.HTTPError as exc:
+            raise URLReviewError(f"Request failed while fetching URL: {exc}") from exc
 
         raise URLReviewError("Too many redirects while fetching URL.")

@@ -202,6 +202,26 @@ def _print_url_review_saved(msg: dict[str, Any]) -> None:
             print(f"url_review_saved>    error={error}")
 
 
+def _print_web_review_context(msg: dict[str, Any]) -> None:
+    items = msg.get("items", [])
+    print("web_review_context> items")
+    if not isinstance(items, list) or not items:
+        print("web_review_context> none")
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("final_url") or item.get("url") or "").strip()
+        status = str(item.get("status", "")).strip() or "unknown"
+        meaning = str(item.get("meaning", "")).strip()
+        error = str(item.get("error", "")).strip()
+        print(f"web_review_context> {url} status={status}")
+        if meaning:
+            print(f"web_review_context>    meaning={meaning[:200]}")
+        if error:
+            print(f"web_review_context>    error={error}")
+
+
 def _print_event(msg: dict[str, Any]) -> str:
     msg_type = str(msg.get("type", ""))
     if msg_type == "web_mode":
@@ -228,6 +248,8 @@ def _print_event(msg: dict[str, Any]) -> str:
         _print_memory_saved(msg)
     elif msg_type == "url_review_saved":
         _print_url_review_saved(msg)
+    elif msg_type == "web_review_context":
+        _print_web_review_context(msg)
     elif msg_type == "info":
         print(f"info> {msg.get('message')}")
     elif msg_type == "error":
@@ -311,6 +333,7 @@ async def _consume_stream(ws: websockets.ClientConnection) -> None:
             "clarify_needed",
             "memory_saved",
             "url_review_saved",
+            "web_review_context",
             "info",
         }:
             print("")

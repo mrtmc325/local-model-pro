@@ -210,6 +210,33 @@ function urlReviewSavedToText(msg) {
   return lines.join("\n");
 }
 
+function webReviewContextToText(msg) {
+  const items = Array.isArray(msg.items) ? msg.items : [];
+  if (items.length === 0) {
+    return "Web page review context: no items";
+  }
+  const lines = ["Web page review context:"];
+  items.forEach((item, idx) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const title = String(item.title || "").trim();
+    const url = String(item.final_url || item.url || "").trim() || "(unknown url)";
+    const status = String(item.status || "").trim() || "unknown";
+    const meaning = String(item.meaning || "").trim();
+    const error = String(item.error || "").trim();
+    lines.push(`${idx + 1}. ${title || url} status=${status}`);
+    lines.push(url);
+    if (meaning) {
+      lines.push(`meaning: ${meaning}`);
+    }
+    if (error) {
+      lines.push(`error: ${error}`);
+    }
+  });
+  return lines.join("\n");
+}
+
 function updateWebModeMeta() {
   if (state.groundedModeEnabled && state.groundedProfile === "strict") {
     webModeMeta.textContent =
@@ -697,6 +724,11 @@ function connectWs() {
 
     if (msgType === "url_review_saved") {
       addMessage("system", urlReviewSavedToText(message));
+      return;
+    }
+
+    if (msgType === "web_review_context") {
+      addMessage("system", webReviewContextToText(message));
       return;
     }
 

@@ -30,6 +30,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         prompt: str = "build a go bag list",
         reasoning_mode: str = "hidden",
         memory_results_override: list[MemoryResult] | None = None,
+        review_items_override: tuple[list[URLReviewSavedItem], list[EvidenceCard]] | None = None,
     ) -> tuple[list[str], list[str], list[dict[str, str]], list[dict[str, object]]]:
         from local_model_pro import server
 
@@ -103,6 +104,43 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                     snippet="Emergency supply checklist.",
                 )
             ]
+
+        async def fake_review_web_results_for_context(self, **kwargs: object):  # type: ignore[no-untyped-def]
+            _ = kwargs
+            calls.append("review_web_results_for_context")
+            if review_items_override is not None:
+                return review_items_override
+            return (
+                [
+                    URLReviewSavedItem(
+                        url="https://www.ready.gov/kit",
+                        status="saved",
+                        raw_file=None,
+                        meaning_file=None,
+                        artifact_id=None,
+                        indexed_count=0,
+                        error=None,
+                        final_url="https://www.ready.gov/kit",
+                        title="Ready.gov kit",
+                        meaning="Ready.gov lists essential emergency kit components and planning guidance.",
+                        key_facts=["Keep several days of food and water.", "Include first aid and backup power."],
+                    )
+                ],
+                [
+                    EvidenceCard(
+                        evidence_id="ev-web-review-1",
+                        source_type="web_review",
+                        actor_scope="web",
+                        label="E1",
+                        content="Ready.gov kit\nReviewed emergency-kit guidance from page content.",
+                        url="https://www.ready.gov/kit",
+                        source_session=None,
+                        confidence=0.78,
+                        pii_flag=False,
+                        used_verbatim=False,
+                    )
+                ],
+            )
 
         async def fake_stream_chat(self, *, model: str, messages: list[dict[str, str]], temperature: float, num_ctx: int):  # type: ignore[no-untyped-def]
             _ = model
@@ -205,6 +243,9 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                     "local_model_pro.server._run_web_search",
                     new=fake_run_web_search,
                 ), mock.patch(
+                    "local_model_pro.knowledge_assist.KnowledgeAssistService.review_web_results_for_context",
+                    new=fake_review_web_results_for_context,
+                ), mock.patch(
                     "local_model_pro.ollama_client.OllamaClient.stream_chat",
                     new=fake_stream_chat,
                 ):
@@ -247,10 +288,14 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         )
 
         # Memory retrieval is always executed before web lookup.
-        self.assertEqual(calls[:3], ["build_query_plan", "search_memory", "web_search"])
+        self.assertEqual(
+            calls[:4],
+            ["build_query_plan", "search_memory", "web_search", "review_web_results_for_context"],
+        )
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertIn("web_results", emitted_types)
+        self.assertIn("web_review_context", emitted_types)
         self.assertNotIn("reasoning", emitted_types)
         self.assertNotIn("debug", emitted_types)
         self.assertIn("done", emitted_types)
@@ -276,18 +321,34 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertNotIn("raw direct transcript", joined)
 
     def test_grounded_chat_emits_evidence_and_grounding_status_with_web(self) -> None:
-        calls, emitted_types, _, _ = self._run_chat_and_collect(
+        calls, emitted_types, _, payloads = self._run_chat_and_collect(
             web_assist_enabled=True,
             grounded_mode_enabled=True,
         )
 
-        self.assertEqual(calls[:4], ["build_query_plan", "search_memory", "web_search", "generate_grounded_response"])
+        self.assertEqual(
+            calls[:5],
+            [
+                "build_query_plan",
+                "search_memory",
+                "web_search",
+                "review_web_results_for_context",
+                "generate_grounded_response",
+            ],
+        )
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertIn("web_results", emitted_types)
+        self.assertIn("web_review_context", emitted_types)
         self.assertIn("evidence_used", emitted_types)
         self.assertIn("grounding_status", emitted_types)
         self.assertIn("done", emitted_types)
+        evidence_events = [item for item in payloads if item.get("type") == "evidence_used"]
+        self.assertTrue(evidence_events)
+        evidence_rows = evidence_events[-1].get("results")
+        self.assertIsInstance(evidence_rows, list)
+        source_types = {str(item.get("source_type")) for item in evidence_rows if isinstance(item, dict)}
+        self.assertIn("web_review", source_types)
 
     def test_grounded_chat_without_web_still_emits_memory_and_grounding(self) -> None:
         calls, emitted_types, _, payloads = self._run_chat_and_collect(
@@ -307,6 +368,44 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         grounding_events = [item for item in payloads if item.get("type") == "grounding_status"]
         self.assertTrue(grounding_events)
         self.assertEqual(grounding_events[-1].get("status"), "full")
+
+    def test_grounded_exact_query_with_web_excludes_same_user_memory_evidence(self) -> None:
+        memory_rows = [
+            MemoryResult(
+                evidence_id="mem-same-user-1",
+                insight="Old same-user summary that should not drive exact recency synthesis.",
+                score=0.92,
+                source_session="older-session",
+                speaker="you",
+                created_at="2026-03-07T01:00:00Z",
+                actor_id="tester",
+                pii_flag=False,
+                allow_cross_user=True,
+                source_type="insight",
+                quote_text="stale same-user prior summary",
+            )
+        ]
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=True,
+            prompt="what happened between US and Iran this year?",
+            reasoning_mode="hidden",
+            memory_results_override=memory_rows,
+        )
+
+        self.assertIn("web_results", emitted_types)
+        evidence_events = [item for item in payloads if item.get("type") == "evidence_used"]
+        self.assertTrue(evidence_events)
+        evidence_rows = evidence_events[-1].get("results")
+        self.assertIsInstance(evidence_rows, list)
+        source_types = {str(item.get("source_type")) for item in evidence_rows if isinstance(item, dict)}
+        self.assertNotIn("memory_same_user", source_types)
+        self.assertNotIn("memory_same_session", source_types)
+        self.assertTrue(any(stype.startswith("web_") for stype in source_types))
+
+        grounding_events = [item for item in payloads if item.get("type") == "grounding_status"]
+        self.assertTrue(grounding_events)
+        self.assertEqual(grounding_events[-1].get("exact_required"), True)
 
     def test_save_directive_emits_memory_saved_event(self) -> None:
         calls: list[dict[str, object]] = []
@@ -437,6 +536,40 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertIn("retrieved memory", str(reasoning_events[-1].get("text", "")).lower())
         joined = json.dumps(streamed_messages)
         self.assertIn("Generalized checklist pattern for emergency prep.", joined)
+        self.assertIn("Reviewed URL context (meaning + key facts):", joined)
+
+    def test_non_grounded_web_review_failures_emit_context_event_and_complete(self) -> None:
+        review_override = (
+            [
+                URLReviewSavedItem(
+                    url="https://www.ready.gov/kit",
+                    status="failed",
+                    raw_file=None,
+                    meaning_file=None,
+                    artifact_id=None,
+                    indexed_count=0,
+                    error="Request timed out while fetching URL.",
+                    final_url=None,
+                    title=None,
+                    meaning=None,
+                    key_facts=None,
+                )
+            ],
+            [],
+        )
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+            reasoning_mode="hidden",
+            review_items_override=review_override,
+        )
+        self.assertIn("web_review_context", emitted_types)
+        self.assertIn("done", emitted_types)
+        review_events = [item for item in payloads if item.get("type") == "web_review_context"]
+        self.assertTrue(review_events)
+        items = review_events[-1].get("items")
+        self.assertIsInstance(items, list)
+        self.assertEqual(items[0].get("status"), "failed")
 
     def test_non_grounded_debug_mode_emits_debug_metadata(self) -> None:
         _, emitted_types, _, payloads = self._run_chat_and_collect(

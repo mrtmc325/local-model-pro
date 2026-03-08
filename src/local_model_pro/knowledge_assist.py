@@ -1180,7 +1180,104 @@ class KnowledgeAssistService:
                         key_facts=key_facts,
                     )
                 )
-            except (URLReviewError, OSError, ValueError) as exc:
+            except Exception as exc:
+                items.append(
+                    URLReviewSavedItem(
+                        url=raw_url,
+                        status="failed",
+                        raw_file=None,
+                        meaning_file=None,
+                        artifact_id=None,
+                        indexed_count=0,
+                        error=str(exc),
+                    )
+                )
+        return items, evidence_cards
+
+    async def review_web_results_for_context(
+        self,
+        *,
+        model: str,
+        web_results: list[dict[str, Any]],
+        max_urls: int | None = None,
+        start_index: int = 1,
+    ) -> tuple[list[URLReviewSavedItem], list[EvidenceCard]]:
+        """
+        Fetch and summarize top web-search URLs for same-turn context/evidence only.
+        This path intentionally does not write artifacts or index memory.
+        """
+        items: list[URLReviewSavedItem] = []
+        evidence_cards: list[EvidenceCard] = []
+        next_label = max(1, start_index)
+
+        limit = max(
+            1,
+            int(
+                max_urls
+                if max_urls is not None
+                else self._settings.web_assist_page_review_max_urls
+            ),
+        )
+        candidates: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for row in web_results:
+            url = str(row.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            candidates.append(row)
+            if len(candidates) >= limit:
+                break
+
+        for row in candidates:
+            raw_url = str(row.get("url", "")).strip()
+            if not raw_url:
+                continue
+            try:
+                page = await self._url_review_client.fetch(url=raw_url)
+                # Keep web-assist scraping resilient: if summarization stalls/fails,
+                # fall back to deterministic extraction from fetched page text.
+                try:
+                    meaning, key_facts = await asyncio.wait_for(
+                        self._summarize_reviewed_page(page=page, model=model),
+                        timeout=max(4, self._settings.url_review_timeout_seconds),
+                    )
+                except (asyncio.TimeoutError, OllamaStreamError):
+                    meaning, key_facts = self._fallback_page_meaning(page)
+                content_bits = [page.title, meaning]
+                for fact in key_facts[:4]:
+                    content_bits.append(f"fact: {fact}")
+                evidence_cards.append(
+                    EvidenceCard(
+                        evidence_id=f"web-review:{uuid.uuid4().hex[:8]}",
+                        source_type="web_review",
+                        actor_scope="web",
+                        label=f"E{next_label}",
+                        content="\n".join(content_bits),
+                        url=page.final_url,
+                        source_session=None,
+                        confidence=self.source_confidence("web_review", base_score=0.74),
+                        pii_flag=False,
+                        used_verbatim=False,
+                    )
+                )
+                next_label += 1
+                items.append(
+                    URLReviewSavedItem(
+                        url=raw_url,
+                        status="saved",
+                        raw_file=None,
+                        meaning_file=None,
+                        artifact_id=None,
+                        indexed_count=0,
+                        error=None,
+                        final_url=page.final_url,
+                        title=page.title,
+                        meaning=meaning,
+                        key_facts=key_facts,
+                    )
+                )
+            except Exception as exc:
                 items.append(
                     URLReviewSavedItem(
                         url=raw_url,
