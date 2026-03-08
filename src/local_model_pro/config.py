@@ -9,6 +9,25 @@ def _env_flag(name: str, default: str = "false") -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
+    raw = os.getenv(name, default)
+    values: list[str] = []
+    for item in raw.split(","):
+        token = item.strip().lower()
+        if token.startswith("www."):
+            token = token[4:]
+        if token and token not in values:
+            values.append(token)
+    return tuple(values)
+
+
+def _env_reasoning_mode(name: str, default: str = "summary") -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value in {"hidden", "summary", "verbose", "debug"}:
+        return value
+    return default
+
+
 @dataclass(frozen=True)
 class Settings:
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -35,6 +54,7 @@ class Settings:
         if os.getenv("GROUNDED_PROFILE_DEFAULT", "balanced").strip().lower() in {"strict", "balanced"}
         else "balanced"
     )
+    reasoning_mode_default: str = _env_reasoning_mode("REASONING_MODE_DEFAULT", "summary")
     grounded_timeout_seconds: int = int(os.getenv("GROUNDED_TIMEOUT_SECONDS", "25"))
     default_actor_id: str = os.getenv("DEFAULT_ACTOR_ID", "anonymous").strip() or "anonymous"
     direct_save_enabled: bool = _env_flag("DIRECT_SAVE_ENABLED", "true")
@@ -44,8 +64,20 @@ class Settings:
     url_review_max_urls: int = int(os.getenv("URL_REVIEW_MAX_URLS", "3"))
     url_review_timeout_seconds: int = int(os.getenv("URL_REVIEW_TIMEOUT_SECONDS", "20"))
     url_review_max_bytes: int = int(os.getenv("URL_REVIEW_MAX_BYTES", "2000000"))
+    web_review_meaning_max_chars: int = int(os.getenv("WEB_REVIEW_MEANING_MAX_CHARS", "650"))
     web_assist_page_review_enabled: bool = _env_flag("WEB_ASSIST_PAGE_REVIEW_ENABLED", "true")
     web_assist_page_review_max_urls: int = int(os.getenv("WEB_ASSIST_PAGE_REVIEW_MAX_URLS", "2"))
+    web_research_max_queries: int = int(os.getenv("WEB_RESEARCH_MAX_QUERIES", "3"))
+    web_trusted_only: bool = _env_flag("WEB_TRUSTED_ONLY", "true")
+    web_trusted_domains: tuple[str, ...] = _env_csv(
+        "WEB_TRUSTED_DOMAINS",
+        (
+            "whitehouse.gov,state.gov,defense.gov,treasury.gov,congress.gov,cia.gov,dni.gov,"
+            "fema.gov,ready.gov,cdc.gov,who.int,un.org,nato.int,reuters.com,apnews.com,bbc.com,"
+            "nytimes.com,washingtonpost.com,wsj.com,ft.com,bloomberg.com,economist.com,cfr.org,"
+            "csis.org,brookings.edu,rand.org,wikipedia.org,britannica.com"
+        ),
+    )
 
 
 settings = Settings()

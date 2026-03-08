@@ -31,6 +31,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         reasoning_mode: str = "hidden",
         memory_results_override: list[MemoryResult] | None = None,
         review_items_override: tuple[list[URLReviewSavedItem], list[EvidenceCard]] | None = None,
+        web_results_override: list[WebSearchResult] | None = None,
     ) -> tuple[list[str], list[str], list[dict[str, str]], list[dict[str, object]]]:
         from local_model_pro import server
 
@@ -97,6 +98,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             _ = query
             _ = max_results
             calls.append("web_search")
+            if web_results_override is not None:
+                return web_results_override
             return [
                 WebSearchResult(
                     title="Ready.gov kit",
@@ -288,10 +291,10 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         )
 
         # Memory retrieval is always executed before web lookup.
-        self.assertEqual(
-            calls[:4],
-            ["build_query_plan", "search_memory", "web_search", "review_web_results_for_context"],
-        )
+        self.assertEqual(calls[:2], ["build_query_plan", "search_memory"])
+        self.assertIn("web_search", calls)
+        self.assertIn("review_web_results_for_context", calls)
+        self.assertLess(calls.index("web_search"), calls.index("review_web_results_for_context"))
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertIn("web_results", emitted_types)
@@ -326,16 +329,10 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             grounded_mode_enabled=True,
         )
 
-        self.assertEqual(
-            calls[:5],
-            [
-                "build_query_plan",
-                "search_memory",
-                "web_search",
-                "review_web_results_for_context",
-                "generate_grounded_response",
-            ],
-        )
+        self.assertEqual(calls[:2], ["build_query_plan", "search_memory"])
+        self.assertIn("web_search", calls)
+        self.assertIn("review_web_results_for_context", calls)
+        self.assertIn("generate_grounded_response", calls)
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertIn("web_results", emitted_types)
@@ -349,6 +346,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertIsInstance(evidence_rows, list)
         source_types = {str(item.get("source_type")) for item in evidence_rows if isinstance(item, dict)}
         self.assertIn("web_review", source_types)
+        self.assertNotIn("web_media", source_types)
 
     def test_grounded_chat_without_web_still_emits_memory_and_grounding(self) -> None:
         calls, emitted_types, _, payloads = self._run_chat_and_collect(
@@ -406,6 +404,86 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         grounding_events = [item for item in payloads if item.get("type") == "grounding_status"]
         self.assertTrue(grounding_events)
         self.assertEqual(grounding_events[-1].get("exact_required"), True)
+
+    def test_non_grounded_exact_query_with_web_excludes_same_user_memory_context(self) -> None:
+        memory_rows = [
+            MemoryResult(
+                evidence_id="mem-same-user-1",
+                insight="Stale same-user recap that should be excluded for exact+web synthesis.",
+                score=0.90,
+                source_session="older-session",
+                speaker="you",
+                created_at="2026-03-07T01:00:00Z",
+                actor_id="tester",
+                pii_flag=False,
+                allow_cross_user=True,
+                source_type="insight",
+                quote_text="stale same-user recap",
+            )
+        ]
+        _, emitted_types, streamed_messages, _ = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+            prompt="what happened between US and Iran this year?",
+            reasoning_mode="summary",
+            memory_results_override=memory_rows,
+        )
+        self.assertIn("web_results", emitted_types)
+        joined_messages = json.dumps(streamed_messages)
+        self.assertNotIn("stale same-user recap", joined_messages.lower())
+
+    def test_trusted_source_filter_drops_untrusted_domains(self) -> None:
+        web_override = [
+            WebSearchResult(
+                title="Ready.gov kit",
+                url="https://www.ready.gov/kit",
+                snippet="Trusted source snippet.",
+            ),
+            WebSearchResult(
+                title="Random personal blog",
+                url="https://example.invalid/blog-post",
+                snippet="Untrusted snippet should be dropped.",
+            ),
+        ]
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+            reasoning_mode="debug",
+            web_results_override=web_override,
+        )
+        self.assertIn("web_results", emitted_types)
+        web_events = [item for item in payloads if item.get("type") == "web_results"]
+        self.assertTrue(web_events)
+        rows = web_events[-1].get("results")
+        self.assertIsInstance(rows, list)
+        urls = {str(item.get("url")) for item in rows if isinstance(item, dict)}
+        self.assertIn("https://www.ready.gov/kit", urls)
+        self.assertNotIn("https://example.invalid/blog-post", urls)
+
+        debug_events = [item for item in payloads if item.get("type") == "debug"]
+        self.assertTrue(debug_events)
+        meta = debug_events[-1].get("meta")
+        self.assertIsInstance(meta, dict)
+        self.assertGreaterEqual(int(meta.get("web_trusted_dropped_count", 0)), 1)
+
+    def test_repeated_prompt_uses_fresh_web_retrieval_timestamps(self) -> None:
+        _, _, _, payloads_one = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+        )
+        _, _, _, payloads_two = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+        )
+        web_events_one = [item for item in payloads_one if item.get("type") == "web_results"]
+        web_events_two = [item for item in payloads_two if item.get("type") == "web_results"]
+        self.assertTrue(web_events_one)
+        self.assertTrue(web_events_two)
+        first_timestamp = str(web_events_one[-1].get("retrieved_at", ""))
+        second_timestamp = str(web_events_two[-1].get("retrieved_at", ""))
+        self.assertTrue(first_timestamp)
+        self.assertTrue(second_timestamp)
+        self.assertNotEqual(first_timestamp, second_timestamp)
 
     def test_save_directive_emits_memory_saved_event(self) -> None:
         calls: list[dict[str, object]] = []

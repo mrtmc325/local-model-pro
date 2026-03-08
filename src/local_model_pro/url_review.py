@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
+import re
+import ssl
 import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,9 +12,22 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from lxml import html as lxml_html
 
+try:  # pragma: no cover - optional dependency fallback
+    from readability import Document as ReadabilityDocument
+except Exception:  # pragma: no cover - import fallback
+    ReadabilityDocument = None  # type: ignore[assignment]
+
 _ALLOWED_SCHEMES: Final[set[str]] = {"http", "https"}
 _LOCAL_HOSTS: Final[set[str]] = {"localhost", "localhost.localdomain"}
 _MAX_REDIRECTS: Final[int] = 4
+_MAX_EXTRACTED_CHARS: Final[int] = 160_000
+_BOILERPLATE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"^\s*(menu|navigation|skip to content)\s*$", re.IGNORECASE),
+    re.compile(r"\b(cookie|privacy policy|terms of (service|use))\b", re.IGNORECASE),
+    re.compile(r"\b(sign in|log in|subscribe|newsletter)\b", re.IGNORECASE),
+    re.compile(r"\b(advertisement|sponsored content)\b", re.IGNORECASE),
+    re.compile(r"\ball rights reserved\b", re.IGNORECASE),
+)
 
 
 class URLReviewError(RuntimeError):
@@ -38,6 +53,8 @@ class URLReviewClient:
     ) -> None:
         self._timeout_seconds = max(3, int(timeout_seconds))
         self._max_bytes = max(32_000, int(max_bytes))
+        # Use system trust roots for outbound HTTPS validation.
+        self._ssl_context = ssl.create_default_context()
 
     @staticmethod
     def _is_forbidden_ip(value: str) -> bool:
@@ -125,35 +142,94 @@ class URLReviewClient:
         return ""
 
     @staticmethod
+    def _is_boilerplate_line(value: str) -> bool:
+        text = value.strip()
+        if not text:
+            return True
+        if len(text) < 2:
+            return True
+        for pattern in _BOILERPLATE_PATTERNS:
+            if pattern.search(text):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_text_lines(chunks: list[str]) -> str:
+        lines: list[str] = []
+        for item in chunks:
+            cleaned = " ".join(str(item).split())
+            if URLReviewClient._is_boilerplate_line(cleaned):
+                continue
+            if lines and cleaned == lines[-1]:
+                continue
+            if len(cleaned) > 900:
+                cleaned = cleaned[:897].rstrip() + "..."
+            lines.append(cleaned)
+        merged = "\n".join(lines)
+        if len(merged) > _MAX_EXTRACTED_CHARS:
+            merged = merged[:_MAX_EXTRACTED_CHARS]
+        return merged
+
+    @staticmethod
+    def _extract_title(document: lxml_html.HtmlElement) -> str:
+        title_parts = [item.strip() for item in document.xpath("//title/text()") if item.strip()]
+        if title_parts:
+            return " ".join(title_parts)[:240]
+        return "Untitled page"
+
+    @staticmethod
+    def _extract_html_text_with_fallback(raw_html: str) -> tuple[str, str]:
+        title = "Untitled page"
+        main_text = ""
+
+        if ReadabilityDocument is not None:
+            try:
+                readable_doc = ReadabilityDocument(raw_html)
+                short_title = " ".join(str(readable_doc.short_title() or "").split()).strip()
+                if short_title:
+                    title = short_title[:240]
+                readable_html = readable_doc.summary(html_partial=True)
+                readable_tree = lxml_html.fromstring(readable_html)
+                readable_text_nodes = readable_tree.xpath("//text()")
+                main_text = URLReviewClient._normalize_text_lines([str(node) for node in readable_text_nodes])
+            except Exception:
+                main_text = ""
+
+        try:
+            document = lxml_html.fromstring(raw_html)
+        except Exception:
+            return title, main_text
+
+        for node in document.xpath(
+            "//script|//style|//noscript|//svg|//iframe|//nav|//header|//footer|//form|//aside"
+        ):
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+
+        fallback_title = URLReviewClient._extract_title(document)
+        fallback_nodes = (
+            document.xpath("//main//text()")
+            or document.xpath("//article//text()")
+            or document.xpath("//body//text()")
+            or document.xpath("//text()")
+        )
+        fallback_text = URLReviewClient._normalize_text_lines([str(node) for node in fallback_nodes])
+
+        if fallback_title and title == "Untitled page":
+            title = fallback_title
+        if len(fallback_text) > len(main_text):
+            main_text = fallback_text
+
+        return title, main_text
+
+    @staticmethod
     def _extract_text(text: str, content_type: str) -> tuple[str, str]:
         content_type_normalized = content_type.split(";", 1)[0].strip().lower()
         if "html" in content_type_normalized or "xhtml" in content_type_normalized:
-            document = lxml_html.fromstring(text)
-            for node in document.xpath("//script|//style|//noscript|//svg|//iframe"):
-                parent = node.getparent()
-                if parent is not None:
-                    parent.remove(node)
+            return URLReviewClient._extract_html_text_with_fallback(text)
 
-            title_parts = [item.strip() for item in document.xpath("//title/text()") if item.strip()]
-            title = " ".join(title_parts)[:240] if title_parts else "Untitled page"
-
-            body_text = document.xpath("//body//text()") or document.xpath("//text()")
-            lines: list[str] = []
-            for item in body_text:
-                cleaned = " ".join(str(item).split())
-                if not cleaned:
-                    continue
-                lines.append(cleaned)
-
-            merged = "\n".join(lines)
-            if len(merged) > 160_000:
-                merged = merged[:160_000]
-            return title, merged
-
-        plain_lines = [" ".join(line.split()) for line in text.splitlines()]
-        merged_plain = "\n".join(line for line in plain_lines if line)
-        if len(merged_plain) > 160_000:
-            merged_plain = merged_plain[:160_000]
+        merged_plain = URLReviewClient._normalize_text_lines(text.splitlines())
         return "Plain text document", merged_plain
 
     async def fetch(self, *, url: str) -> ReviewedPage:
@@ -168,7 +244,12 @@ class URLReviewClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers=headers,
+                follow_redirects=False,
+                verify=self._ssl_context,
+            ) as client:
                 for _ in range(_MAX_REDIRECTS + 1):
                     current_url = self._validate_url(current_url)
                     async with client.stream("GET", current_url) as response:

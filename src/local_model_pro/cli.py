@@ -113,9 +113,16 @@ def _print_web_results(msg: dict[str, Any]) -> None:
     query = str(msg.get("query", "")).strip()
     results = msg.get("results", [])
     retrieved_at = str(msg.get("retrieved_at", "")).strip()
+    research_queries = msg.get("research_queries", [])
+    trusted_kept = msg.get("trusted_kept_count")
+    trusted_dropped = msg.get("trusted_dropped_count")
     print(f"web> results for: {query}")
+    if isinstance(research_queries, list) and research_queries:
+        print(f"web> research_queries={research_queries}")
     if retrieved_at:
         print(f"web> retrieved_at: {retrieved_at}")
+    if trusted_kept is not None or trusted_dropped is not None:
+        print(f"web> trusted_kept={trusted_kept} trusted_dropped={trusted_dropped}")
     if not isinstance(results, list) or not results:
         print("web> no results")
         return
@@ -215,7 +222,14 @@ def _print_web_review_context(msg: dict[str, Any]) -> None:
         status = str(item.get("status", "")).strip() or "unknown"
         meaning = str(item.get("meaning", "")).strip()
         error = str(item.get("error", "")).strip()
+        domain = str(item.get("domain", "")).strip()
+        source_type = str(item.get("source_type", "")).strip()
+        reviewed_chars = item.get("reviewed_chars")
         print(f"web_review_context> {url} status={status}")
+        if domain or source_type:
+            print(f"web_review_context>    domain={domain} source_type={source_type}")
+        if reviewed_chars is not None:
+            print(f"web_review_context>    reviewed_chars={reviewed_chars}")
         if meaning:
             print(f"web_review_context>    meaning={meaning[:200]}")
         if error:

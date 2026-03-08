@@ -148,6 +148,8 @@ For each prompt when `Knowledge Assist` is enabled:
 1. Session memory (current chat history)
 2. Shared local memory retrieval (Qdrant insights)
 3. Optional web retrieval (if `Web Assist` is enabled)
+4. Research mode runs multiple targeted web queries, dedupes URLs, and filters synthesis to trusted domains.
+5. For exact/recency prompts with web results, same-session/same-user memory is excluded from synthesis context.
 
 Only insight abstractions are used from shared memory. Raw transcript text is persisted but not directly injected into model context.
 
@@ -184,7 +186,7 @@ Server -> client:
 - `{"type":"grounding_status","status":"full|partial|insufficient","profile":"balanced","exact_required":true,"overall_confidence":0.81,"note":"..."}`
 - `{"type":"clarify_needed","question":"..."}`
 - `{"type":"url_review_saved","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","raw_file":"...","meaning_file":"...","artifact_id":"...","indexed_count":1,"error":null}]}`
-- `{"type":"web_review_context","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","final_url":"...","title":"...","meaning":"...","key_facts":["..."],"error":null}]}`
+- `{"type":"web_review_context","request_id":"...","items":[{"url":"https://example.com","status":"saved|failed","final_url":"...","title":"...","meaning":"...","key_facts":["..."],"domain":"example.com","source_type":"web_media","reviewed_chars":12000,"error":null}]}`
 - `{"type":"start","request_id":"..."}`
 - `{"type":"token","request_id":"...","text":"..."}`
 - `{"type":"done","request_id":"...","model":"...","web_assist_enabled":false,"knowledge_assist_enabled":true,"grounded_mode_enabled":true,"grounded_profile":"balanced"}`
@@ -193,7 +195,7 @@ Server -> client:
 - `{"type":"knowledge_mode","enabled":true}`
 - `{"type":"grounded_mode","enabled":true}`
 - `{"type":"grounded_profile","profile":"strict"}`
-- `{"type":"web_results","query":"...","retrieved_at":"...","results":[...]}`
+- `{"type":"web_results","query":"...","research_queries":["...","..."],"retrieved_at":"...","trusted_kept_count":2,"trusted_dropped_count":1,"results":[...]}`
 - `{"type":"info","message":"..."}`
 - `{"type":"error","message":"..."}`
 

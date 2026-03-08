@@ -9,6 +9,10 @@ COPY pyproject.toml /app/
 COPY README.md /app/
 COPY src /app/src
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 

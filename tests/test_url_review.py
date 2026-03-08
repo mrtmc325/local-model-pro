@@ -45,6 +45,29 @@ class URLReviewClientValidationTests(unittest.TestCase):
         validated = URLReviewClient._validate_url("https://example.com/path")
         self.assertEqual(validated, "https://example.com/path")
 
+    def test_extract_text_strips_navigation_and_boilerplate(self) -> None:
+        html = """
+        <html>
+          <head><title>Sample Article</title></head>
+          <body>
+            <nav>Menu</nav>
+            <header>Subscribe to newsletter</header>
+            <article>
+              <h1>Sample Article</h1>
+              <p>Main analysis starts here with concrete details.</p>
+              <p>Second paragraph with relevant factual context.</p>
+            </article>
+            <footer>Privacy policy and all rights reserved.</footer>
+          </body>
+        </html>
+        """
+        title, text = URLReviewClient._extract_text(html, "text/html")
+        self.assertIn("Sample Article", title)
+        self.assertIn("Main analysis starts here", text)
+        self.assertIn("Second paragraph with relevant factual context", text)
+        self.assertNotIn("Privacy policy", text)
+        self.assertNotIn("Subscribe to newsletter", text)
+
 
 class URLReviewFailureModeTests(unittest.IsolatedAsyncioTestCase):
     async def _build_service(self, tmpdir: str) -> KnowledgeAssistService:
@@ -144,6 +167,9 @@ class URLReviewFailureModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(items[0].artifact_id)
             self.assertIsNone(items[0].raw_file)
             self.assertIsNone(items[0].meaning_file)
+            self.assertEqual(items[0].domain, "example.com")
+            self.assertEqual(items[0].source_type, "web_media")
+            self.assertGreater(int(items[0].reviewed_chars or 0), 0)
             self.assertEqual(len(cards), 1)
             self.assertEqual(cards[0].source_type, "web_review")
             self.assertFalse(export_dir.exists())

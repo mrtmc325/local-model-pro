@@ -173,6 +173,9 @@ class URLReviewSavedItem:
     title: str | None = None
     meaning: str | None = None
     key_facts: list[str] | None = None
+    domain: str | None = None
+    source_type: str | None = None
+    reviewed_chars: int | None = None
 
 
 class RecursivePlanner:
@@ -508,11 +511,16 @@ class KnowledgeAssistService:
         return not KnowledgeAssistService._detect_pii(content)
 
     @staticmethod
-    def classify_source_type_for_url(url: str) -> str:
+    def domain_for_url(url: str) -> str:
         parsed = urlparse(url)
-        host = parsed.netloc.lower()
+        host = parsed.netloc.lower().strip().rstrip(".")
         if host.startswith("www."):
             host = host[4:]
+        return host
+
+    @staticmethod
+    def classify_source_type_for_url(url: str) -> str:
+        host = KnowledgeAssistService.domain_for_url(url)
 
         if any(token in host for token in _FORUM_HINTS):
             return "web_user_story_forum"
@@ -1003,6 +1011,62 @@ class KnowledgeAssistService:
             facts.append(meaning[:220])
         return meaning, facts
 
+    @staticmethod
+    def _clean_review_line(value: str, *, max_chars: int) -> str:
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if not cleaned:
+            return ""
+        noise_phrases = (
+            "cookie policy",
+            "privacy policy",
+            "terms of service",
+            "sign in",
+            "log in",
+            "subscribe",
+            "newsletter",
+            "all rights reserved",
+        )
+        lowered = cleaned.lower()
+        if any(phrase in lowered for phrase in noise_phrases):
+            return ""
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[: max_chars - 3].rstrip() + "..."
+        return cleaned
+
+    def _normalize_review_summary(
+        self,
+        *,
+        page: ReviewedPage,
+        meaning: str,
+        key_facts: list[str],
+    ) -> tuple[str, list[str]]:
+        meaning_limit = max(180, int(self._settings.web_review_meaning_max_chars))
+        clean_meaning = self._clean_review_line(meaning, max_chars=meaning_limit)
+        if not clean_meaning:
+            fallback_meaning, fallback_facts = self._fallback_page_meaning(page)
+            clean_meaning = self._clean_review_line(fallback_meaning, max_chars=meaning_limit)
+            key_facts = key_facts or fallback_facts
+
+        fact_limit = min(240, max(80, meaning_limit // 3))
+        normalized_facts: list[str] = []
+        seen: set[str] = set()
+        for fact in key_facts:
+            clean_fact = self._clean_review_line(str(fact), max_chars=fact_limit)
+            if not clean_fact:
+                continue
+            key = clean_fact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_facts.append(clean_fact)
+            if len(normalized_facts) >= 5:
+                break
+
+        if not normalized_facts and clean_meaning:
+            normalized_facts = [self._clean_review_line(clean_meaning, max_chars=fact_limit)]
+
+        return clean_meaning, [item for item in normalized_facts if item]
+
     async def _summarize_reviewed_page(
         self,
         *,
@@ -1034,11 +1098,21 @@ class KnowledgeAssistService:
                 num_ctx=max(2048, min(self._settings.default_num_ctx, 6144)),
             )
         except OllamaStreamError:
-            return self._fallback_page_meaning(page)
+            fallback_meaning, fallback_facts = self._fallback_page_meaning(page)
+            return self._normalize_review_summary(
+                page=page,
+                meaning=fallback_meaning,
+                key_facts=fallback_facts,
+            )
 
         payload = RecursivePlanner._extract_json_object(raw)
         if not payload:
-            return self._fallback_page_meaning(page)
+            fallback_meaning, fallback_facts = self._fallback_page_meaning(page)
+            return self._normalize_review_summary(
+                page=page,
+                meaning=fallback_meaning,
+                key_facts=fallback_facts,
+            )
 
         meaning = re.sub(r"\s+", " ", str(payload.get("meaning", ""))).strip()
         key_facts = self._extract_json_array(payload.get("key_facts"))
@@ -1046,7 +1120,11 @@ class KnowledgeAssistService:
             meaning, fallback_facts = self._fallback_page_meaning(page)
             if not key_facts:
                 key_facts = fallback_facts
-        return meaning, key_facts
+        return self._normalize_review_summary(
+            page=page,
+            meaning=meaning,
+            key_facts=key_facts,
+        )
 
     async def review_and_save_urls(
         self,
@@ -1063,9 +1141,25 @@ class KnowledgeAssistService:
         evidence_cards: list[EvidenceCard] = []
         next_label = max(1, start_index)
         for raw_url in urls[: max(1, self._settings.url_review_max_urls)]:
+            source_type = self.classify_source_type_for_url(raw_url)
+            domain = self.domain_for_url(raw_url)
             try:
                 page = await self._url_review_client.fetch(url=raw_url)
-                meaning, key_facts = await self._summarize_reviewed_page(page=page, model=model)
+                try:
+                    meaning, key_facts = await asyncio.wait_for(
+                        self._summarize_reviewed_page(page=page, model=model),
+                        timeout=max(4, self._settings.url_review_timeout_seconds),
+                    )
+                except (asyncio.TimeoutError, OllamaStreamError):
+                    fallback_meaning, fallback_facts = self._fallback_page_meaning(page)
+                    meaning, key_facts = self._normalize_review_summary(
+                        page=page,
+                        meaning=fallback_meaning,
+                        key_facts=fallback_facts,
+                    )
+                source_type = self.classify_source_type_for_url(page.final_url)
+                domain = self.domain_for_url(page.final_url)
+                reviewed_chars = len(page.text)
 
                 raw_file, raw_hash = self._write_artifact_file(
                     actor_id=actor_id,
@@ -1178,6 +1272,9 @@ class KnowledgeAssistService:
                         title=page.title,
                         meaning=meaning,
                         key_facts=key_facts,
+                        domain=domain,
+                        source_type=source_type,
+                        reviewed_chars=reviewed_chars,
                     )
                 )
             except Exception as exc:
@@ -1190,6 +1287,8 @@ class KnowledgeAssistService:
                         artifact_id=None,
                         indexed_count=0,
                         error=str(exc),
+                        domain=domain,
+                        source_type=source_type,
                     )
                 )
         return items, evidence_cards
@@ -1233,8 +1332,12 @@ class KnowledgeAssistService:
             raw_url = str(row.get("url", "")).strip()
             if not raw_url:
                 continue
+            source_type = str(row.get("source_type", "")).strip() or self.classify_source_type_for_url(raw_url)
+            domain = self.domain_for_url(raw_url)
             try:
                 page = await self._url_review_client.fetch(url=raw_url)
+                source_type = self.classify_source_type_for_url(page.final_url)
+                domain = self.domain_for_url(page.final_url)
                 # Keep web-assist scraping resilient: if summarization stalls/fails,
                 # fall back to deterministic extraction from fetched page text.
                 try:
@@ -1243,7 +1346,12 @@ class KnowledgeAssistService:
                         timeout=max(4, self._settings.url_review_timeout_seconds),
                     )
                 except (asyncio.TimeoutError, OllamaStreamError):
-                    meaning, key_facts = self._fallback_page_meaning(page)
+                    fallback_meaning, fallback_facts = self._fallback_page_meaning(page)
+                    meaning, key_facts = self._normalize_review_summary(
+                        page=page,
+                        meaning=fallback_meaning,
+                        key_facts=fallback_facts,
+                    )
                 content_bits = [page.title, meaning]
                 for fact in key_facts[:4]:
                     content_bits.append(f"fact: {fact}")
@@ -1275,6 +1383,9 @@ class KnowledgeAssistService:
                         title=page.title,
                         meaning=meaning,
                         key_facts=key_facts,
+                        domain=domain,
+                        source_type=source_type,
+                        reviewed_chars=len(page.text),
                     )
                 )
             except Exception as exc:
@@ -1287,6 +1398,8 @@ class KnowledgeAssistService:
                         artifact_id=None,
                         indexed_count=0,
                         error=str(exc),
+                        domain=domain,
+                        source_type=source_type,
                     )
                 )
         return items, evidence_cards
@@ -1941,6 +2054,7 @@ class KnowledgeAssistService:
                 f"source_type_counts={source_summary or 'none'}",
                 f"status={status}",
                 f"overall_confidence={overall_confidence:.2f}",
+                f"weak_claims={weak_count}",
                 f"unsupported_claims={unsupported_count}",
                 f"conflicts={conflict_summary or 'none'}",
                 f"exact_required={exact_required}",
@@ -2072,19 +2186,20 @@ class KnowledgeAssistService:
                     pair = (claim.evidence_ids[0], claim.evidence_ids[1])
                     if pair not in conflict_pairs:
                         conflict_pairs.append(pair)
+        weak_count = sum(1 for claim in claims if claim.status == "weak")
 
         if claims:
             overall = sum(item.confidence for item in claims) / len(claims)
         else:
             overall = 0.0
 
-        if exact_required and (unsupported_count > 0 or conflict_pairs):
+        if exact_required and (unsupported_count > 0 or weak_count > 0 or conflict_pairs):
             conflict_note = " Conflicting evidence detected." if conflict_pairs else ""
             clarify = (
                 "I can’t verify the exact concrete data yet. "
                 "Which exact phrase, date, or field should I validate first?"
             )
-            insufficient_note = f"Exact request has unsupported or conflicting claims.{conflict_note}"
+            insufficient_note = f"Exact request has weak, unsupported, or conflicting claims.{conflict_note}"
             reasoning_text, debug_text = self._build_grounded_reasoning_and_debug(
                 reasoning_mode=reasoning_mode,
                 evidence_cards=evidence_cards,
@@ -2107,7 +2222,7 @@ class KnowledgeAssistService:
                 debug_text=debug_text,
             )
 
-        if unsupported_count == 0 and not conflict_pairs:
+        if unsupported_count == 0 and weak_count == 0 and not conflict_pairs:
             status = "full"
         else:
             status = "partial"
@@ -2119,7 +2234,7 @@ class KnowledgeAssistService:
                 "Presenting both interpretations; clarify which source should be authoritative."
             )
 
-        if (unsupported_count > 0 or conflict_pairs) and "not 100% factual" not in answer_text.lower():
+        if (unsupported_count > 0 or weak_count > 0 or conflict_pairs) and "not 100% factual" not in answer_text.lower():
             answer_text = answer_text.rstrip() + "\n\nThis response is not 100% factual; some claims are weakly grounded."
 
         if claims:

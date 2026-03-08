@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -51,7 +52,7 @@ class ChatSession:
     knowledge_assist_enabled: bool = settings.knowledge_assist_default
     grounded_mode_enabled: bool = settings.grounded_mode_default
     grounded_profile: str = settings.grounded_profile_default
-    reasoning_mode: str = "hidden"
+    reasoning_mode: str = settings.reasoning_mode_default
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -75,6 +76,15 @@ class IngestionResolution:
     save_event: SavedMemoryEvent | None
     review_items: list[URLReviewSavedItem]
     review_evidence_cards: list[EvidenceCard]
+
+
+@dataclass(frozen=True)
+class WebResearchResolution:
+    queries: list[str]
+    raw_results: list[WebSearchResult]
+    deduped_results: list[WebSearchResult]
+    trusted_results: list[WebSearchResult]
+    errors: list[str]
 
 
 def _safe_text(value: Any) -> str:
@@ -183,6 +193,8 @@ def _build_debug_metadata(
     reasoning_mode: str,
     grounded: GroundedResponse | None = None,
     evidence_cards: list[EvidenceCard] | None = None,
+    web_research_stats: dict[str, Any] | None = None,
+    excluded_memory_count: int = 0,
 ) -> dict[str, Any]:
     memory_ids = [item.evidence_id for item in assist.memory_results if item.evidence_id][:5]
     metadata: dict[str, Any] = {
@@ -193,14 +205,25 @@ def _build_debug_metadata(
         "web_used": bool(web_results),
         "web_result_count": len(web_results),
         "exact_required": assist.exact_required,
+        "excluded_actor_memory_count": excluded_memory_count,
     }
+    if web_research_stats:
+        metadata.update(web_research_stats)
     if web_review_items is not None:
         saved_count = sum(1 for item in web_review_items if item.status == "saved")
         metadata["web_page_reviewed_count"] = saved_count
         metadata["web_page_review_failed_count"] = max(0, len(web_review_items) - saved_count)
+        metadata["web_page_review_total"] = len(web_review_items)
+        metadata["web_page_reviewed_chars_total"] = sum(
+            int(item.reviewed_chars or 0) for item in web_review_items
+        )
     if evidence_cards is not None:
         metadata["top_evidence_labels"] = [card.label for card in evidence_cards[:5]]
         metadata["top_evidence_ids"] = [card.evidence_id for card in evidence_cards[:5]]
+        source_counts: dict[str, int] = {}
+        for card in evidence_cards:
+            source_counts[card.source_type] = source_counts.get(card.source_type, 0) + 1
+        metadata["evidence_source_counts"] = source_counts
     if grounded is not None:
         metadata["grounded_status"] = grounded.status
         metadata["grounded_confidence"] = round(grounded.overall_confidence, 3)
@@ -216,14 +239,25 @@ def _debug_metadata_to_text(meta: dict[str, Any]) -> str:
         f"top_memory_evidence_ids={meta.get('top_memory_evidence_ids')}",
         f"web_used={meta.get('web_used')}",
         f"web_result_count={meta.get('web_result_count')}",
+        f"web_research_query_count={meta.get('web_research_query_count')}",
+        f"web_raw_result_count={meta.get('web_raw_result_count')}",
+        f"web_deduped_result_count={meta.get('web_deduped_result_count')}",
+        f"web_trusted_kept_count={meta.get('web_trusted_kept_count')}",
+        f"web_trusted_dropped_count={meta.get('web_trusted_dropped_count')}",
+        f"web_search_error_count={meta.get('web_search_error_count')}",
         f"web_page_reviewed_count={meta.get('web_page_reviewed_count')}",
         f"web_page_review_failed_count={meta.get('web_page_review_failed_count')}",
+        f"web_page_review_total={meta.get('web_page_review_total')}",
+        f"web_page_reviewed_chars_total={meta.get('web_page_reviewed_chars_total')}",
+        f"excluded_actor_memory_count={meta.get('excluded_actor_memory_count')}",
         f"exact_required={meta.get('exact_required')}",
     ]
     if "top_evidence_labels" in meta:
         lines.append(f"top_evidence_labels={meta.get('top_evidence_labels')}")
     if "top_evidence_ids" in meta:
         lines.append(f"top_evidence_ids={meta.get('top_evidence_ids')}")
+    if "evidence_source_counts" in meta:
+        lines.append(f"evidence_source_counts={meta.get('evidence_source_counts')}")
     if "grounded_status" in meta:
         lines.append(f"grounded_status={meta.get('grounded_status')}")
     if "grounded_confidence" in meta:
@@ -241,7 +275,7 @@ def _memory_scope(item: MemoryResult, session: ChatSession) -> str:
     return "shared"
 
 
-def _filter_memory_for_grounded_synthesis(
+def _filter_memory_for_web_synthesis(
     *,
     memory_results: list[MemoryResult],
     session: ChatSession,
@@ -250,7 +284,7 @@ def _filter_memory_for_grounded_synthesis(
 ) -> tuple[list[MemoryResult], int]:
     """
     For exact/recency prompts backed by fresh web retrieval, avoid recycling
-    actor-owned memory summaries into grounded synthesis.
+    actor-owned memory summaries into synthesis context.
     """
     if not (exact_required and has_web_results):
         return memory_results, 0
@@ -264,6 +298,127 @@ def _filter_memory_for_grounded_synthesis(
             continue
         filtered.append(item)
     return filtered, excluded_count
+
+
+def _canonical_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.netloc or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{scheme}://{host}{path}"
+
+
+def _trusted_domain_for_url(url: str) -> str:
+    host = (urlparse(url).netloc or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _is_trusted_url(url: str) -> bool:
+    if not settings.web_trusted_only:
+        return True
+    host = _trusted_domain_for_url(url)
+    if not host:
+        return False
+    trusted = settings.web_trusted_domains
+    if not trusted:
+        return True
+    for domain in trusted:
+        if host == domain or host.endswith(f".{domain}"):
+            return True
+    return False
+
+
+def _build_web_research_queries(*, assist: AssistResolution, prompt: str) -> list[str]:
+    limit = max(1, min(settings.web_research_max_queries, 6))
+    now_year = datetime.now(timezone.utc).year
+    candidates: list[str] = []
+    base = (assist.web_query or prompt).strip()
+    if base:
+        candidates.append(base)
+        candidates.append(f"{base} latest updates")
+        candidates.append(f"{base} timeline {now_year}")
+        if assist.exact_required:
+            candidates.append(f"{base} official statements {now_year}")
+            candidates.append(f"{base} chronology so far")
+    if assist.query_plan:
+        meaning = assist.query_plan.meaning.strip()
+        purpose = assist.query_plan.purpose.strip()
+        if meaning:
+            candidates.append(f"{meaning} {now_year}")
+        if purpose:
+            candidates.append(f"{purpose} current developments")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in candidates:
+        clean = re.sub(r"\s+", " ", query).strip()
+        if len(clean) < 4:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(clean)
+        if len(deduped) >= limit:
+            break
+    return deduped or [prompt.strip()]
+
+
+def _dedupe_web_results(rows: list[WebSearchResult]) -> list[WebSearchResult]:
+    deduped: list[WebSearchResult] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = _canonical_url(row.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _drop_untrusted_results(rows: list[WebSearchResult]) -> tuple[list[WebSearchResult], int]:
+    kept: list[WebSearchResult] = []
+    dropped = 0
+    for row in rows:
+        if _is_trusted_url(row.url):
+            kept.append(row)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def _filter_snippet_rows_for_reviewed_urls(
+    *,
+    web_rows: list[dict[str, Any]],
+    review_items: list[URLReviewSavedItem],
+) -> tuple[list[dict[str, Any]], int]:
+    reviewed_keys: set[str] = set()
+    for item in review_items:
+        if item.status != "saved":
+            continue
+        chosen_url = (item.final_url or item.url or "").strip()
+        if not chosen_url:
+            continue
+        reviewed_keys.add(_canonical_url(chosen_url))
+
+    if not reviewed_keys:
+        return web_rows, 0
+
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for row in web_rows:
+        row_url = str(row.get("url", "")).strip()
+        if row_url and _canonical_url(row_url) in reviewed_keys:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
 
 
 async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
@@ -363,6 +518,9 @@ def _serialize_url_review_items(items: list[URLReviewSavedItem]) -> list[dict[st
                 "title": item.title,
                 "meaning": item.meaning,
                 "key_facts": item.key_facts or [],
+                "domain": item.domain,
+                "source_type": item.source_type,
+                "reviewed_chars": item.reviewed_chars,
             }
         )
     return rows
@@ -447,6 +605,40 @@ async def _run_web_search(
         web_search.search,
         query=query,
         max_results=max_results,
+    )
+
+
+async def _run_web_research(
+    *,
+    web_search: WebSearchClient,
+    assist: AssistResolution,
+    prompt: str,
+    max_results: int,
+) -> WebResearchResolution:
+    queries = _build_web_research_queries(assist=assist, prompt=prompt)
+    raw_results: list[WebSearchResult] = []
+    errors: list[str] = []
+
+    for query in queries:
+        try:
+            result_rows = await _run_web_search(
+                web_search,
+                query=query,
+                max_results=max_results,
+            )
+        except WebSearchError as exc:
+            errors.append(f"{query}: {exc}")
+            continue
+        raw_results.extend(result_rows)
+
+    deduped_results = _dedupe_web_results(raw_results)
+    trusted_results, _ = _drop_untrusted_results(deduped_results)
+    return WebResearchResolution(
+        queries=queries,
+        raw_results=raw_results,
+        deduped_results=deduped_results,
+        trusted_results=trusted_results,
+        errors=errors,
     )
 
 
@@ -695,12 +887,14 @@ async def service_info() -> dict[str, Any]:
             "grounded_mode": True,
             "grounded_profiles": ["strict", "balanced"],
             "reasoning_modes": ["hidden", "summary", "verbose", "debug"],
-            "reasoning_default": "hidden",
+            "reasoning_default": settings.reasoning_mode_default,
             "web_assist": True,
             "evidence_panel_events": True,
             "direct_save": settings.direct_save_enabled,
             "url_review": settings.url_review_enabled,
             "web_assist_page_review": settings.web_assist_page_review_enabled,
+            "web_trusted_only": settings.web_trusted_only,
+            "web_research_max_queries": settings.web_research_max_queries,
         },
     }
 
@@ -1222,90 +1416,217 @@ async def chat_ws(websocket: WebSocket) -> None:
                 )
             )
             web_results: list[WebSearchResult] = []
+            snippet_only_web_results: list[WebSearchResult] = []
             serialized_web_results: list[dict[str, Any]] = []
+            snippet_only_serialized_web_results: list[dict[str, Any]] = []
             search_review_items: list[URLReviewSavedItem] = []
             search_review_evidence_cards: list[EvidenceCard] = []
+            web_research_stats: dict[str, Any] = {
+                "web_research_query_count": 0,
+                "web_raw_result_count": 0,
+                "web_deduped_result_count": 0,
+                "web_trusted_kept_count": 0,
+                "web_trusted_dropped_count": 0,
+                "web_search_error_count": 0,
+            }
             if use_web_for_chat:
-                try:
-                    web_results = await _run_web_search(
-                        web_search,
-                        query=assist.web_query,
-                        max_results=settings.web_search_max_results,
-                    )
-                except WebSearchError as exc:
+                research = await _run_web_research(
+                    web_search=web_search,
+                    assist=assist,
+                    prompt=prompt,
+                    max_results=settings.web_search_max_results,
+                )
+                web_results = research.trusted_results
+                dropped_untrusted = max(0, len(research.deduped_results) - len(research.trusted_results))
+                web_research_stats = {
+                    "web_research_query_count": len(research.queries),
+                    "web_raw_result_count": len(research.raw_results),
+                    "web_deduped_result_count": len(research.deduped_results),
+                    "web_trusted_kept_count": len(research.trusted_results),
+                    "web_trusted_dropped_count": dropped_untrusted,
+                    "web_search_error_count": len(research.errors),
+                }
+                serialized_web_results = _serialize_web_results(web_results)
+                snippet_only_serialized_web_results = list(serialized_web_results)
+                snippet_only_web_results = list(web_results)
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "web_results",
+                        "query": assist.web_query,
+                        "research_queries": research.queries,
+                        "original_query": prompt,
+                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                        "results": serialized_web_results,
+                        "request_id": request_id,
+                        "trusted_only": settings.web_trusted_only,
+                        "trusted_kept_count": len(research.trusted_results),
+                        "trusted_dropped_count": dropped_untrusted,
+                    },
+                )
+
+                if research.errors:
                     await _send_json(
                         websocket,
                         {
                             "type": "info",
-                            "message": f"Web assist unavailable, continuing without web context: {exc}",
+                            "request_id": request_id,
+                            "message": (
+                                "Some web research queries failed, continuing with successful results "
+                                f"(failed={len(research.errors)})."
+                            ),
                         },
                     )
-                else:
-                    serialized_web_results = _serialize_web_results(web_results)
+                if settings.web_trusted_only and dropped_untrusted:
                     await _send_json(
                         websocket,
                         {
-                            "type": "web_results",
-                            "query": assist.web_query,
-                            "original_query": prompt,
-                            "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                            "results": serialized_web_results,
+                            "type": "info",
                             "request_id": request_id,
+                            "message": (
+                                "Filtered untrusted web sources before synthesis "
+                                f"(kept={len(research.trusted_results)}, dropped={dropped_untrusted})."
+                            ),
                         },
                     )
 
-                    if (
-                        serialized_web_results
-                        and settings.url_review_enabled
-                        and settings.web_assist_page_review_enabled
-                    ):
+                if settings.url_review_enabled and settings.web_assist_page_review_enabled:
+                    review_limit = min(
+                        max(1, settings.web_assist_page_review_max_urls),
+                        max(1, len(serialized_web_results)),
+                    )
+                    if serialized_web_results:
                         try:
                             search_review_items, search_review_evidence_cards = (
                                 await knowledge.review_web_results_for_context(
                                     model=session.model,
                                     web_results=serialized_web_results,
-                                    max_urls=settings.web_assist_page_review_max_urls,
+                                    max_urls=review_limit,
                                     start_index=1,
                                 )
                             )
                         except Exception as exc:
                             err_text = str(exc).strip() or exc.__class__.__name__
-                            await _send_json(
-                                websocket,
-                                {
-                                    "type": "info",
-                                    "request_id": request_id,
-                                    "message": (
-                                        "Web page review failed, continuing with search snippets: "
-                                        f"{err_text}"
-                                    ),
-                                },
-                            )
-                        else:
-                            if search_review_items:
-                                saved_count = sum(
-                                    1 for item in search_review_items if item.status == "saved"
-                                )
-                                failed_count = max(0, len(search_review_items) - saved_count)
+                            # Latency guardrail: retry with a smaller reviewed set before giving up.
+                            if review_limit > 1:
+                                try:
+                                    search_review_items, search_review_evidence_cards = (
+                                        await knowledge.review_web_results_for_context(
+                                            model=session.model,
+                                            web_results=serialized_web_results,
+                                            max_urls=1,
+                                            start_index=1,
+                                        )
+                                    )
+                                except Exception as retry_exc:
+                                    retry_text = str(retry_exc).strip() or retry_exc.__class__.__name__
+                                    search_review_items = [
+                                        URLReviewSavedItem(
+                                            url=str(serialized_web_results[0].get("url", "")).strip(),
+                                            status="failed",
+                                            raw_file=None,
+                                            meaning_file=None,
+                                            artifact_id=None,
+                                            indexed_count=0,
+                                            error=retry_text,
+                                        )
+                                    ]
+                                    await _send_json(
+                                        websocket,
+                                        {
+                                            "type": "info",
+                                            "request_id": request_id,
+                                            "message": (
+                                                "Web page review failed after fallback, continuing with snippets: "
+                                                f"{retry_text}"
+                                            ),
+                                        },
+                                    )
+                                else:
+                                    await _send_json(
+                                        websocket,
+                                        {
+                                            "type": "info",
+                                            "request_id": request_id,
+                                            "message": (
+                                                "Web page review slowed down; retried with a smaller set "
+                                                "(max_urls=1)."
+                                            ),
+                                        },
+                                    )
+                            else:
+                                search_review_items = [
+                                    URLReviewSavedItem(
+                                        url=str(serialized_web_results[0].get("url", "")).strip(),
+                                        status="failed",
+                                        raw_file=None,
+                                        meaning_file=None,
+                                        artifact_id=None,
+                                        indexed_count=0,
+                                        error=err_text,
+                                    )
+                                ]
                                 await _send_json(
                                     websocket,
                                     {
-                                        "type": "web_review_context",
                                         "request_id": request_id,
-                                        "items": _serialize_url_review_items(search_review_items),
-                                    },
-                                )
-                                await _send_json(
-                                    websocket,
-                                    {
                                         "type": "info",
-                                        "request_id": request_id,
                                         "message": (
-                                            "Reviewed top web pages for context "
-                                            f"(saved={saved_count}, failed={failed_count})."
+                                            "Web page review failed, continuing with search snippets: "
+                                            f"{err_text}"
                                         ),
                                     },
                                 )
+
+                    saved_count = sum(1 for item in search_review_items if item.status == "saved")
+                    failed_count = max(0, len(search_review_items) - saved_count)
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "web_review_context",
+                            "request_id": request_id,
+                            "items": _serialize_url_review_items(search_review_items),
+                        },
+                    )
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "info",
+                            "request_id": request_id,
+                            "message": (
+                                "Reviewed top web pages for context "
+                                f"(saved={saved_count}, failed={failed_count})."
+                            ),
+                        },
+                    )
+
+                snippet_only_serialized_web_results, dropped_duplicate_snippets = (
+                    _filter_snippet_rows_for_reviewed_urls(
+                        web_rows=serialized_web_results,
+                        review_items=search_review_items,
+                    )
+                )
+                snippet_only_web_results = [
+                    WebSearchResult(
+                        title=str(row.get("title", "")).strip() or str(row.get("url", "")).strip(),
+                        url=str(row.get("url", "")).strip(),
+                        snippet=str(row.get("snippet", "")).strip(),
+                    )
+                    for row in snippet_only_serialized_web_results
+                    if str(row.get("url", "")).strip()
+                ]
+                if dropped_duplicate_snippets:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "info",
+                            "request_id": request_id,
+                            "message": (
+                                "Using reviewed page evidence instead of duplicate search snippets "
+                                f"(dropped_snippets={dropped_duplicate_snippets})."
+                            ),
+                        },
+                    )
 
             if session.grounded_mode_enabled:
                 if not session.knowledge_assist_enabled:
@@ -1321,7 +1642,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     prompt=prompt,
                 )
 
-                memory_results_for_grounded, excluded_memory_count = _filter_memory_for_grounded_synthesis(
+                memory_results_for_grounded, excluded_memory_count = _filter_memory_for_web_synthesis(
                     memory_results=assist.memory_results,
                     session=session,
                     exact_required=assist.exact_required,
@@ -1342,7 +1663,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     start_index=1 + len(memory_cards) + len(review_cards),
                 )
                 web_cards = knowledge.web_to_evidence_cards(
-                    web_results=serialized_web_results,
+                    web_results=snippet_only_serialized_web_results,
                     start_index=1 + len(memory_cards) + len(review_cards) + len(search_review_cards),
                 )
                 evidence_cards = [
@@ -1406,6 +1727,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                     reasoning_mode=session.reasoning_mode,
                     grounded=grounded,
                     evidence_cards=evidence_cards,
+                    web_research_stats=web_research_stats,
+                    excluded_memory_count=excluded_memory_count,
                 )
 
                 if session.reasoning_mode in {"summary", "verbose", "debug"} and grounded.reasoning_text:
@@ -1543,28 +1866,47 @@ async def chat_ws(websocket: WebSocket) -> None:
                 )
                 continue
 
+            memory_results_for_chat, excluded_memory_non_grounded = _filter_memory_for_web_synthesis(
+                memory_results=assist.memory_results,
+                session=session,
+                exact_required=assist.exact_required,
+                has_web_results=bool(web_results),
+            )
+            if excluded_memory_non_grounded:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "info",
+                        "request_id": request_id,
+                        "message": (
+                            "Excluded actor-owned memory evidence for exact query with web results "
+                            f"(excluded={excluded_memory_non_grounded})."
+                        ),
+                    },
+                )
+
             all_review_items = [*ingestion.review_items, *search_review_items]
             has_review_context = any(item.status == "saved" and item.meaning for item in all_review_items)
-            if assist.memory_results or web_results or has_review_context:
+            if memory_results_for_chat or snippet_only_web_results or has_review_context:
                 history_without_latest = session.messages[:-1]
                 latest_user_message = session.messages[-1]
                 context_messages: list[dict[str, str]] = []
-                if assist.memory_results:
+                if memory_results_for_chat:
                     context_messages.append(
                         {
                             "role": "system",
                             "content": _build_memory_context(
                                 query=assist.memory_query,
-                                results=assist.memory_results,
+                                results=memory_results_for_chat,
                                 session=session,
                             ),
                         }
                     )
-                if web_results:
+                if snippet_only_web_results:
                     context_messages.append(
                         {
                             "role": "system",
-                            "content": _build_web_context(query=assist.web_query, results=web_results),
+                            "content": _build_web_context(query=assist.web_query, results=snippet_only_web_results),
                         }
                     )
                 review_context = _build_review_context(all_review_items)
@@ -1645,6 +1987,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                         web_results=web_results,
                         web_review_items=search_review_items,
                         reasoning_mode=session.reasoning_mode,
+                        web_research_stats=web_research_stats,
+                        excluded_memory_count=excluded_memory_non_grounded,
                     )
                     debug_segments = []
                     if model_debug_text:

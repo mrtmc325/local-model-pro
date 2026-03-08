@@ -40,7 +40,7 @@ const state = {
   knowledgeAssistEnabled: true,
   groundedModeEnabled: true,
   groundedProfile: "balanced",
-  reasoningMode: "hidden",
+  reasoningMode: "summary",
 };
 
 function wsUrl() {
@@ -102,12 +102,21 @@ function memoryResultsToText(msg) {
 function webResultsToText(msg) {
   const query = String(msg.query || "").trim();
   const retrievedAt = String(msg.retrieved_at || "").trim();
+  const researchQueries = Array.isArray(msg.research_queries) ? msg.research_queries : [];
+  const trustedKept = Number(msg.trusted_kept_count || 0);
+  const trustedDropped = Number(msg.trusted_dropped_count || 0);
   const lines = [];
   if (query) {
     lines.push(`Web results for: ${query}`);
   }
+  if (researchQueries.length > 0) {
+    lines.push(`Research queries: ${researchQueries.join(" | ")}`);
+  }
   if (retrievedAt) {
     lines.push(`Retrieved: ${retrievedAt}`);
+  }
+  if (msg.trusted_kept_count !== undefined || msg.trusted_dropped_count !== undefined) {
+    lines.push(`trusted_kept=${trustedKept} trusted_dropped=${trustedDropped}`);
   }
   const results = Array.isArray(msg.results) ? msg.results : [];
   if (results.length === 0) {
@@ -225,8 +234,17 @@ function webReviewContextToText(msg) {
     const status = String(item.status || "").trim() || "unknown";
     const meaning = String(item.meaning || "").trim();
     const error = String(item.error || "").trim();
+    const domain = String(item.domain || "").trim();
+    const sourceType = String(item.source_type || "").trim();
+    const reviewedChars = Number(item.reviewed_chars || 0);
     lines.push(`${idx + 1}. ${title || url} status=${status}`);
     lines.push(url);
+    if (domain || sourceType) {
+      lines.push(`domain=${domain} source_type=${sourceType}`);
+    }
+    if (reviewedChars > 0) {
+      lines.push(`reviewed_chars=${reviewedChars}`);
+    }
     if (meaning) {
       lines.push(`meaning: ${meaning}`);
     }

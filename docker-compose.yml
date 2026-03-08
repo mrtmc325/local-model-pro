@@ -14,6 +14,7 @@ services:
       KNOWLEDGE_RECURSION_PASSES: "3"
       GROUNDED_MODE_DEFAULT: "true"
       GROUNDED_PROFILE_DEFAULT: "balanced"
+      REASONING_MODE_DEFAULT: "summary"
       GROUNDED_TIMEOUT_SECONDS: "25"
       DEFAULT_ACTOR_ID: "anonymous"
       DIRECT_SAVE_ENABLED: "true"
@@ -23,8 +24,12 @@ services:
       URL_REVIEW_MAX_URLS: "3"
       URL_REVIEW_TIMEOUT_SECONDS: "20"
       URL_REVIEW_MAX_BYTES: "2000000"
+      WEB_REVIEW_MEANING_MAX_CHARS: "650"
       WEB_ASSIST_PAGE_REVIEW_ENABLED: "true"
       WEB_ASSIST_PAGE_REVIEW_MAX_URLS: "2"
+      WEB_RESEARCH_MAX_QUERIES: "3"
+      WEB_TRUSTED_ONLY: "true"
+      WEB_TRUSTED_DOMAINS: "whitehouse.gov,state.gov,defense.gov,congress.gov,cia.gov,dni.gov,reuters.com,apnews.com,bbc.com,nytimes.com,washingtonpost.com,wsj.com,bloomberg.com,wikipedia.org,britannica.com,cfr.org"
       SQLITE_DB_PATH: /data/local_model_pro.db
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: local_model_pro_insights

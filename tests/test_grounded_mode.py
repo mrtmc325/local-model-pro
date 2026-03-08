@@ -73,7 +73,7 @@ class GroundedModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "insufficient")
         self.assertTrue(result.clarify_question)
-        self.assertIn("unsupported or conflicting", result.note.lower())
+        self.assertIn("weak, unsupported, or conflicting", result.note.lower())
         self.assertIn("Used 2 evidence cards", result.reasoning_text)
         self.assertIn("status=insufficient", result.debug_text)
         self.assertIn("evidence_labels=['E1', 'E2']", result.debug_text)
@@ -141,6 +141,42 @@ class GroundedModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No evidence available", result.note)
         self.assertIn("Used 0 evidence cards", result.reasoning_text)
         self.assertEqual(result.debug_text, "")
+        store.close()
+
+    async def test_weak_claims_do_not_return_full_status(self) -> None:
+        store = ConversationStore(db_path=":memory:")
+        service = KnowledgeAssistService(
+            settings=Settings(),
+            ollama=_FakeOllama('{"answer":"Checklist alpha includes water and radio.","note":"ok"}'),  # type: ignore[arg-type]
+            store=store,
+            memory_index=_NoopMemoryIndex(),  # type: ignore[arg-type]
+        )
+        cards = [
+            EvidenceCard(
+                evidence_id="ev-weak-1",
+                source_type="web_review",
+                actor_scope="web",
+                label="E1",
+                content="Checklist alpha includes water only.",
+                url="https://www.ready.gov/kit",
+                source_session=None,
+                confidence=0.40,
+                pii_flag=False,
+                used_verbatim=False,
+            )
+        ]
+
+        result = await service.generate_grounded_response(
+            prompt="What does checklist alpha include?",
+            model="qwen2.5:7b",
+            grounded_profile="balanced",
+            exact_required=False,
+            evidence_cards=cards,
+            reasoning_mode="summary",
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertIn("not 100% factual", result.answer_text.lower())
         store.close()
 
 
