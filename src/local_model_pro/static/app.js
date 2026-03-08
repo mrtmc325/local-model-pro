@@ -9,6 +9,8 @@ const knowledgeModeMeta = document.getElementById("knowledgeModeMeta");
 const groundedModeToggle = document.getElementById("groundedModeToggle");
 const groundedProfileSelect = document.getElementById("groundedProfileSelect");
 const groundedModeMeta = document.getElementById("groundedModeMeta");
+const reasoningModeSelect = document.getElementById("reasoningModeSelect");
+const reasoningModeMeta = document.getElementById("reasoningModeMeta");
 const webAssistToggle = document.getElementById("webAssistToggle");
 const webQueryInput = document.getElementById("webQueryInput");
 const webSearchBtn = document.getElementById("webSearchBtn");
@@ -19,6 +21,10 @@ const activeModelLabel = document.getElementById("activeModelLabel");
 const statusBadge = document.getElementById("statusBadge");
 const chatLog = document.getElementById("chatLog");
 const evidenceLog = document.getElementById("evidenceLog");
+const reasoningPanel = document.getElementById("reasoningPanel");
+const reasoningLog = document.getElementById("reasoningLog");
+const debugPanel = document.getElementById("debugPanel");
+const debugLog = document.getElementById("debugLog");
 const chatForm = document.getElementById("chatForm");
 const promptInput = document.getElementById("promptInput");
 const sendBtn = document.getElementById("sendBtn");
@@ -34,6 +40,7 @@ const state = {
   knowledgeAssistEnabled: true,
   groundedModeEnabled: true,
   groundedProfile: "balanced",
+  reasoningMode: "hidden",
 };
 
 function wsUrl() {
@@ -237,6 +244,44 @@ function updateGroundedModeMeta() {
   }
   groundedModeMeta.textContent =
     "Grounded mode is on (balanced). Knowledge Assist is forced on. Web evidence can be included when Web Assist is enabled.";
+}
+
+function setReasoningPanelText(value) {
+  const text = String(value || "").trim();
+  reasoningLog.textContent = text || "No reasoning emitted for this response.";
+}
+
+function setDebugPanelText(value) {
+  const text = String(value || "").trim();
+  debugLog.textContent = text || "No debug metadata emitted for this response.";
+}
+
+function renderReasoningPanels() {
+  const mode = state.reasoningMode;
+  const reasoningHidden = mode === "hidden";
+  const debugHidden = mode !== "debug";
+  reasoningPanel.classList.toggle("is-hidden", reasoningHidden);
+  debugPanel.classList.toggle("is-hidden", debugHidden);
+  if (reasoningHidden) {
+    setReasoningPanelText("Reasoning hidden.");
+    setDebugPanelText("Debug hidden.");
+  }
+}
+
+function updateReasoningModeMeta() {
+  if (state.reasoningMode === "hidden") {
+    reasoningModeMeta.textContent = "Reasoning is hidden. Chat shows answer text only.";
+    return;
+  }
+  if (state.reasoningMode === "summary") {
+    reasoningModeMeta.textContent = "Reasoning summary is shown in a separate panel.";
+    return;
+  }
+  if (state.reasoningMode === "verbose") {
+    reasoningModeMeta.textContent = "Verbose reasoning notes are shown separately from the answer.";
+    return;
+  }
+  reasoningModeMeta.textContent = "Debug view includes reasoning plus retrieval metadata.";
 }
 
 function syncKnowledgeToggleState() {
@@ -498,6 +543,7 @@ function connectWs() {
       knowledge_assist_enabled: state.knowledgeAssistEnabled,
       grounded_mode_enabled: state.groundedModeEnabled,
       grounded_profile: state.groundedProfile,
+      reasoning_mode: state.reasoningMode,
     });
     addMessage("system", `Connected. Requested model: ${model}`);
   };
@@ -551,9 +597,15 @@ function connectWs() {
         state.groundedProfile = message.grounded_profile;
         groundedProfileSelect.value = state.groundedProfile;
       }
+      if (typeof message.reasoning_mode === "string" && message.reasoning_mode) {
+        state.reasoningMode = message.reasoning_mode;
+        reasoningModeSelect.value = state.reasoningMode;
+      }
       syncKnowledgeToggleState();
       updateKnowledgeModeMeta();
       updateGroundedModeMeta();
+      updateReasoningModeMeta();
+      renderReasoningPanels();
       updateActiveModelLabel(modelName);
       setBusy(false);
       return;
@@ -628,6 +680,16 @@ function connectWs() {
       return;
     }
 
+    if (msgType === "reasoning") {
+      setReasoningPanelText(String(message.text || ""));
+      return;
+    }
+
+    if (msgType === "debug") {
+      setDebugPanelText(String(message.text || ""));
+      return;
+    }
+
     if (msgType === "memory_saved") {
       addMessage("system", memorySavedToText(message));
       return;
@@ -640,6 +702,12 @@ function connectWs() {
 
     if (msgType === "start") {
       state.assistantEl = addMessage("ai", "");
+      if (state.reasoningMode !== "hidden") {
+        setReasoningPanelText("Waiting for reasoning output...");
+      }
+      if (state.reasoningMode === "debug") {
+        setDebugPanelText("Waiting for debug output...");
+      }
       setBusy(true);
       return;
     }
@@ -676,10 +744,16 @@ function connectWs() {
         state.groundedProfile = message.grounded_profile;
         groundedProfileSelect.value = state.groundedProfile;
       }
+      if (typeof message.reasoning_mode === "string" && message.reasoning_mode) {
+        state.reasoningMode = message.reasoning_mode;
+        reasoningModeSelect.value = state.reasoningMode;
+      }
       syncKnowledgeToggleState();
       updateKnowledgeModeMeta();
       updateGroundedModeMeta();
       updateWebModeMeta();
+      updateReasoningModeMeta();
+      renderReasoningPanels();
       return;
     }
 
@@ -792,10 +866,28 @@ function setGroundedProfile() {
   }
 }
 
+function setReasoningMode() {
+  const mode = String(reasoningModeSelect.value || "hidden").trim().toLowerCase();
+  state.reasoningMode = ["summary", "verbose", "debug"].includes(mode) ? mode : "hidden";
+  reasoningModeSelect.value = state.reasoningMode;
+  updateReasoningModeMeta();
+  renderReasoningPanels();
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({ type: "set_reasoning_mode", mode: state.reasoningMode });
+  } catch (error) {
+    addMessage("system", `Reasoning mode update failed: ${error.message}`);
+  }
+}
+
 function resetConversation() {
   chatLog.innerHTML = "";
   renderEvidence([]);
   state.assistantEl = null;
+  setReasoningPanelText(state.reasoningMode === "hidden" ? "Reasoning hidden." : "No reasoning yet.");
+  setDebugPanelText(state.reasoningMode === "debug" ? "No debug metadata yet." : "Debug hidden.");
   if (!state.connected) {
     addMessage("system", "Local chat view cleared.");
     return;
@@ -822,7 +914,7 @@ function sendPrompt(event) {
   addMessage("user", prompt);
   promptInput.value = "";
   try {
-    sendWs({ type: "chat", prompt });
+    sendWs({ type: "chat", prompt, reasoning_mode: state.reasoningMode });
   } catch (error) {
     addMessage("system", `Send failed: ${error.message}`);
     setBusy(false);
@@ -837,6 +929,7 @@ webAssistToggle.addEventListener("change", toggleWebAssist);
 knowledgeAssistToggle.addEventListener("change", toggleKnowledgeAssist);
 groundedModeToggle.addEventListener("change", toggleGroundedMode);
 groundedProfileSelect.addEventListener("change", setGroundedProfile);
+reasoningModeSelect.addEventListener("change", setReasoningMode);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
 modelFilterInput.addEventListener("input", () => renderModelOptions());
@@ -878,6 +971,8 @@ setBusy(false);
 updateWebModeMeta();
 updateKnowledgeModeMeta();
 updateGroundedModeMeta();
+updateReasoningModeMeta();
 syncKnowledgeToggleState();
 renderEvidence([]);
+renderReasoningPanels();
 loadModels();

@@ -28,6 +28,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         web_assist_enabled: bool,
         grounded_mode_enabled: bool,
         prompt: str = "build a go bag list",
+        reasoning_mode: str = "hidden",
+        memory_results_override: list[MemoryResult] | None = None,
     ) -> tuple[list[str], list[str], list[dict[str, str]], list[dict[str, object]]]:
         from local_model_pro import server
 
@@ -62,6 +64,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             _ = current_session_id
             _ = query_plan
             calls.append("search_memory")
+            if memory_results_override is not None:
+                return memory_results_override
             return [
                 MemoryResult(
                     evidence_id="mem-1",
@@ -105,7 +109,20 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             _ = temperature
             _ = num_ctx
             streamed_messages.extend(messages)
-            yield "ok"
+            if reasoning_mode == "hidden":
+                yield "ok"
+                return
+            if reasoning_mode == "debug":
+                yield (
+                    "<reasoning>Used retrieved memory and web context to answer.</reasoning>"
+                    "<answer>Structured answer from evidence context.</answer>"
+                    "<debug>model_debug=enabled</debug>"
+                )
+                return
+            yield (
+                "<reasoning>Used retrieved memory and web context to answer.</reasoning>"
+                "<answer>Structured answer from evidence context.</answer>"
+            )
 
         async def fake_generate_grounded_response(  # type: ignore[no-untyped-def]
             self,
@@ -115,6 +132,7 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
             grounded_profile: str,
             exact_required: bool,
             evidence_cards: list[object],
+            reasoning_mode: str = "hidden",
         ) -> GroundedResponse:
             _ = prompt
             _ = model
@@ -137,6 +155,12 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                 overall_confidence=0.91,
                 clarify_question="",
                 note="ok",
+                reasoning_text=(
+                    "Used retrieved evidence cards to produce grounded answer."
+                    if reasoning_mode in {"summary", "verbose", "debug"}
+                    else ""
+                ),
+                debug_text=("grounded_debug=true" if reasoning_mode == "debug" else ""),
             )
 
         async def fake_log(*_: object, **__: object) -> None:  # type: ignore[no-untyped-def]
@@ -196,11 +220,12 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
                                     "web_assist_enabled": web_assist_enabled,
                                     "grounded_mode_enabled": grounded_mode_enabled,
                                     "grounded_profile": "balanced",
+                                    "reasoning_mode": reasoning_mode,
                                     "actor_id": "tester",
                                 }
                             )
                             _ = ws.receive_json()
-                            ws.send_json({"type": "chat", "prompt": prompt})
+                            ws.send_json({"type": "chat", "prompt": prompt, "reasoning_mode": reasoning_mode})
 
                             while True:
                                 msg = ws.receive_json()
@@ -226,6 +251,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertIn("web_results", emitted_types)
+        self.assertNotIn("reasoning", emitted_types)
+        self.assertNotIn("debug", emitted_types)
         self.assertIn("done", emitted_types)
 
     def test_chat_pipeline_order_with_web_disabled(self) -> None:
@@ -239,6 +266,8 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
         self.assertIn("query_plan", emitted_types)
         self.assertIn("memory_results", emitted_types)
         self.assertNotIn("web_results", emitted_types)
+        self.assertNotIn("reasoning", emitted_types)
+        self.assertNotIn("debug", emitted_types)
         self.assertIn("done", emitted_types)
 
         # Privacy path: streamed context gets memory insights, not arbitrary transcript dumps.
@@ -383,6 +412,71 @@ class ServerKnowledgePipelineTests(unittest.TestCase):
 
         self.assertFalse(review_calls)
         self.assertNotIn("url_review_saved", emitted_types)
+        self.assertIn("done", emitted_types)
+
+    def test_reasoning_mode_round_trip_in_done_payload(self) -> None:
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=False,
+            grounded_mode_enabled=False,
+            reasoning_mode="verbose",
+        )
+        self.assertIn("done", emitted_types)
+        done_events = [item for item in payloads if item.get("type") == "done"]
+        self.assertTrue(done_events)
+        self.assertEqual(done_events[-1].get("reasoning_mode"), "verbose")
+
+    def test_non_grounded_reasoning_emits_separate_reasoning_event(self) -> None:
+        _, emitted_types, streamed_messages, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+            reasoning_mode="summary",
+        )
+        self.assertIn("reasoning", emitted_types)
+        reasoning_events = [item for item in payloads if item.get("type") == "reasoning"]
+        self.assertTrue(reasoning_events)
+        self.assertIn("retrieved memory", str(reasoning_events[-1].get("text", "")).lower())
+        joined = json.dumps(streamed_messages)
+        self.assertIn("Generalized checklist pattern for emergency prep.", joined)
+
+    def test_non_grounded_debug_mode_emits_debug_metadata(self) -> None:
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=False,
+            reasoning_mode="debug",
+        )
+        self.assertIn("debug", emitted_types)
+        debug_events = [item for item in payloads if item.get("type") == "debug"]
+        self.assertTrue(debug_events)
+        latest = debug_events[-1]
+        self.assertIn("memory_query", str(latest.get("text", "")))
+        meta = latest.get("meta")
+        self.assertIsInstance(meta, dict)
+        self.assertEqual(meta.get("memory_hits"), 1)
+        self.assertTrue(meta.get("web_used"))
+
+    def test_grounded_debug_mode_emits_reasoning_and_debug(self) -> None:
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=True,
+            grounded_mode_enabled=True,
+            reasoning_mode="debug",
+        )
+        self.assertIn("reasoning", emitted_types)
+        self.assertIn("debug", emitted_types)
+        debug_events = [item for item in payloads if item.get("type") == "debug"]
+        self.assertTrue(debug_events)
+        self.assertIn("grounded_status", str(debug_events[-1].get("text", "")))
+
+    def test_reasoning_mode_no_memory_hit_still_completes(self) -> None:
+        _, emitted_types, _, payloads = self._run_chat_and_collect(
+            web_assist_enabled=False,
+            grounded_mode_enabled=False,
+            reasoning_mode="summary",
+            memory_results_override=[],
+        )
+        self.assertIn("memory_results", emitted_types)
+        memory_events = [item for item in payloads if item.get("type") == "memory_results"]
+        self.assertTrue(memory_events)
+        self.assertEqual(memory_events[-1].get("results"), [])
         self.assertIn("done", emitted_types)
 
 

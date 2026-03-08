@@ -68,11 +68,15 @@ class GroundedModeTests(unittest.IsolatedAsyncioTestCase):
             grounded_profile="strict",
             exact_required=True,
             evidence_cards=cards,
+            reasoning_mode="debug",
         )
 
         self.assertEqual(result.status, "insufficient")
         self.assertTrue(result.clarify_question)
         self.assertIn("unsupported or conflicting", result.note.lower())
+        self.assertIn("Used 2 evidence cards", result.reasoning_text)
+        self.assertIn("status=insufficient", result.debug_text)
+        self.assertIn("evidence_labels=['E1', 'E2']", result.debug_text)
         store.close()
 
     async def test_grounded_response_appends_claims_without_sources_footer(self) -> None:
@@ -111,6 +115,32 @@ class GroundedModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Sources:", result.answer_text)
         self.assertNotIn("[E1]", result.answer_text)
         self.assertIn(result.status, {"full", "partial"})
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.debug_text, "")
+        store.close()
+
+    async def test_no_memory_hit_still_generates_reasoning_summary_when_enabled(self) -> None:
+        store = ConversationStore(db_path=":memory:")
+        service = KnowledgeAssistService(
+            settings=Settings(),
+            ollama=_FakeOllama('{"answer":"No evidence.","note":"ok"}'),  # type: ignore[arg-type]
+            store=store,
+            memory_index=_NoopMemoryIndex(),  # type: ignore[arg-type]
+        )
+
+        result = await service.generate_grounded_response(
+            prompt="What did we decide yesterday?",
+            model="qwen2.5:7b",
+            grounded_profile="balanced",
+            exact_required=False,
+            evidence_cards=[],
+            reasoning_mode="summary",
+        )
+
+        self.assertEqual(result.status, "insufficient")
+        self.assertIn("No evidence available", result.note)
+        self.assertIn("Used 0 evidence cards", result.reasoning_text)
+        self.assertEqual(result.debug_text, "")
         store.close()
 
 

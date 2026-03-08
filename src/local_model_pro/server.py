@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 conversation_store = ConversationStore(db_path=settings.sqlite_db_path)
+_REASONING_MODES = {"hidden", "summary", "verbose", "debug"}
 
 
 @dataclass
@@ -49,6 +51,7 @@ class ChatSession:
     knowledge_assist_enabled: bool = settings.knowledge_assist_default
     grounded_mode_enabled: bool = settings.grounded_mode_default
     grounded_profile: str = settings.grounded_profile_default
+    reasoning_mode: str = "hidden"
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -104,10 +107,123 @@ def _safe_profile(value: Any) -> str:
     return profile
 
 
+def _safe_reasoning_mode(value: Any, *, default: str = "hidden") -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError("reasoning_mode must be one of: hidden, summary, verbose, debug")
+    mode = value.strip().lower()
+    if mode not in _REASONING_MODES:
+        raise ValueError("reasoning_mode must be one of: hidden, summary, verbose, debug")
+    return mode
+
+
 def _chunks(text: str, chunk_size: int = 64) -> list[str]:
     if not text:
         return []
     return [text[idx : idx + chunk_size] for idx in range(0, len(text), chunk_size)]
+
+
+def _build_reasoning_instruction(reasoning_mode: str) -> str:
+    mode = reasoning_mode.strip().lower()
+    if mode == "hidden":
+        return ""
+    detail = {
+        "summary": "Keep reasoning concise (2-4 short lines) and tied to retrieved context only.",
+        "verbose": "Provide detailed reasoning notes tied to retrieved context only.",
+        "debug": "Provide concise reasoning and include lightweight retrieval/debug notes.",
+    }.get(mode, "Keep reasoning concise and grounded to retrieved context.")
+    debug_line = (
+        "\n- Include <debug> only in debug mode with retrieval transparency metadata."
+        if mode == "debug"
+        else ""
+    )
+    return (
+        "Reasoning visibility mode is enabled.\n"
+        "Return response in XML tags with this exact structure:\n"
+        "<reasoning>...</reasoning>\n"
+        "<answer>...</answer>\n"
+        f"{'<debug>...</debug>' if mode == 'debug' else ''}\n"
+        "Rules:\n"
+        f"- {detail}\n"
+        "- Do not reveal hidden/internal chain-of-thought.\n"
+        "- Keep final answer content inside <answer> only."
+        f"{debug_line}"
+    )
+
+
+def _extract_tag_block(text: str, tag: str) -> str:
+    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.IGNORECASE | re.DOTALL)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _parse_reasoning_output(raw_text: str, reasoning_mode: str) -> tuple[str, str, str]:
+    payload = (raw_text or "").strip()
+    if not payload:
+        return "", "", ""
+
+    reasoning_text = _extract_tag_block(payload, "reasoning")
+    answer_text = _extract_tag_block(payload, "answer")
+    debug_text = _extract_tag_block(payload, "debug") if reasoning_mode == "debug" else ""
+
+    if not answer_text:
+        # Graceful fallback for models that ignore structured tags.
+        return "", payload, ""
+    return reasoning_text, answer_text, debug_text
+
+
+def _build_debug_metadata(
+    *,
+    assist: AssistResolution,
+    web_results: list[WebSearchResult],
+    reasoning_mode: str,
+    grounded: GroundedResponse | None = None,
+    evidence_cards: list[EvidenceCard] | None = None,
+) -> dict[str, Any]:
+    memory_ids = [item.evidence_id for item in assist.memory_results if item.evidence_id][:5]
+    metadata: dict[str, Any] = {
+        "reasoning_mode": reasoning_mode,
+        "memory_query": assist.memory_query,
+        "memory_hits": len(assist.memory_results),
+        "top_memory_evidence_ids": memory_ids,
+        "web_used": bool(web_results),
+        "web_result_count": len(web_results),
+        "exact_required": assist.exact_required,
+    }
+    if evidence_cards is not None:
+        metadata["top_evidence_labels"] = [card.label for card in evidence_cards[:5]]
+        metadata["top_evidence_ids"] = [card.evidence_id for card in evidence_cards[:5]]
+    if grounded is not None:
+        metadata["grounded_status"] = grounded.status
+        metadata["grounded_confidence"] = round(grounded.overall_confidence, 3)
+        metadata["clarify_needed"] = grounded.status == "insufficient"
+    return metadata
+
+
+def _debug_metadata_to_text(meta: dict[str, Any]) -> str:
+    lines = [
+        f"reasoning_mode={meta.get('reasoning_mode')}",
+        f"memory_query={meta.get('memory_query')}",
+        f"memory_hits={meta.get('memory_hits')}",
+        f"top_memory_evidence_ids={meta.get('top_memory_evidence_ids')}",
+        f"web_used={meta.get('web_used')}",
+        f"web_result_count={meta.get('web_result_count')}",
+        f"exact_required={meta.get('exact_required')}",
+    ]
+    if "top_evidence_labels" in meta:
+        lines.append(f"top_evidence_labels={meta.get('top_evidence_labels')}")
+    if "top_evidence_ids" in meta:
+        lines.append(f"top_evidence_ids={meta.get('top_evidence_ids')}")
+    if "grounded_status" in meta:
+        lines.append(f"grounded_status={meta.get('grounded_status')}")
+    if "grounded_confidence" in meta:
+        lines.append(f"grounded_confidence={meta.get('grounded_confidence')}")
+    if "clarify_needed" in meta:
+        lines.append(f"clarify_needed={meta.get('clarify_needed')}")
+    return "\n".join(lines)
 
 
 def _memory_scope(item: MemoryResult, session: ChatSession) -> str:
@@ -546,6 +662,8 @@ async def service_info() -> dict[str, Any]:
             "knowledge_assist": True,
             "grounded_mode": True,
             "grounded_profiles": ["strict", "balanced"],
+            "reasoning_modes": ["hidden", "summary", "verbose", "debug"],
+            "reasoning_default": "hidden",
             "web_assist": True,
             "evidence_panel_events": True,
             "direct_save": settings.direct_save_enabled,
@@ -610,6 +728,7 @@ async def chat_ws_http_hint() -> dict[str, Any]:
             "set_knowledge_mode",
             "set_grounded_mode",
             "set_grounded_profile",
+            "set_reasoning_mode",
             "web_search",
         ],
         "event_types": [
@@ -625,6 +744,8 @@ async def chat_ws_http_hint() -> dict[str, Any]:
             "grounding_status",
             "evidence_used",
             "clarify_needed",
+            "reasoning",
+            "debug",
             "memory_saved",
             "url_review_saved",
             "query_plan",
@@ -685,6 +806,7 @@ async def chat_ws(websocket: WebSocket) -> None:
             "knowledge_assist_enabled": session.knowledge_assist_enabled,
             "grounded_mode_enabled": session.grounded_mode_enabled,
             "grounded_profile": session.grounded_profile,
+            "reasoning_mode": session.reasoning_mode,
         },
     )
 
@@ -735,6 +857,15 @@ async def chat_ws(websocket: WebSocket) -> None:
                     except ValueError as exc:
                         await _send_json(websocket, {"type": "error", "message": str(exc)})
                         continue
+                if "reasoning_mode" in incoming:
+                    try:
+                        session.reasoning_mode = _safe_reasoning_mode(
+                            incoming.get("reasoning_mode"),
+                            default=session.reasoning_mode,
+                        )
+                    except ValueError as exc:
+                        await _send_json(websocket, {"type": "error", "message": str(exc)})
+                        continue
                 if session.grounded_mode_enabled:
                     session.knowledge_assist_enabled = True
 
@@ -755,6 +886,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "knowledge_assist_enabled": session.knowledge_assist_enabled,
                         "grounded_mode_enabled": session.grounded_mode_enabled,
                         "grounded_profile": session.grounded_profile,
+                        "reasoning_mode": session.reasoning_mode,
                     },
                 )
                 continue
@@ -771,6 +903,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "knowledge_assist_enabled": session.knowledge_assist_enabled,
                         "grounded_mode_enabled": session.grounded_mode_enabled,
                         "grounded_profile": session.grounded_profile,
+                        "reasoning_mode": session.reasoning_mode,
                     },
                 )
                 continue
@@ -870,6 +1003,24 @@ async def chat_ws(websocket: WebSocket) -> None:
                     {
                         "type": "grounded_profile",
                         "profile": session.grounded_profile,
+                    },
+                )
+                continue
+
+            if msg_type == "set_reasoning_mode":
+                try:
+                    session.reasoning_mode = _safe_reasoning_mode(
+                        incoming.get("mode"),
+                        default=session.reasoning_mode,
+                    )
+                except ValueError as exc:
+                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "info",
+                        "message": f"Reasoning mode set to {session.reasoning_mode}.",
                     },
                 )
                 continue
@@ -990,6 +1141,15 @@ async def chat_ws(websocket: WebSocket) -> None:
             except ValueError as exc:
                 await _send_json(websocket, {"type": "error", "message": str(exc)})
                 continue
+            try:
+                request_reasoning_mode = _safe_reasoning_mode(
+                    incoming.get("reasoning_mode"),
+                    default=session.reasoning_mode,
+                )
+            except ValueError as exc:
+                await _send_json(websocket, {"type": "error", "message": str(exc)})
+                continue
+            session.reasoning_mode = request_reasoning_mode
 
             request_id = str(uuid.uuid4())
             await knowledge.save_turn(
@@ -1106,6 +1266,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                             grounded_profile=session.grounded_profile,
                             exact_required=assist.exact_required,
                             evidence_cards=evidence_cards,
+                            reasoning_mode=session.reasoning_mode,
                         ),
                         timeout=max(5, settings.grounded_timeout_seconds),
                     )
@@ -1117,6 +1278,42 @@ async def chat_ws(websocket: WebSocket) -> None:
                         overall_confidence=0.0,
                         clarify_question="Grounded mode timed out. What exact field or fact should I verify first?",
                         note="Timed out while grounding.",
+                    )
+
+                grounded_debug_meta = _build_debug_metadata(
+                    assist=assist,
+                    web_results=web_results,
+                    reasoning_mode=session.reasoning_mode,
+                    grounded=grounded,
+                    evidence_cards=evidence_cards,
+                )
+
+                if session.reasoning_mode in {"summary", "verbose", "debug"} and grounded.reasoning_text:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "reasoning",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "mode": session.reasoning_mode,
+                            "text": grounded.reasoning_text,
+                        },
+                    )
+                if session.reasoning_mode == "debug":
+                    debug_segments = []
+                    if grounded.debug_text:
+                        debug_segments.append(grounded.debug_text)
+                    debug_segments.append(_debug_metadata_to_text(grounded_debug_meta))
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "debug",
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "mode": session.reasoning_mode,
+                            "text": "\n\n".join(segment for segment in debug_segments if segment.strip()),
+                            "meta": grounded_debug_meta,
+                        },
                     )
 
                 await knowledge.log_grounded_claims(
@@ -1166,6 +1363,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                             "knowledge_assist_enabled": session.knowledge_assist_enabled,
                             "grounded_mode_enabled": session.grounded_mode_enabled,
                             "grounded_profile": session.grounded_profile,
+                            "reasoning_mode": session.reasoning_mode,
                         },
                     )
                     continue
@@ -1220,6 +1418,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "knowledge_assist_enabled": session.knowledge_assist_enabled,
                         "grounded_mode_enabled": session.grounded_mode_enabled,
                         "grounded_profile": session.grounded_profile,
+                        "reasoning_mode": session.reasoning_mode,
                     },
                 )
                 continue
@@ -1261,6 +1460,15 @@ async def chat_ws(websocket: WebSocket) -> None:
                     latest_user_message,
                 ]
 
+            if session.reasoning_mode != "hidden":
+                model_messages = [
+                    *model_messages,
+                    {
+                        "role": "system",
+                        "content": _build_reasoning_instruction(session.reasoning_mode),
+                    },
+                ]
+
             await _send_json(websocket, {"type": "start", "request_id": request_id})
 
             assistant_chunks: list[str] = []
@@ -1272,10 +1480,11 @@ async def chat_ws(websocket: WebSocket) -> None:
                     num_ctx=settings.default_num_ctx,
                 ):
                     assistant_chunks.append(chunk)
-                    await _send_json(
-                        websocket,
-                        {"type": "token", "request_id": request_id, "text": chunk},
-                    )
+                    if session.reasoning_mode == "hidden":
+                        await _send_json(
+                            websocket,
+                            {"type": "token", "request_id": request_id, "text": chunk},
+                        )
             except OllamaStreamError as exc:
                 await _send_json(websocket, {"type": "error", "message": str(exc)})
                 if session.messages and session.messages[-1]["role"] == "user":
@@ -1287,7 +1496,54 @@ async def chat_ws(websocket: WebSocket) -> None:
                     session.messages.pop()
                 continue
 
-            assistant_text = "".join(assistant_chunks).strip()
+            raw_assistant_text = "".join(assistant_chunks).strip()
+            assistant_text = raw_assistant_text
+            if session.reasoning_mode != "hidden":
+                reasoning_text, parsed_answer, model_debug_text = _parse_reasoning_output(
+                    raw_assistant_text,
+                    session.reasoning_mode,
+                )
+                assistant_text = parsed_answer.strip()
+                if not assistant_text:
+                    assistant_text = raw_assistant_text
+
+                if reasoning_text:
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "reasoning",
+                            "request_id": request_id,
+                            "mode": session.reasoning_mode,
+                            "text": reasoning_text,
+                        },
+                    )
+
+                if session.reasoning_mode == "debug":
+                    debug_meta = _build_debug_metadata(
+                        assist=assist,
+                        web_results=web_results,
+                        reasoning_mode=session.reasoning_mode,
+                    )
+                    debug_segments = []
+                    if model_debug_text:
+                        debug_segments.append(model_debug_text.strip())
+                    debug_segments.append(_debug_metadata_to_text(debug_meta))
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "debug",
+                            "request_id": request_id,
+                            "mode": session.reasoning_mode,
+                            "text": "\n\n".join(segment for segment in debug_segments if segment.strip()),
+                            "meta": debug_meta,
+                        },
+                    )
+
+                for chunk in _chunks(assistant_text):
+                    await _send_json(
+                        websocket,
+                        {"type": "token", "request_id": request_id, "text": chunk},
+                    )
             if assistant_text:
                 session.messages.append({"role": "assistant", "content": assistant_text})
                 await knowledge.save_turn(
@@ -1330,6 +1586,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     "knowledge_assist_enabled": session.knowledge_assist_enabled,
                     "grounded_mode_enabled": session.grounded_mode_enabled,
                     "grounded_profile": session.grounded_profile,
+                    "reasoning_mode": session.reasoning_mode,
                 },
             )
     except WebSocketDisconnect:

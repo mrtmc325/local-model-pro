@@ -83,6 +83,21 @@
 
           <div class="field">
             <div class="field-head">
+              <span>Reasoning View</span>
+            </div>
+            <select id="reasoningModeSelect" aria-label="Reasoning mode">
+              <option value="hidden" selected>No reasoning</option>
+              <option value="summary">Reasoning summary</option>
+              <option value="verbose">Verbose notes</option>
+              <option value="debug">Debug view</option>
+            </select>
+            <div id="reasoningModeMeta" class="field-help">
+              Reasoning is hidden. Chat shows answer text only.
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="field-head">
               <span>Web Assist</span>
               <label class="toggle-inline" for="webAssistToggle">
                 <input id="webAssistToggle" type="checkbox" />
@@ -111,6 +126,16 @@
 
         <section class="card terminal-section">
           <h2>Chat Console</h2>
+          <div id="reasoningPanel" class="reasoning-panel is-hidden">
+            <div class="reasoning-section">
+              <div class="reasoning-head">Reasoning</div>
+              <div id="reasoningLog" class="reasoning-log">Reasoning hidden.</div>
+            </div>
+            <div id="debugPanel" class="reasoning-section is-hidden">
+              <div class="reasoning-head">Debug</div>
+              <div id="debugLog" class="reasoning-log">Debug hidden.</div>
+            </div>
+          </div>
           <div class="console-grid">
             <div id="chatLog" class="chat-log" aria-live="polite"></div>
             <aside class="evidence-panel">

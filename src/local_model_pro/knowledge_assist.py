@@ -122,6 +122,8 @@ class GroundedResponse:
     overall_confidence: float
     clarify_question: str
     note: str
+    reasoning_text: str = ""
+    debug_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1637,6 +1639,88 @@ class KnowledgeAssistService:
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
+    @staticmethod
+    def _shorten(text: str, *, limit: int = 130) -> str:
+        clean = re.sub(r"\s+", " ", text).strip()
+        if len(clean) <= limit:
+            return clean
+        return clean[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _build_grounded_reasoning_and_debug(
+        *,
+        reasoning_mode: str,
+        evidence_cards: list[EvidenceCard],
+        claims: list[GroundedClaim],
+        status: str,
+        overall_confidence: float,
+        exact_required: bool,
+        unsupported_count: int,
+        conflict_pairs: list[tuple[str, str]],
+        note: str,
+    ) -> tuple[str, str]:
+        mode = (reasoning_mode or "hidden").strip().lower()
+        if mode not in {"summary", "verbose", "debug"}:
+            return "", ""
+
+        scope_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        for card in evidence_cards:
+            scope_counts[card.actor_scope] = scope_counts.get(card.actor_scope, 0) + 1
+            source_counts[card.source_type] = source_counts.get(card.source_type, 0) + 1
+
+        grounded_count = sum(1 for claim in claims if claim.status == "grounded")
+        weak_count = sum(1 for claim in claims if claim.status == "weak")
+
+        scope_summary = ", ".join(f"{scope}:{count}" for scope, count in sorted(scope_counts.items()))
+        if not scope_summary:
+            scope_summary = "none"
+
+        reasoning_lines = [
+            f"Used {len(evidence_cards)} evidence cards ({scope_summary}).",
+            f"Grounding status is {status} with confidence {overall_confidence:.2f}.",
+        ]
+        if claims:
+            reasoning_lines.append(
+                f"Claims assessed: grounded={grounded_count}, weak={weak_count}, unsupported={unsupported_count}."
+            )
+        if conflict_pairs:
+            reasoning_lines.append("Detected conflicting evidence across retrieved items.")
+        if exact_required:
+            reasoning_lines.append("Exact-request checks were applied for concrete fields.")
+        if note:
+            reasoning_lines.append(f"Grounding note: {KnowledgeAssistService._shorten(note, limit=180)}")
+
+        if mode in {"verbose", "debug"}:
+            top_cards = sorted(evidence_cards, key=lambda card: card.confidence, reverse=True)[:4]
+            if top_cards:
+                reasoning_lines.append("Top evidence considered:")
+                for card in top_cards:
+                    reasoning_lines.append(
+                        f"- {card.label} {card.source_type} conf={card.confidence:.2f}: "
+                        f"{KnowledgeAssistService._shorten(card.content, limit=150)}"
+                    )
+
+        debug_text = ""
+        if mode == "debug":
+            labels = [card.label for card in evidence_cards]
+            evidence_ids = [card.evidence_id for card in evidence_cards]
+            source_summary = ", ".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+            conflict_summary = ", ".join(f"{left}/{right}" for left, right in conflict_pairs)
+            debug_lines = [
+                f"evidence_labels={labels}",
+                f"evidence_ids={evidence_ids}",
+                f"source_type_counts={source_summary or 'none'}",
+                f"status={status}",
+                f"overall_confidence={overall_confidence:.2f}",
+                f"unsupported_claims={unsupported_count}",
+                f"conflicts={conflict_summary or 'none'}",
+                f"exact_required={exact_required}",
+            ]
+            debug_text = "\n".join(debug_lines)
+
+        return "\n".join(reasoning_lines), debug_text
+
     async def generate_grounded_response(
         self,
         *,
@@ -1645,9 +1729,21 @@ class KnowledgeAssistService:
         grounded_profile: str,
         exact_required: bool,
         evidence_cards: list[EvidenceCard],
+        reasoning_mode: str = "hidden",
     ) -> GroundedResponse:
         if not evidence_cards:
             clarify = "I couldn't verify enough evidence yet. Can you clarify the exact fact or timeframe you want verified?"
+            reasoning_text, debug_text = self._build_grounded_reasoning_and_debug(
+                reasoning_mode=reasoning_mode,
+                evidence_cards=[],
+                claims=[],
+                status="insufficient",
+                overall_confidence=0.0,
+                exact_required=exact_required,
+                unsupported_count=0,
+                conflict_pairs=[],
+                note="No evidence available.",
+            )
             return GroundedResponse(
                 status="insufficient",
                 answer_text="",
@@ -1655,6 +1751,8 @@ class KnowledgeAssistService:
                 overall_confidence=0.0,
                 clarify_question=clarify,
                 note="No evidence available.",
+                reasoning_text=reasoning_text,
+                debug_text=debug_text,
             )
 
         evidence_lines = []
@@ -1758,13 +1856,27 @@ class KnowledgeAssistService:
                 "I can’t verify the exact concrete data yet. "
                 "Which exact phrase, date, or field should I validate first?"
             )
+            insufficient_note = f"Exact request has unsupported or conflicting claims.{conflict_note}"
+            reasoning_text, debug_text = self._build_grounded_reasoning_and_debug(
+                reasoning_mode=reasoning_mode,
+                evidence_cards=evidence_cards,
+                claims=claims,
+                status="insufficient",
+                overall_confidence=overall,
+                exact_required=exact_required,
+                unsupported_count=unsupported_count,
+                conflict_pairs=conflict_pairs,
+                note=insufficient_note,
+            )
             return GroundedResponse(
                 status="insufficient",
                 answer_text="",
                 claims=claims,
                 overall_confidence=overall,
                 clarify_question=clarify,
-                note=f"Exact request has unsupported or conflicting claims.{conflict_note}",
+                note=insufficient_note,
+                reasoning_text=reasoning_text,
+                debug_text=debug_text,
             )
 
         if unsupported_count == 0 and not conflict_pairs:
@@ -1787,6 +1899,18 @@ class KnowledgeAssistService:
                 self._claim_line(claim) for claim in claims
             )
 
+        reasoning_text, debug_text = self._build_grounded_reasoning_and_debug(
+            reasoning_mode=reasoning_mode,
+            evidence_cards=evidence_cards,
+            claims=claims,
+            status=status,
+            overall_confidence=overall,
+            exact_required=exact_required,
+            unsupported_count=unsupported_count,
+            conflict_pairs=conflict_pairs,
+            note=note,
+        )
+
         return GroundedResponse(
             status=status,
             answer_text=answer_text,
@@ -1794,6 +1918,8 @@ class KnowledgeAssistService:
             overall_confidence=overall,
             clarify_question="",
             note=note,
+            reasoning_text=reasoning_text,
+            debug_text=debug_text,
         )
 
     async def log_grounded_run_start(

@@ -265,6 +265,43 @@ button:disabled {
   background: rgba(10, 22, 34, 0.9);
 }
 
+.reasoning-panel {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.reasoning-section {
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.7rem;
+  background: rgba(13, 28, 43, 0.82);
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.reasoning-head {
+  padding: 0.5rem 0.62rem 0.38rem;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.reasoning-log {
+  min-height: 0;
+  max-height: 170px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.36;
+  font-size: 0.8rem;
+  padding: 0.48rem 0.6rem;
+  color: #bfd8eb;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+}
+
+.is-hidden {
+  display: none !important;
+}
+
 .chat-log {
   min-height: 0;
   overflow-y: auto;
