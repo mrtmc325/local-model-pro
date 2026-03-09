@@ -95,6 +95,7 @@ def build_code_pack_markdown(
     prompt: str,
     outputs: dict[str, str],
 ) -> str:
+    inline_doc_code = outputs.get("doc_inline_code", "").strip() or outputs.get("doc_inline", "").strip()
     lines = [
         "# Generated Code Pack",
         "",
@@ -132,6 +133,10 @@ def build_code_pack_markdown(
         "",
         outputs.get("final_code", "").strip(),
         "",
+        "## Inline Documented Code Variant",
+        "",
+        inline_doc_code,
+        "",
     ]
     return "\n".join(lines).strip() + "\n"
 
@@ -141,6 +146,7 @@ def build_documentation_markdown(
     prompt: str,
     outputs: dict[str, str],
 ) -> str:
+    inline_doc_code = outputs.get("doc_inline_code", "").strip() or outputs.get("doc_inline", "").strip()
     lines = [
         "# Documentation Pack",
         "",
@@ -148,14 +154,13 @@ def build_documentation_markdown(
         "",
         prompt.strip(),
         "",
-        "## Functionality Notes",
+        "## Inline Documented Code",
         "",
-        outputs.get("doc_inline", "").strip(),
+        inline_doc_code,
         "",
-        "## Inline/In-Code Documentation Guidance",
+        "## Inline Documentation Notes",
         "",
-        "Use the recommendations above to annotate generated source with intent-focused comments, "
-        "input/output contracts, and side-effect boundaries.",
+        "Inline comments and function-level docstrings are embedded directly in the code block above.",
         "",
         "## Git Notes",
         "",

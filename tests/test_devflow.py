@@ -161,6 +161,101 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
         with zipfile.ZipFile(job.artifacts["zip"], "r") as archive:
             self.assertEqual(sorted(archive.namelist()), ["code_pack.md", "documentation.md"])
 
+    async def test_run_devflow_job_falls_back_when_doc_role_fails(self) -> None:
+        class FakeOllama:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, str]] = []
+
+            async def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                temperature: float,
+                num_ctx: int,
+            ) -> str:
+                _ = (temperature, num_ctx, model)
+                prompt = str(messages[-1]["content"])
+                self.calls.append({"prompt": prompt})
+                if "Generate concise git notes and commit summary" in prompt:
+                    raise TimeoutError("doc git timeout")
+                return f"ok-{len(self.calls)}"
+
+        job = DevflowJob(
+            job_id="job-runner-doc-fallback",
+            actor_id="actor",
+            prompt="Build a simple API server.",
+            selected_model="qwen3:8b",
+            role_models={role: "qwen3:8b" for role in ROLE_ORDER},
+        )
+        events: list[dict[str, object]] = []
+
+        async def emit(payload: dict[str, object]) -> None:
+            events.append(payload)
+
+        ollama = FakeOllama()
+        await _run_devflow_job(job=job, ollama=ollama, emit_event=emit)
+
+        self.assertEqual(job.status, "completed")
+        self.assertIn("doc_git", job.outputs)
+        self.assertIn("fallback", job.outputs["doc_git"].lower())
+        fallback_events = [
+            e
+            for e in events
+            if e.get("type") == "devflow_stage_result"
+            and e.get("role") == "doc_git"
+            and e.get("status") == "fallback"
+        ]
+        self.assertTrue(fallback_events)
+        done_events = [e for e in events if e.get("type") == "devflow_done"]
+        self.assertTrue(done_events)
+
+    async def test_run_devflow_job_inline_fallback_generates_commented_code_block(self) -> None:
+        class FakeOllama:
+            async def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                temperature: float,
+                num_ctx: int,
+            ) -> str:
+                _ = (model, temperature, num_ctx)
+                prompt = str(messages[-1]["content"])
+                if "Return ONLY a single fenced code block" in prompt:
+                    raise TimeoutError("inline doc timeout")
+                if "Round 3 chain step 3" in prompt:
+                    return (
+                        "```python\n"
+                        "from fastapi import FastAPI\n\n"
+                        "app = FastAPI()\n\n"
+                        "@app.get('/')\n"
+                        "def root():\n"
+                        "    return {'ok': True}\n"
+                        "```"
+                    )
+                return "ok"
+
+        job = DevflowJob(
+            job_id="job-runner-inline-fallback",
+            actor_id="actor",
+            prompt="Create a tiny FastAPI service.",
+            selected_model="qwen3:8b",
+            role_models={role: "qwen3:8b" for role in ROLE_ORDER},
+        )
+        events: list[dict[str, object]] = []
+
+        async def emit(payload: dict[str, object]) -> None:
+            events.append(payload)
+
+        await _run_devflow_job(job=job, ollama=FakeOllama(), emit_event=emit)
+
+        self.assertEqual(job.status, "completed")
+        inline_code = str(job.outputs.get("doc_inline_code", ""))
+        self.assertIn("```python", inline_code)
+        self.assertIn("# root:", inline_code)
+        self.assertIn("Inline documentation fallback", inline_code)
+
 
 class DevflowWebSocketTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -644,6 +644,15 @@
           <div class="console-grid">
             <div id="chatLog" class="chat-log" aria-live="polite"></div>
           </div>
+          <div class="composer-toolbar">
+            <label class="checkbox-field main-devflow-toggle">
+              <input id="mainDevflowToggle" type="checkbox" />
+              <span>Programming Development Mode</span>
+            </label>
+            <div class="field-help">
+              When enabled, Send starts a Devflow run from this chat prompt.
+            </div>
+          </div>
           <form id="chatForm" class="composer">
             <textarea
               id="promptInput"
@@ -653,6 +662,23 @@
             <button id="sendBtn" type="submit">Send</button>
           </form>
         </section>
+
+        <aside id="devflowSidePanel" class="card devflow-side-panel" hidden>
+          <h3>Programming Workflow</h3>
+          <div id="devflowMainMeta" class="field-help">No programming workflow started.</div>
+          <progress id="devflowMainProgressBar" class="devflow-progress" max="100" value="0"></progress>
+          <div id="devflowMainTimeline" class="admin-events-list"></div>
+          <details class="profile-group" open>
+            <summary class="profile-group-summary">
+              <span>Stage Output Preview</span>
+              <small>Latest role outputs</small>
+            </summary>
+            <div id="devflowMainOutputs" class="profile-group-body"></div>
+          </details>
+          <a id="devflowMainDownloadLink" class="tool-action disabled-link" href="#" download>
+            Download ZIP (Waiting)
+          </a>
+        </aside>
       </div>
     </div>
 

@@ -203,6 +203,10 @@ body.drawer-open {
   gap: 1rem;
 }
 
+body.devflow-main-open .workspace-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
+}
+
 .terminal-section {
   min-width: 0;
   display: grid;
@@ -497,6 +501,13 @@ button:disabled {
   font-size: 0.84rem;
 }
 
+a.tool-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
 .tool-action.secondary {
   background: var(--button-secondary-bg);
   border-color: var(--border-strong);
@@ -738,6 +749,47 @@ button:disabled {
   gap: 0.55rem;
 }
 
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.main-devflow-toggle span {
+  font-size: 0.9rem;
+}
+
+.devflow-side-panel {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto auto auto 1fr auto;
+  gap: 0.55rem;
+  height: clamp(520px, 78vh, 900px);
+  overflow: hidden;
+}
+
+.devflow-side-panel h3 {
+  margin: 0;
+  font-size: 1.02rem;
+}
+
+.devflow-side-panel .admin-events-list {
+  min-height: 0;
+  max-height: none;
+}
+
+.devflow-side-panel .profile-group {
+  min-height: 0;
+}
+
+.devflow-side-panel .profile-group-body {
+  min-height: 0;
+  max-height: 100%;
+  overflow: auto;
+}
+
 .msg {
   max-width: min(92%, 920px);
   padding: 0.58rem 0.72rem;
@@ -826,8 +878,17 @@ button:disabled {
 }
 
 @media (max-width: 1024px) {
+  body.devflow-main-open .workspace-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .terminal-section {
     height: clamp(480px, 74vh, 760px);
+  }
+
+  .devflow-side-panel {
+    height: auto;
+    max-height: 520px;
   }
 
   .tools-grid {
@@ -871,6 +932,11 @@ button:disabled {
 
   .composer {
     grid-template-columns: 1fr;
+  }
+
+  .composer-toolbar {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .store-select,

@@ -24,6 +24,8 @@ const chatLog = document.getElementById("chatLog");
 const chatForm = document.getElementById("chatForm");
 const promptInput = document.getElementById("promptInput");
 const sendBtn = document.getElementById("sendBtn");
+const mainDevflowToggle = document.getElementById("mainDevflowToggle");
+const devflowSidePanel = document.getElementById("devflowSidePanel");
 const menuToggleBtn = document.getElementById("menuToggleBtn");
 const menuCloseBtn = document.getElementById("menuCloseBtn");
 const drawerOverlay = document.getElementById("drawerOverlay");
@@ -52,6 +54,11 @@ const devflowProgressBar = document.getElementById("devflowProgressBar");
 const devflowTimeline = document.getElementById("devflowTimeline");
 const devflowOutputs = document.getElementById("devflowOutputs");
 const devflowDownloadLink = document.getElementById("devflowDownloadLink");
+const devflowMainMeta = document.getElementById("devflowMainMeta");
+const devflowMainProgressBar = document.getElementById("devflowMainProgressBar");
+const devflowMainTimeline = document.getElementById("devflowMainTimeline");
+const devflowMainOutputs = document.getElementById("devflowMainOutputs");
+const devflowMainDownloadLink = document.getElementById("devflowMainDownloadLink");
 const devflowRoleIntentReasoner = document.getElementById("devflowRoleIntentReasoner");
 const devflowRoleIntentKnowledge = document.getElementById("devflowRoleIntentKnowledge");
 const devflowRoleIntentFeasibility = document.getElementById("devflowRoleIntentFeasibility");
@@ -257,6 +264,51 @@ function setDevflowMeta(text) {
   if (devflowMeta) {
     devflowMeta.textContent = text;
   }
+  if (devflowMainMeta) {
+    devflowMainMeta.textContent = text;
+  }
+}
+
+function isMainDevflowModeEnabled() {
+  return Boolean(mainDevflowToggle?.checked);
+}
+
+function syncMainDevflowPanelVisibility() {
+  const hasWorkflowData =
+    state.devflowStatus !== "idle" ||
+    state.devflowTimelineItems.length > 0 ||
+    Object.keys(state.devflowOutputsByKey).length > 0;
+  const shouldShow = isMainDevflowModeEnabled() || hasWorkflowData;
+  if (devflowSidePanel) {
+    devflowSidePanel.hidden = !shouldShow;
+  }
+  document.body.classList.toggle("devflow-main-open", shouldShow);
+}
+
+function loadMainDevflowTogglePreference() {
+  if (!mainDevflowToggle) {
+    return;
+  }
+  try {
+    const raw = window.localStorage.getItem("local-model-pro.devflow.main-toggle");
+    mainDevflowToggle.checked = raw === "true";
+  } catch (_error) {
+    mainDevflowToggle.checked = false;
+  }
+}
+
+function saveMainDevflowTogglePreference() {
+  if (!mainDevflowToggle) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(
+      "local-model-pro.devflow.main-toggle",
+      mainDevflowToggle.checked ? "true" : "false"
+    );
+  } catch (_error) {
+    return;
+  }
 }
 
 function truncateText(text, maxChars = 1200) {
@@ -268,71 +320,83 @@ function truncateText(text, maxChars = 1200) {
 }
 
 function renderDevflowTimeline() {
-  if (!devflowTimeline) {
-    return;
-  }
-  devflowTimeline.innerHTML = "";
-  if (!state.devflowTimelineItems.length) {
-    const empty = document.createElement("div");
-    empty.className = "field-help";
-    empty.textContent = "No workflow events yet.";
-    devflowTimeline.appendChild(empty);
-    return;
-  }
-  state.devflowTimelineItems.slice(-40).forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "admin-event-row";
-    row.textContent = `${item.at} · ${item.label}`;
-    devflowTimeline.appendChild(row);
-  });
+  [devflowTimeline, devflowMainTimeline]
+    .filter(Boolean)
+    .forEach((target) => {
+      target.innerHTML = "";
+      if (!state.devflowTimelineItems.length) {
+        const empty = document.createElement("div");
+        empty.className = "field-help";
+        empty.textContent = "No workflow events yet.";
+        target.appendChild(empty);
+        return;
+      }
+      state.devflowTimelineItems.slice(-40).forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "admin-event-row";
+        row.textContent = `${item.at} · ${item.label}`;
+        target.appendChild(row);
+      });
+    });
+  syncMainDevflowPanelVisibility();
 }
 
 function renderDevflowOutputs() {
-  if (!devflowOutputs) {
-    return;
-  }
-  devflowOutputs.innerHTML = "";
-  const keys = Object.keys(state.devflowOutputsByKey);
-  if (!keys.length) {
-    const empty = document.createElement("div");
-    empty.className = "field-help";
-    empty.textContent = "No stage outputs yet.";
-    devflowOutputs.appendChild(empty);
-    return;
-  }
-  keys.forEach((key) => {
-    const details = document.createElement("details");
-    details.className = "devflow-output-item";
-    const summary = document.createElement("summary");
-    summary.textContent = key;
-    const pre = document.createElement("pre");
-    pre.textContent = truncateText(state.devflowOutputsByKey[key], 3000);
-    details.appendChild(summary);
-    details.appendChild(pre);
-    devflowOutputs.appendChild(details);
-  });
+  [devflowOutputs, devflowMainOutputs]
+    .filter(Boolean)
+    .forEach((target) => {
+      target.innerHTML = "";
+      const keys = Object.keys(state.devflowOutputsByKey);
+      if (!keys.length) {
+        const empty = document.createElement("div");
+        empty.className = "field-help";
+        empty.textContent = "No stage outputs yet.";
+        target.appendChild(empty);
+        return;
+      }
+      keys.forEach((key) => {
+        const details = document.createElement("details");
+        details.className = "devflow-output-item";
+        const summary = document.createElement("summary");
+        summary.textContent = key;
+        const pre = document.createElement("pre");
+        pre.textContent = truncateText(state.devflowOutputsByKey[key], 3000);
+        details.appendChild(summary);
+        details.appendChild(pre);
+        target.appendChild(details);
+      });
+    });
+  syncMainDevflowPanelVisibility();
 }
 
 function setDevflowDownload(downloadUrl) {
-  if (!devflowDownloadLink) {
-    return;
-  }
-  if (downloadUrl) {
-    devflowDownloadLink.href = String(downloadUrl);
-    devflowDownloadLink.classList.remove("disabled-link");
-  } else {
-    devflowDownloadLink.href = "#";
-    devflowDownloadLink.classList.add("disabled-link");
-  }
+  [devflowDownloadLink, devflowMainDownloadLink]
+    .filter(Boolean)
+    .forEach((link) => {
+      if (downloadUrl) {
+        link.href = String(downloadUrl);
+        link.classList.remove("disabled-link");
+        link.setAttribute("aria-disabled", "false");
+        link.textContent = "Download ZIP (Ready)";
+        return;
+      }
+      link.href = "#";
+      link.classList.add("disabled-link");
+      link.setAttribute("aria-disabled", "true");
+      link.textContent = "Download ZIP (Waiting)";
+    });
 }
 
 function renderDevflowStatus({ status, percent, message }) {
-  if (devflowProgressBar) {
-    devflowProgressBar.value = Number(percent || 0);
-  }
+  [devflowProgressBar, devflowMainProgressBar]
+    .filter(Boolean)
+    .forEach((bar) => {
+      bar.value = Number(percent || 0);
+    });
   state.devflowStatus = String(status || state.devflowStatus || "idle");
   setDevflowMeta(`${String(status || "idle")} · ${Math.round(Number(percent || 0))}% · ${String(message || "")}`);
   syncDevflowControls();
+  syncMainDevflowPanelVisibility();
 }
 
 function syncDevflowControls() {
@@ -492,10 +556,12 @@ function applyDevflowSlots() {
 }
 
 function pushDevflowTimeline(label) {
+  const normalized = String(label || "").trim() || "event";
   state.devflowTimelineItems.push({
     at: new Date().toLocaleTimeString(),
-    label: String(label || "").trim() || "event",
+    label: normalized,
   });
+  addMessage("system", `[Devflow] ${normalized}`);
   renderDevflowTimeline();
 }
 
@@ -503,10 +569,15 @@ function applyDevflowEvent(message) {
   const status = String(message.status || state.devflowStatus || "idle");
   const percent = Number(message.percent || 0);
   const infoMessage = String(message.message || "");
+  const errorMessage = String(message.error || "");
+  const composedMessage =
+    message.type === "devflow_error" && errorMessage
+      ? `${infoMessage}${infoMessage ? " · " : ""}${errorMessage}`
+      : infoMessage;
   if (message.job_id) {
     state.devflowJobId = String(message.job_id);
   }
-  renderDevflowStatus({ status, percent, message: infoMessage });
+  renderDevflowStatus({ status, percent, message: composedMessage });
   const role = String(message.role || "");
   const stage = String(message.stage || "");
   if (message.type === "devflow_stage_result") {
@@ -515,7 +586,10 @@ function applyDevflowEvent(message) {
     renderDevflowOutputs();
     pushDevflowTimeline(`${stage}/${role} completed`);
   } else {
-    pushDevflowTimeline(`${message.type}${role ? `/${role}` : ""}${infoMessage ? `: ${infoMessage}` : ""}`);
+    const timelineText = composedMessage || infoMessage;
+    pushDevflowTimeline(
+      `${message.type}${role ? `/${role}` : ""}${timelineText ? `: ${timelineText}` : ""}`
+    );
   }
   const downloadUrl = String(message.download_url || "");
   if (downloadUrl) {
@@ -536,11 +610,16 @@ function resetDevflowView() {
   renderDevflowStatus({ status: "idle", percent: 0, message: "No programming workflow started." });
 }
 
-function startDevflowRun() {
-  const prompt = String(devflowPromptInput?.value || "").trim();
+function startDevflowRun(options = {}) {
+  const promptOverride =
+    typeof options === "string" ? options : String(options?.promptOverride || "");
+  const prompt = String(promptOverride || devflowPromptInput?.value || "").trim();
   if (!prompt) {
     setDevflowMeta("Enter a development request.");
     return;
+  }
+  if (devflowPromptInput) {
+    devflowPromptInput.value = prompt;
   }
   const role_models = collectDevflowRoleModels();
   const primaryModel = preferredDevflowModel(role_models);
@@ -1250,8 +1329,9 @@ function rerenderReasoningMessages() {
 
 function setBusy(busy) {
   state.inflight = busy;
-  sendBtn.disabled = busy || !state.connected;
-  promptInput.disabled = !state.connected;
+  const allowOfflineCompose = isMainDevflowModeEnabled();
+  sendBtn.disabled = busy || (!state.connected && !allowOfflineCompose);
+  promptInput.disabled = !state.connected && !allowOfflineCompose;
   toolActionElements.forEach((el) => {
     el.disabled = busy || !state.connected;
   });
@@ -2004,9 +2084,7 @@ function connectWs(options = {}) {
     ) {
       applyDevflowEvent(message);
       if (msgType === "devflow_done" || msgType === "devflow_error") {
-        if (devflowStartBtn) {
-          devflowStartBtn.disabled = !state.connected;
-        }
+        syncDevflowControls();
       }
       return;
     }
@@ -2138,10 +2216,6 @@ function sendPrompt(event) {
 }
 
 function sendChatPrompt(rawPrompt) {
-  if (!state.connected) {
-    addMessage("system", "Connect first.");
-    return;
-  }
   const prompt = String(rawPrompt || "").trim();
   if (!prompt) {
     return;
@@ -2151,6 +2225,17 @@ function sendChatPrompt(rawPrompt) {
     closeDrawer();
   }
   addMessage("user", prompt);
+
+  if (isMainDevflowModeEnabled()) {
+    startDevflowRun({ promptOverride: prompt });
+    return;
+  }
+
+  if (!state.connected) {
+    addMessage("system", "Connect first.");
+    return;
+  }
+
   try {
     const reasoning_mode = String(reasoningViewSelect?.value || "summary");
     sendWs({ type: "chat", prompt, reasoning_mode });
@@ -2380,6 +2465,16 @@ if (reasoningViewSelect) {
     rerenderReasoningMessages();
   });
 }
+if (mainDevflowToggle) {
+  mainDevflowToggle.addEventListener("change", () => {
+    saveMainDevflowTogglePreference();
+    syncMainDevflowPanelVisibility();
+    setBusy(state.inflight);
+    if (mainDevflowToggle.checked) {
+      setDevflowMeta("Programming Development Mode enabled for main chat send.");
+    }
+  });
+}
 modelFilterInput.addEventListener("input", () => renderModelOptions());
 modelSelect.addEventListener("change", () => {
   customModelInput.value = "";
@@ -2508,6 +2603,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 setStatus(false, "offline");
+loadMainDevflowTogglePreference();
 setBusy(false);
 updateActiveModelLabel(state.currentModel);
 populateDevflowRoleSelectors();

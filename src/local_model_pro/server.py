@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import shlex
 import uuid
 from dataclasses import dataclass, field
@@ -539,6 +540,7 @@ async def _run_devflow_job(
 ) -> None:
     total_steps = 15
     completed_steps = 0
+    max_doc_context_chars = 12000
 
     async def push_progress(
         *,
@@ -589,19 +591,21 @@ async def _run_devflow_job(
         output_key: str,
         role_prompt: str,
         status_message: str,
+        retries: int | None = None,
     ) -> str:
         nonlocal completed_steps
         if job.cancel_requested:
             raise DevflowError("Cancelled by user.")
         await push_progress(stage=stage, role=role, status="running", message=status_message)
         model_name = job.role_models.get(role, job.selected_model)
+        effective_retries = devflow_config.retry_count if retries is None else max(0, retries)
         output = await run_with_retries(
             job=job,
             role=role,
             role_model=model_name,
             role_prompt=role_prompt,
             role_call=call_role,
-            retries=devflow_config.retry_count,
+            retries=effective_retries,
         )
         job.outputs[output_key] = output
         completed_steps += 1
@@ -629,6 +633,125 @@ async def _run_devflow_job(
             }
         )
         return output
+
+    async def run_role_with_fallback(
+        *,
+        stage: str,
+        role: str,
+        output_key: str,
+        role_prompt: str,
+        status_message: str,
+        fallback_builder: Callable[[Exception], str],
+        retries: int | None = None,
+    ) -> str:
+        nonlocal completed_steps
+        try:
+            return await run_role(
+                stage=stage,
+                role=role,
+                output_key=output_key,
+                role_prompt=role_prompt,
+                status_message=status_message,
+                retries=retries,
+            )
+        except Exception as exc:
+            fallback_output = fallback_builder(exc).strip()
+            if not fallback_output:
+                fallback_output = (
+                    f"Role '{role}' fallback output generated after failure: {str(exc)[:300]}"
+                )
+            job.outputs[output_key] = fallback_output
+            completed_steps += 1
+            stage_time = _utc_now_iso()
+            job.stages.append(
+                {
+                    "stage": stage,
+                    "role": role,
+                    "output_key": output_key,
+                    "model": job.role_models.get(role, job.selected_model),
+                    "status": "fallback",
+                    "error": str(exc)[:500],
+                    "at": stage_time,
+                }
+            )
+            await emit_event(
+                {
+                    "type": "devflow_stage_result",
+                    "job_id": job.job_id,
+                    "stage": stage,
+                    "role": role,
+                    "output_key": output_key,
+                    "model": job.role_models.get(role, job.selected_model),
+                    "status": "fallback",
+                    "percent": int((completed_steps / total_steps) * 100),
+                    "output": fallback_output,
+                    "error": str(exc)[:500],
+                    "updated_at": stage_time,
+                }
+            )
+            await push_progress(
+                stage=stage,
+                role=role,
+                status="running",
+                message=f"{role} used fallback output after role failure.",
+            )
+            return fallback_output
+
+    def _trim_text(value: str, *, max_chars: int) -> str:
+        normalized = value.strip()
+        if len(normalized) <= max_chars:
+            return normalized
+        return f"{normalized[:max_chars].rstrip()}\n\n[truncated]"
+
+    def _extract_first_fenced_code_block(value: str) -> tuple[str, str]:
+        text = str(value or "")
+        match = re.search(r"```([a-zA-Z0-9_+-]*)\s*\n([\s\S]*?)```", text)
+        if not match:
+            return "", text.strip()
+        return match.group(1).strip().lower(), match.group(2).strip()
+
+    def _comment_prefix_for_language(language: str) -> str:
+        lang = language.lower().strip()
+        if lang in {"python", "py", "bash", "sh", "yaml", "yml", "toml", "ini", "ruby", "rb"}:
+            return "#"
+        return "//"
+
+    def _annotate_python_code(code: str) -> str:
+        lines = code.splitlines()
+        out: list[str] = []
+        for line in lines:
+            match = re.match(r"^(\s*)(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if match:
+                indent, symbol_name = match.groups()
+                out.append(f"{indent}# {symbol_name}: inline documentation for behavior and intent.")
+            out.append(line)
+        return "\n".join(out).strip()
+
+    def _build_inline_documented_code(value: str, *, error_note: str | None = None) -> str:
+        language, code = _extract_first_fenced_code_block(value)
+        normalized_code = code.strip() or str(value or "").strip()
+        if not normalized_code:
+            normalized_code = "pass"
+        target_language = language or "python"
+
+        if target_language in {"python", "py"}:
+            annotated_code = _annotate_python_code(normalized_code)
+            comment_prefix = "#"
+        else:
+            comment_prefix = _comment_prefix_for_language(target_language)
+            annotated_code = (
+                f"{comment_prefix} Inline documentation fallback: preserve behavior and add intent comments.\n"
+                f"{normalized_code}"
+            )
+
+        if error_note:
+            annotated_code = (
+                f"{comment_prefix} Inline documentation fallback after role error: {error_note[:220]}\n"
+                f"{annotated_code}"
+            )
+
+        language_label = target_language if target_language else "text"
+        return f"```{language_label}\n{annotated_code.strip()}\n```"
 
     def round_bundle(label: str, mapping: dict[str, str]) -> str:
         lines = [f"{label}:"]
@@ -751,21 +874,30 @@ async def _run_devflow_job(
             )
             job.outputs["final_code"] = round3_model3
 
+            trimmed_final_code = _trim_text(round3_model3, max_chars=max_doc_context_chars)
+            trimmed_request = _trim_text(job.prompt, max_chars=1500)
             final_code_context = (
-                f"Final canonical code:\n{round3_model3}\n\nOriginal request:\n{job.prompt}"
+                f"Final canonical code:\n{trimmed_final_code}\n\nOriginal request:\n{trimmed_request}"
             )
-            doc_inline = await run_role(
+            doc_inline = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_inline",
                 output_key="doc_inline",
-                status_message="Generating inline/functionality documentation guidance.",
+                status_message="Generating inline-documented code variant.",
                 role_prompt=(
-                    "Generate documentation focused on functionality and inline/in-code annotation guidance "
-                    "for the final code.\n\n"
+                    "Return ONLY a single fenced code block that preserves behavior while adding inline documentation. "
+                    "Requirements: add concise intent comments above key blocks, and ensure each function has a docstring "
+                    "describing purpose, inputs, and outputs. Do not include prose outside the code block.\n\n"
                     f"{final_code_context}"
                 ),
+                retries=0,
+                fallback_builder=lambda exc: _build_inline_documented_code(
+                    round3_model3,
+                    error_note=str(exc),
+                ),
             )
-            doc_git = await run_role(
+            job.outputs["doc_inline_code"] = _build_inline_documented_code(doc_inline)
+            doc_git = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_git",
                 output_key="doc_git",
@@ -774,8 +906,16 @@ async def _run_devflow_job(
                     "Generate concise git notes and commit summary for this generated code.\n\n"
                     f"{final_code_context}"
                 ),
+                retries=0,
+                fallback_builder=lambda exc: (
+                    "Git notes fallback (role failed):\n\n"
+                    f"- Error: {str(exc)[:240]}\n"
+                    "- Suggested commit title: add generated implementation from devflow run\n"
+                    "- Suggested scope: app bootstrap, routes, server config, and docs\n"
+                    "- Validation notes: run local smoke test and endpoint checks before merge"
+                ),
             )
-            doc_release = await run_role(
+            doc_release = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_release",
                 output_key="doc_release",
@@ -784,8 +924,22 @@ async def _run_devflow_job(
                     "Generate release notes for this generated code including highlights, compatibility, and risk notes.\n\n"
                     f"{final_code_context}"
                 ),
+                retries=0,
+                fallback_builder=lambda exc: (
+                    "Release notes fallback (role failed):\n\n"
+                    f"- Error: {str(exc)[:240]}\n"
+                    "- Highlights: initial generated feature scaffold and runnable service entrypoint\n"
+                    "- Compatibility: verify Python and dependency versions in your runtime\n"
+                    "- Risks: generated code requires operator review before production rollout"
+                ),
             )
 
+            job.status = "completed"
+            job.stage = "completed"
+            job.percent = 100
+            job.message = "Programming development workflow completed."
+            job.updated_at = _utc_now_iso()
+            job.finished_at = _utc_now_iso()
             code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
             documentation = build_documentation_markdown(
                 prompt=job.prompt,
@@ -810,12 +964,6 @@ async def _run_devflow_job(
             artifacts["metadata"] = str(metadata_path)
             job.artifacts = artifacts
             job.run_dir = artifacts.get("run_dir")
-            job.status = "completed"
-            job.stage = "completed"
-            job.percent = 100
-            job.message = "Programming development workflow completed."
-            job.updated_at = _utc_now_iso()
-            job.finished_at = _utc_now_iso()
             await _upsert_devflow_job(job)
             await emit_event(
                 {
@@ -825,6 +973,13 @@ async def _run_devflow_job(
                 }
             )
         except Exception as exc:
+            error_text = str(exc).strip() or "Unknown error"
+            job.status = "failed"
+            job.stage = "failed"
+            job.message = f"Programming workflow failed: {error_text[:280]}"
+            job.error = error_text[:1200]
+            job.updated_at = _utc_now_iso()
+            job.finished_at = _utc_now_iso()
             if job.outputs:
                 code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
                 documentation = build_documentation_markdown(prompt=job.prompt, outputs=job.outputs)
@@ -834,20 +989,15 @@ async def _run_devflow_job(
                     code_pack=code_pack,
                     documentation=documentation,
                 )
-                metadata_path = Path(artifacts["run_dir"]) / "run_metadata.json"
+                job.artifacts = artifacts
+                job.run_dir = artifacts.get("run_dir")
+            if job.run_dir:
+                metadata_path = Path(job.run_dir) / "run_metadata.json"
                 metadata_path.write_text(
                     json.dumps(_job_payload(job), indent=2, sort_keys=True),
                     encoding="utf-8",
                 )
-                artifacts["metadata"] = str(metadata_path)
-                job.artifacts = artifacts
-                job.run_dir = artifacts.get("run_dir")
-            job.status = "failed"
-            job.stage = "failed"
-            job.message = "Programming workflow failed."
-            job.error = str(exc)
-            job.updated_at = _utc_now_iso()
-            job.finished_at = _utc_now_iso()
+                job.artifacts["metadata"] = str(metadata_path)
             await _upsert_devflow_job(job)
             await emit_event(
                 {
