@@ -62,6 +62,9 @@ devflow_config = DevflowRuntimeConfig(
     max_concurrent_jobs=max(1, settings.devflow_max_concurrent_jobs),
     role_timeout_seconds=max(5, settings.devflow_role_timeout_seconds),
     run_retention=max(5, settings.devflow_run_retention),
+    doc_inline_max_input_chars=max(1000, settings.devflow_doc_inline_max_input_chars),
+    doc_git_max_input_chars=max(800, settings.devflow_doc_git_max_input_chars),
+    doc_escalation_enabled=settings.devflow_doc_escalation_enabled,
     artifact_dir=Path(settings.devflow_artifact_dir),
 )
 devflow_jobs: dict[str, DevflowJob] = {}
@@ -234,6 +237,24 @@ def _devflow_enabled_or_403() -> None:
 
 
 def _job_payload(job: DevflowJob) -> dict[str, Any]:
+    output_sources = {
+        key: value
+        for key, value in {
+            "doc_inline": str(job.outputs.get("doc_inline_source", "")).strip(),
+            "doc_git": str(job.outputs.get("doc_git_source", "")).strip(),
+            "doc_release": str(job.outputs.get("doc_release_source", "")).strip(),
+        }.items()
+        if value
+    }
+    output_errors = {
+        key: value
+        for key, value in {
+            "doc_inline": str(job.outputs.get("doc_inline_error", "")).strip(),
+            "doc_git": str(job.outputs.get("doc_git_error", "")).strip(),
+            "doc_release": str(job.outputs.get("doc_release_error", "")).strip(),
+        }.items()
+        if value
+    }
     return {
         "job_id": job.job_id,
         "actor_id": job.actor_id,
@@ -252,6 +273,8 @@ def _job_payload(job: DevflowJob) -> dict[str, Any]:
         "artifacts": job.artifacts,
         "stages": job.stages,
         "retries_by_role": job.retries_by_role,
+        "output_sources": output_sources,
+        "output_errors": output_errors,
     }
 
 
@@ -548,6 +571,9 @@ async def _run_devflow_job(
         role: str | None,
         status: str,
         message: str,
+        attempt_index: int | None = None,
+        attempt_model: str | None = None,
+        attempt_path: str | None = None,
     ) -> None:
         percent = int((completed_steps / total_steps) * 100)
         job.stage = stage
@@ -561,6 +587,9 @@ async def _run_devflow_job(
                 "type": "devflow_progress",
                 **_job_payload(job),
                 "role": role,
+                "attempt_index": attempt_index,
+                "attempt_model": attempt_model,
+                "attempt_path": attempt_path,
             }
         )
 
@@ -592,16 +621,28 @@ async def _run_devflow_job(
         role_prompt: str,
         status_message: str,
         retries: int | None = None,
+        model_override: str | None = None,
+        attempt_index: int = 1,
+        attempt_path: str = "slot",
     ) -> str:
         nonlocal completed_steps
         if job.cancel_requested:
             raise DevflowError("Cancelled by user.")
-        model_name = job.role_models.get(role, job.selected_model)
+        model_name = (
+            str(model_override).strip()
+            if isinstance(model_override, str) and str(model_override).strip()
+            else job.role_models.get(role, job.selected_model)
+        )
+        normalized_attempt_index = max(1, int(attempt_index))
+        normalized_attempt_path = str(attempt_path or "slot").strip() or "slot"
         await push_progress(
             stage=stage,
             role=role,
             status="running",
             message=f"{status_message} (model={model_name})",
+            attempt_index=normalized_attempt_index,
+            attempt_model=model_name,
+            attempt_path=normalized_attempt_path,
         )
         effective_retries = devflow_config.retry_count if retries is None else max(0, retries)
         output = await run_with_retries(
@@ -620,6 +661,8 @@ async def _run_devflow_job(
                 "role": role,
                 "output_key": output_key,
                 "model": model_name,
+                "attempt_index": normalized_attempt_index,
+                "attempt_path": normalized_attempt_path,
                 "at": _utc_now_iso(),
             }
         )
@@ -631,6 +674,9 @@ async def _run_devflow_job(
                 "role": role,
                 "output_key": output_key,
                 "model": model_name,
+                "attempt_index": normalized_attempt_index,
+                "attempt_model": model_name,
+                "attempt_path": normalized_attempt_path,
                 "status": "completed",
                 "percent": int((completed_steps / total_steps) * 100),
                 "output": output,
@@ -648,8 +694,16 @@ async def _run_devflow_job(
         status_message: str,
         fallback_builder: Callable[[Exception], str],
         retries: int | None = None,
-    ) -> tuple[str, bool]:
+        escalate_model: str | None = None,
+        escalate_enabled: bool = False,
+    ) -> tuple[str, str, str]:
         nonlocal completed_steps
+        slot_model = job.role_models.get(role, job.selected_model)
+        first_error: Exception | None = None
+        escalated_error: Exception | None = None
+        escalation_candidate = str(escalate_model or "").strip()
+        used_escalation_attempt = False
+
         try:
             result = await run_role(
                 stage=stage,
@@ -658,51 +712,108 @@ async def _run_devflow_job(
                 role_prompt=role_prompt,
                 status_message=status_message,
                 retries=retries,
+                model_override=slot_model,
+                attempt_index=1,
+                attempt_path="slot",
             )
-            return result, False
+            return result, "role", ""
         except Exception as exc:
-            fallback_output = fallback_builder(exc).strip()
-            if not fallback_output:
-                fallback_output = (
-                    f"Role '{role}' fallback output generated after failure: {str(exc)[:300]}"
+            first_error = exc
+
+        if (
+            escalate_enabled
+            and devflow_config.doc_escalation_enabled
+            and escalation_candidate
+            and escalation_candidate != slot_model
+        ):
+            used_escalation_attempt = True
+            try:
+                result = await run_role(
+                    stage=stage,
+                    role=role,
+                    output_key=output_key,
+                    role_prompt=role_prompt,
+                    status_message=f"{status_message} (escalated retry)",
+                    retries=max(0, retries if retries is not None else 0),
+                    model_override=escalation_candidate,
+                    attempt_index=2,
+                    attempt_path="escalated",
                 )
-            fallback_model = job.role_models.get(role, job.selected_model)
-            job.outputs[output_key] = fallback_output
-            completed_steps += 1
-            stage_time = _utc_now_iso()
-            job.stages.append(
-                {
-                    "stage": stage,
-                    "role": role,
-                    "output_key": output_key,
-                    "model": fallback_model,
-                    "status": "fallback",
-                    "error": str(exc)[:500],
-                    "at": stage_time,
-                }
+                first_error_text = str(first_error).strip() if first_error is not None else ""
+                return result, "escalated", first_error_text[:500]
+            except Exception as exc:
+                escalated_error = exc
+
+        first_error_text = str(first_error).strip() if first_error is not None else ""
+        if not first_error_text and first_error is not None:
+            first_error_text = type(first_error).__name__
+        escalated_error_text = str(escalated_error).strip() if escalated_error is not None else ""
+        if not escalated_error_text and escalated_error is not None:
+            escalated_error_text = type(escalated_error).__name__
+
+        if escalated_error is not None:
+            combined_error = (
+                f"slot attempt failed ({slot_model}): {first_error_text or 'unknown error'}; "
+                f"escalated attempt failed ({escalation_candidate}): {escalated_error_text or 'unknown error'}"
             )
-            await emit_event(
-                {
-                    "type": "devflow_stage_result",
-                    "job_id": job.job_id,
-                    "stage": stage,
-                    "role": role,
-                    "output_key": output_key,
-                    "model": fallback_model,
-                    "status": "fallback",
-                    "percent": int((completed_steps / total_steps) * 100),
-                    "output": fallback_output,
-                    "error": str(exc)[:500],
-                    "updated_at": stage_time,
-                }
+            fallback_exception: Exception = DevflowError(combined_error)
+        else:
+            combined_error = f"slot attempt failed ({slot_model}): {first_error_text or 'unknown error'}"
+            fallback_exception = first_error if first_error is not None else DevflowError(combined_error)
+
+        fallback_output = fallback_builder(fallback_exception).strip()
+        if not fallback_output:
+            fallback_output = (
+                f"Role '{role}' fallback output generated after failure: {combined_error[:300]}"
             )
-            await push_progress(
-                stage=stage,
-                role=role,
-                status="running",
-                message=f"{role} used fallback output after role failure (model={fallback_model}).",
-            )
-            return fallback_output, True
+        fallback_model = (
+            escalation_candidate if used_escalation_attempt and escalation_candidate else slot_model
+        )
+        fallback_attempt_index = 3 if used_escalation_attempt else 2
+        job.outputs[output_key] = fallback_output
+        completed_steps += 1
+        stage_time = _utc_now_iso()
+        job.stages.append(
+            {
+                "stage": stage,
+                "role": role,
+                "output_key": output_key,
+                "model": fallback_model,
+                "attempt_index": fallback_attempt_index,
+                "attempt_path": "fallback",
+                "status": "fallback",
+                "error": combined_error[:500],
+                "at": stage_time,
+            }
+        )
+        await emit_event(
+            {
+                "type": "devflow_stage_result",
+                "job_id": job.job_id,
+                "stage": stage,
+                "role": role,
+                "output_key": output_key,
+                "model": fallback_model,
+                "attempt_index": fallback_attempt_index,
+                "attempt_model": fallback_model,
+                "attempt_path": "fallback",
+                "status": "fallback",
+                "percent": int((completed_steps / total_steps) * 100),
+                "output": fallback_output,
+                "error": combined_error[:500],
+                "updated_at": stage_time,
+            }
+        )
+        await push_progress(
+            stage=stage,
+            role=role,
+            status="running",
+            message=f"{role} used fallback output after role failure (model={fallback_model}).",
+            attempt_index=fallback_attempt_index,
+            attempt_model=fallback_model,
+            attempt_path="fallback",
+        )
+        return fallback_output, "fallback", combined_error[:500]
 
     def _trim_text(value: str, *, max_chars: int) -> str:
         normalized = value.strip()
@@ -717,6 +828,16 @@ async def _run_devflow_job(
             return "", text.strip()
         return match.group(1).strip().lower(), match.group(2).strip()
 
+    def _normalize_model_inline_code(value: str) -> str:
+        language, code = _extract_first_fenced_code_block(value)
+        if code.strip():
+            language_label = language or "python"
+            return f"```{language_label}\n{code.strip()}\n```"
+        raw = str(value or "").strip()
+        if not raw:
+            return "```python\npass\n```"
+        return f"```python\n{raw}\n```"
+
     def _comment_prefix_for_language(language: str) -> str:
         lang = language.lower().strip()
         if lang in {"python", "py", "bash", "sh", "yaml", "yml", "toml", "ini", "ruby", "rb"}:
@@ -727,17 +848,163 @@ async def _run_devflow_job(
         lines = code.splitlines()
         out: list[str] = []
 
-        def previous_nonempty() -> str:
-            for existing in reversed(out):
-                if existing.strip():
-                    return existing
-            return ""
+        def adjacent_comment_index() -> int | None:
+            for index in range(len(out) - 1, -1, -1):
+                stripped = out[index].strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("@"):
+                    continue
+                if stripped.startswith("#"):
+                    return index
+                return None
+            return None
 
-        def has_upcoming_docstring(start_index: int) -> bool:
+        def collect_decorators(start_index: int) -> list[str]:
+            decorators: list[str] = []
+            cursor = start_index - 1
+            while cursor >= 0:
+                probe = lines[cursor].strip()
+                if not probe:
+                    cursor -= 1
+                    continue
+                if probe.startswith("@"):
+                    decorators.insert(0, probe)
+                    cursor -= 1
+                    continue
+                if probe.startswith("#"):
+                    cursor -= 1
+                    continue
+                break
+            return decorators
+
+        def collect_symbol_body(start_index: int, symbol_indent: int) -> list[str]:
+            body: list[str] = []
             for look_ahead in range(start_index + 1, len(lines)):
-                probe = lines[look_ahead].strip()
+                probe_raw = lines[look_ahead]
+                probe = probe_raw.strip()
+                if not probe:
+                    body.append(probe_raw)
+                    continue
+                probe_indent = len(probe_raw) - len(probe_raw.lstrip())
+                if probe_indent <= symbol_indent and re.match(r"^(async\s+def|def|class)\s+", probe):
+                    break
+                body.append(probe_raw)
+            return body
+
+        def infer_route_signature(decorators: list[str]) -> tuple[str, str] | None:
+            for decorator in decorators:
+                match = re.search(
+                    r"""@\w+(?:\.\w+)*\.(get|post|put|delete|patch|options|head)\(\s*["']([^"']+)""",
+                    decorator,
+                    flags=re.IGNORECASE,
+                )
+                if match:
+                    return match.group(1).upper(), match.group(2).strip()
+            return None
+
+        def infer_return_hint(body_lines: list[str]) -> str:
+            body_blob = "\n".join(body_lines).lower()
+            if "htmlresponse(" in body_blob:
+                return "HTMLResponse: Rendered HTML content returned to the browser."
+            if "jsonresponse(" in body_blob:
+                return "JSONResponse: JSON payload for API callers."
+            if "uvicorn.run(" in body_blob:
+                return "None: Starts the ASGI server process."
+            if re.search(r"\breturn\s+[{[]", body_blob):
+                return "dict: JSON-serializable response payload."
+            return "Any: Value produced by the function."
+
+        def parse_function_args(function_line: str) -> list[str]:
+            match = re.match(
+                r"^\s*(?:async\s+def|def)\s+[A-Za-z_][A-Za-z0-9_]*\((.*?)\)\s*(?:->\s*[^:]+)?\s*:",
+                function_line,
+            )
+            if not match:
+                return []
+            raw_args = match.group(1).strip()
+            if not raw_args:
+                return []
+            parsed: list[str] = []
+            for chunk in raw_args.split(","):
+                token = chunk.strip()
+                if not token or token in {"*", "/"}:
+                    continue
+                token = token.split(":", 1)[0].split("=", 1)[0].strip()
+                token = token.lstrip("*")
+                if token and token not in {"self", "cls"}:
+                    parsed.append(token)
+            return parsed
+
+        def infer_symbol_comment(
+            *,
+            symbol_name: str,
+            symbol_kind: str,
+            decorators: list[str],
+            body_lines: list[str],
+        ) -> str:
+            if symbol_kind == "class":
+                return (
+                    f"{symbol_name}: Define shared behavior and state for this component."
+                )
+
+            route_signature = infer_route_signature(decorators)
+            body_blob = "\n".join(body_lines).lower()
+            if route_signature:
+                method, path = route_signature
+                return (
+                    f"{symbol_name}: Handle {method} {path} requests and produce the endpoint response."
+                )
+            if "htmlresponse(" in body_blob:
+                return (
+                    f"{symbol_name}: Build and return rendered HTML describing server behavior."
+                )
+            if "uvicorn.run(" in body_blob:
+                return (
+                    f"{symbol_name}: Start the ASGI application server with configured host and port."
+                )
+            return f"{symbol_name}: Execute application logic and return the computed result."
+
+        def build_function_docstring(
+            *,
+            function_indent: str,
+            function_name: str,
+            decorators: list[str],
+            body_lines: list[str],
+            function_line: str,
+        ) -> list[str]:
+            route_signature = infer_route_signature(decorators)
+            body_blob = "\n".join(body_lines).lower()
+            if route_signature:
+                method, path = route_signature
+                summary = f"Handle {method} {path} requests for this API endpoint."
+            elif "htmlresponse(" in body_blob:
+                summary = "Render and return HTML content for browser clients."
+            elif "uvicorn.run(" in body_blob:
+                summary = "Start the ASGI server with the configured runtime options."
+            else:
+                summary = f"Execute {function_name} logic and return its result."
+
+            args = parse_function_args(function_line)
+            returns_hint = infer_return_hint(body_lines)
+            doc_indent = f"{function_indent}    "
+            doc_lines = [f'{doc_indent}"""{summary}']
+            if args:
+                doc_lines.extend(["", f"{doc_indent}Args:"])
+                for arg in args:
+                    doc_lines.append(f"{doc_indent}    {arg}: Input used to compute the result.")
+            doc_lines.extend(["", f"{doc_indent}Returns:", f"{doc_indent}    {returns_hint}", f'{doc_indent}"""'])
+            return doc_lines
+
+        def has_upcoming_docstring(start_index: int, symbol_indent: int) -> bool:
+            for look_ahead in range(start_index + 1, len(lines)):
+                probe_raw = lines[look_ahead]
+                probe = probe_raw.strip()
                 if not probe:
                     continue
+                probe_indent = len(probe_raw) - len(probe_raw.lstrip())
+                if probe_indent <= symbol_indent and re.match(r"^(async\s+def|def|class)\s+", probe):
+                    return False
                 if probe.startswith("#"):
                     continue
                 return probe.startswith('"""') or probe.startswith("'''")
@@ -754,14 +1021,34 @@ async def _run_devflow_job(
             )
             if symbol_match:
                 indent, symbol_name = symbol_match.groups()
-                marker = f"{indent}# {symbol_name}: inline documentation for behavior and intent."
-                if previous_nonempty().strip() != marker.strip():
-                    out.append(marker)
+                symbol_indent = len(indent)
+                decorators = collect_decorators(idx)
+                body_lines = collect_symbol_body(idx, symbol_indent)
+                symbol_kind = "class" if re.match(r"^\s*class\s+", line) else "function"
+                marker = infer_symbol_comment(
+                    symbol_name=symbol_name,
+                    symbol_kind=symbol_kind,
+                    decorators=decorators,
+                    body_lines=body_lines,
+                )
+                comment_index = adjacent_comment_index()
+                if comment_index is None:
+                    out.append(f"{indent}# {marker}")
+                else:
+                    existing_comment = out[comment_index].strip().lower()
+                    if "inline documentation for behavior and intent" in existing_comment:
+                        out[comment_index] = f"{indent}# {marker}"
                 out.append(line)
-                if function_match and not has_upcoming_docstring(idx):
+                if function_match and not has_upcoming_docstring(idx, symbol_indent):
                     function_indent, function_name = function_match.groups()
-                    out.append(
-                        f'{function_indent}    """Describe the purpose, inputs, and outputs for {function_name}."""'
+                    out.extend(
+                        build_function_docstring(
+                            function_indent=function_indent,
+                            function_name=function_name,
+                            decorators=decorators,
+                            body_lines=body_lines,
+                            function_line=line,
+                        )
                     )
                 continue
             out.append(line)
@@ -792,6 +1079,69 @@ async def _run_devflow_job(
 
         language_label = target_language if target_language else "text"
         return f"```{language_label}\n{annotated_code.strip()}\n```"
+
+    def _normalize_git_notes(value: str) -> str:
+        text = str(value or "").strip()
+        section_labels = [
+            "Commit Title",
+            "Commit Body",
+            "Validation Checklist",
+            "Risk Notes",
+        ]
+        has_required_sections = all(
+            re.search(rf"(?im)^\s*(?:#+\s*)?{re.escape(label)}\s*:?", text) for label in section_labels
+        )
+        if has_required_sections:
+            normalized = text
+        else:
+            extracted_lines = [line.strip() for line in text.splitlines() if line.strip()]
+            commit_title = ""
+            for line in extracted_lines:
+                candidate = line.lstrip("-*# ").strip()
+                if candidate:
+                    commit_title = candidate.rstrip(".")
+                    break
+            if not commit_title:
+                commit_title = "add generated implementation from devflow run"
+            commit_title = commit_title[:72].strip() or "add generated implementation from devflow run"
+
+            commit_body_items: list[str] = []
+            for line in extracted_lines:
+                cleaned = line.lstrip("-*# ").strip()
+                if not cleaned or cleaned == commit_title:
+                    continue
+                commit_body_items.append(cleaned)
+                if len(commit_body_items) >= 5:
+                    break
+            if not commit_body_items:
+                commit_body_items = [
+                    "Implement generated solution scaffold and core logic.",
+                    "Align behavior with the original development request.",
+                ]
+
+            checklist_items = [
+                "Run lint and formatting checks for generated code.",
+                "Run test suite and verify expected pass state.",
+                "Smoke-test startup command and core endpoint behavior.",
+                "Review generated code for security and maintainability risks.",
+            ]
+            risk_items = [
+                "Generated output still requires manual engineering review before merge.",
+                "Dependency and runtime assumptions must be validated in target environment.",
+            ]
+            normalized = (
+                f"Commit Title: {commit_title}\n\n"
+                "Commit Body:\n"
+                + "\n".join([f"- {item}" for item in commit_body_items])
+                + "\n\nValidation Checklist:\n"
+                + "\n".join([f"- {item}" for item in checklist_items])
+                + "\n\nRisk Notes:\n"
+                + "\n".join([f"- {item}" for item in risk_items])
+            )
+
+        if len(normalized) > 2200:
+            normalized = f"{normalized[:2200].rstrip()}\n\n- [truncated]"
+        return normalized.strip()
 
     def round_bundle(label: str, mapping: dict[str, str]) -> str:
         lines = [f"{label}:"]
@@ -915,38 +1265,81 @@ async def _run_devflow_job(
             job.outputs["final_code"] = round3_model3
 
             trimmed_final_code = _trim_text(round3_model3, max_chars=max_doc_context_chars)
+            canonical_language, canonical_code = _extract_first_fenced_code_block(round3_model3)
+            canonical_code_text = canonical_code.strip() or round3_model3.strip() or "pass"
+            code_language = canonical_language or "python"
+            trimmed_inline_code = _trim_text(
+                canonical_code_text,
+                max_chars=devflow_config.doc_inline_max_input_chars,
+            )
+            trimmed_git_code = _trim_text(
+                canonical_code_text,
+                max_chars=devflow_config.doc_git_max_input_chars,
+            )
             trimmed_request = _trim_text(job.prompt, max_chars=1500)
             final_code_context = (
                 f"Final canonical code:\n{trimmed_final_code}\n\nOriginal request:\n{trimmed_request}"
             )
-            doc_inline, doc_inline_fallback = await run_role_with_fallback(
+            inline_doc_context = (
+                f"Canonical code to annotate:\n```{code_language}\n{trimmed_inline_code}\n```\n\n"
+                f"Original request:\n{trimmed_request}"
+            )
+            git_notes_context = (
+                f"Canonical code:\n```{code_language}\n{trimmed_git_code}\n```\n\n"
+                f"Original request:\n{trimmed_request}"
+            )
+            doc_escalation_model = job.role_models.get("code_model_3", job.selected_model)
+
+            doc_inline_raw, doc_inline_source, doc_inline_error = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_inline",
                 output_key="doc_inline",
                 status_message="Generating inline-documented code variant.",
                 role_prompt=(
-                    "Return ONLY a single fenced code block that preserves behavior while adding inline documentation. "
-                    "Requirements: add concise intent comments above key blocks, and ensure each function has a docstring "
-                    "describing purpose, inputs, and outputs. Do not include prose outside the code block.\n\n"
-                    f"{final_code_context}"
+                    "You are documenting existing code for maintainers. Preserve behavior exactly and return ONLY one fenced code block.\n"
+                    "Hard requirements:\n"
+                    "1) Keep runtime behavior unchanged (same endpoints, same port, same control flow).\n"
+                    "2) Add specific inline comments above non-obvious blocks using symbol-aware language.\n"
+                    "3) For every function/method, include a meaningful docstring with purpose and return value.\n"
+                    "4) Add an Args section when parameters exist.\n"
+                    "5) For FastAPI route handlers, explicitly mention HTTP method and route path in comment or docstring.\n"
+                    "6) Do not emit placeholder text such as 'inline documentation for behavior and intent'.\n"
+                    "7) Do not include prose outside the code block.\n"
+                    "Self-check before responding: no duplicate consecutive comment lines and no missing function docstrings.\n\n"
+                    f"{inline_doc_context}"
                 ),
                 retries=0,
+                escalate_model=doc_escalation_model,
+                escalate_enabled=True,
                 fallback_builder=lambda exc: _build_inline_documented_code(
                     round3_model3,
                     error_note=str(exc),
                 ),
             )
-            job.outputs["doc_inline_code"] = _build_inline_documented_code(doc_inline)
-            doc_git, doc_git_fallback = await run_role_with_fallback(
+            job.outputs["doc_inline_raw"] = doc_inline_raw
+            job.outputs["doc_inline_source"] = doc_inline_source
+            job.outputs["doc_inline_error"] = doc_inline_error
+            job.outputs["doc_inline_code"] = _normalize_model_inline_code(doc_inline_raw)
+
+            doc_git_raw, doc_git_source, doc_git_error = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_git",
                 output_key="doc_git",
                 status_message="Generating git notes.",
                 role_prompt=(
-                    "Generate concise git notes and commit summary for this generated code.\n\n"
-                    f"{final_code_context}"
+                    "Generate deterministic git notes for the generated code.\n"
+                    "Return markdown with exactly these sections and labels:\n"
+                    "Commit Title:\nCommit Body:\nValidation Checklist:\nRisk Notes:\n"
+                    "Constraints:\n"
+                    "- Commit title: single line, <=72 chars.\n"
+                    "- Commit body: 3-6 bullets.\n"
+                    "- Validation checklist: 4-8 bullets.\n"
+                    "- Risk notes: 2-4 bullets.\n\n"
+                    f"{git_notes_context}"
                 ),
                 retries=0,
+                escalate_model=doc_escalation_model,
+                escalate_enabled=True,
                 fallback_builder=lambda exc: (
                     "Git notes fallback (role failed):\n\n"
                     f"- Error: {str(exc)[:240]}\n"
@@ -955,7 +1348,12 @@ async def _run_devflow_job(
                     "- Validation notes: run local smoke test and endpoint checks before merge"
                 ),
             )
-            doc_release, doc_release_fallback = await run_role_with_fallback(
+            doc_git = _normalize_git_notes(doc_git_raw)
+            job.outputs["doc_git"] = doc_git
+            job.outputs["doc_git_source"] = doc_git_source
+            job.outputs["doc_git_error"] = doc_git_error
+
+            doc_release, doc_release_source, doc_release_error = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_release",
                 output_key="doc_release",
@@ -973,9 +1371,14 @@ async def _run_devflow_job(
                     "- Risks: generated code requires operator review before production rollout"
                 ),
             )
-            job.outputs["doc_inline_fallback_used"] = "true" if doc_inline_fallback else "false"
-            job.outputs["doc_git_fallback_used"] = "true" if doc_git_fallback else "false"
-            job.outputs["doc_release_fallback_used"] = "true" if doc_release_fallback else "false"
+            job.outputs["doc_release"] = doc_release
+            job.outputs["doc_release_source"] = doc_release_source
+            job.outputs["doc_release_error"] = doc_release_error
+            job.outputs["doc_inline_fallback_used"] = "true" if doc_inline_source == "fallback" else "false"
+            job.outputs["doc_git_fallback_used"] = "true" if doc_git_source == "fallback" else "false"
+            job.outputs["doc_release_fallback_used"] = (
+                "true" if doc_release_source == "fallback" else "false"
+            )
 
             job.status = "completed"
             job.stage = "completed"
@@ -984,15 +1387,7 @@ async def _run_devflow_job(
             job.updated_at = _utc_now_iso()
             job.finished_at = _utc_now_iso()
             code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
-            documentation = build_documentation_markdown(
-                prompt=job.prompt,
-                outputs={
-                    **job.outputs,
-                    "doc_inline": doc_inline,
-                    "doc_git": doc_git,
-                    "doc_release": doc_release,
-                },
-            )
+            documentation = build_documentation_markdown(prompt=job.prompt, outputs=job.outputs)
             artifacts = write_devflow_artifacts(
                 base_dir=devflow_config.artifact_dir,
                 job=job,

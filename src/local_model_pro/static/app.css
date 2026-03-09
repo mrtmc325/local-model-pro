@@ -770,6 +770,10 @@ a.tool-action {
   overflow: hidden;
 }
 
+.devflow-side-panel[hidden] {
+  display: none !important;
+}
+
 .devflow-side-panel h3 {
   margin: 0;
   font-size: 1.02rem;

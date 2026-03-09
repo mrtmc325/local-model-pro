@@ -49,6 +49,11 @@ class Settings:
     devflow_max_concurrent_jobs: int = int(os.getenv("DEVFLOW_MAX_CONCURRENT_JOBS", "1"))
     devflow_role_timeout_seconds: int = int(os.getenv("DEVFLOW_ROLE_TIMEOUT_SECONDS", "90"))
     devflow_run_retention: int = int(os.getenv("DEVFLOW_RUN_RETENTION", "30"))
+    devflow_doc_inline_max_input_chars: int = int(
+        os.getenv("DEVFLOW_DOC_INLINE_MAX_INPUT_CHARS", "5000")
+    )
+    devflow_doc_git_max_input_chars: int = int(os.getenv("DEVFLOW_DOC_GIT_MAX_INPUT_CHARS", "3500"))
+    devflow_doc_escalation_enabled: bool = _env_bool("DEVFLOW_DOC_ESCALATION_ENABLED", "true")
     devflow_artifact_dir: str = str(
         Path(
             os.getenv(

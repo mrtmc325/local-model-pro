@@ -274,11 +274,7 @@ function isMainDevflowModeEnabled() {
 }
 
 function syncMainDevflowPanelVisibility() {
-  const hasWorkflowData =
-    state.devflowStatus !== "idle" ||
-    state.devflowTimelineItems.length > 0 ||
-    Object.keys(state.devflowOutputsByKey).length > 0;
-  const shouldShow = isMainDevflowModeEnabled() || hasWorkflowData;
+  const shouldShow = isMainDevflowModeEnabled();
   if (devflowSidePanel) {
     devflowSidePanel.hidden = !shouldShow;
   }
@@ -581,17 +577,23 @@ function applyDevflowEvent(message) {
   const role = String(message.role || "");
   const stage = String(message.stage || "");
   const stageModel = String(message.model || "").trim();
+  const attemptPath = String(message.attempt_path || "").trim();
+  const attemptIndexRaw = Number(message.attempt_index || 0);
+  const attemptIndex = Number.isFinite(attemptIndexRaw) ? attemptIndexRaw : 0;
+  const attemptTag = attemptPath
+    ? ` [${attemptPath}${attemptIndex > 0 ? `#${attemptIndex}` : ""}]`
+    : "";
   if (message.type === "devflow_stage_result") {
     const outputKey = String(message.output_key || `${stage}.${role}` || "output");
     state.devflowOutputsByKey[outputKey] = String(message.output || "");
     renderDevflowOutputs();
     pushDevflowTimeline(
-      `${stage}/${role} completed${stageModel ? ` (model=${stageModel})` : ""}`
+      `${stage}/${role} completed${stageModel ? ` (model=${stageModel})` : ""}${attemptTag}`
     );
   } else {
     const timelineText = composedMessage || infoMessage;
     pushDevflowTimeline(
-      `${message.type}${role ? `/${role}` : ""}${timelineText ? `: ${timelineText}` : ""}`
+      `${message.type}${role ? `/${role}` : ""}${attemptTag}${timelineText ? `: ${timelineText}` : ""}`
     );
   }
   const downloadUrl = String(message.download_url || "");

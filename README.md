@@ -92,6 +92,9 @@ Environment variable overrides:
 - `DEVFLOW_MAX_CONCURRENT_JOBS` (default: `1`)
 - `DEVFLOW_ROLE_TIMEOUT_SECONDS` (default: `90`)
 - `DEVFLOW_RUN_RETENTION` (default: `30`)
+- `DEVFLOW_DOC_INLINE_MAX_INPUT_CHARS` (default: `5000`)
+- `DEVFLOW_DOC_GIT_MAX_INPUT_CHARS` (default: `3500`)
+- `DEVFLOW_DOC_ESCALATION_ENABLED` (default: `true`)
 - `DEVFLOW_ARTIFACT_DIR` (default: `<workspace_root>/data/devflow_runs`)
 
 Reasoning behavior:

@@ -175,6 +175,12 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
             [str(e.get("model")) for e in stage_results],
             expected_model_sequence,
         )
+        self.assertTrue(
+            all(int(e.get("attempt_index", 0)) >= 1 for e in stage_results),
+        )
+        self.assertTrue(
+            all(str(e.get("attempt_path", "")) in {"slot", "escalated", "fallback"} for e in stage_results),
+        )
         role_progress_events = [
             e for e in events if e.get("type") == "devflow_progress" and e.get("role")
         ]
@@ -208,7 +214,7 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
                 _ = (temperature, num_ctx, model)
                 prompt = str(messages[-1]["content"])
                 self.calls.append({"prompt": prompt})
-                if "Generate concise git notes and commit summary" in prompt:
+                if "Generate deterministic git notes for the generated code." in prompt:
                     raise TimeoutError("doc git timeout")
                 return f"ok-{len(self.calls)}"
 
@@ -229,7 +235,10 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(job.status, "completed")
         self.assertIn("doc_git", job.outputs)
-        self.assertIn("fallback", job.outputs["doc_git"].lower())
+        self.assertEqual(job.outputs.get("doc_git_source"), "fallback")
+        self.assertTrue(str(job.outputs.get("doc_git_error", "")).strip())
+        self.assertIn("Commit Title:", job.outputs["doc_git"])
+        self.assertIn("Commit Body:", job.outputs["doc_git"])
         fallback_events = [
             e
             for e in events
@@ -238,8 +247,123 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
             and e.get("status") == "fallback"
         ]
         self.assertTrue(fallback_events)
+        self.assertEqual(fallback_events[-1].get("attempt_path"), "fallback")
         done_events = [e for e in events if e.get("type") == "devflow_done"]
         self.assertTrue(done_events)
+
+    async def test_run_devflow_job_inline_role_success_uses_model_output_source(self) -> None:
+        class FakeOllama:
+            async def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                temperature: float,
+                num_ctx: int,
+            ) -> str:
+                _ = (model, temperature, num_ctx)
+                prompt = str(messages[-1]["content"])
+                if "Round 3 chain step 3" in prompt:
+                    return "```python\ndef generated():\n    return {'ok': True}\n```"
+                if "You are documenting existing code for maintainers." in prompt:
+                    return "```python\ndef root():\n    return {'ok': True}\n```"
+                if "Generate deterministic git notes for the generated code." in prompt:
+                    return (
+                        "Commit Title: add fastapi server\n\n"
+                        "Commit Body:\n- Add server entrypoint\n\n"
+                        "Validation Checklist:\n- Run tests\n\n"
+                        "Risk Notes:\n- Review generated code"
+                    )
+                return "ok"
+
+        job = DevflowJob(
+            job_id="job-runner-inline-role-success",
+            actor_id="actor",
+            prompt="Create a tiny FastAPI service.",
+            selected_model="qwen3:8b",
+            role_models={role: "qwen3:8b" for role in ROLE_ORDER},
+        )
+        events: list[dict[str, object]] = []
+
+        async def emit(payload: dict[str, object]) -> None:
+            events.append(payload)
+
+        await _run_devflow_job(job=job, ollama=FakeOllama(), emit_event=emit)
+
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.outputs.get("doc_inline_source"), "role")
+        inline_code = str(job.outputs.get("doc_inline_code", ""))
+        self.assertIn("```python", inline_code)
+        self.assertIn("def root()", inline_code)
+        self.assertNotIn("Inline documentation fallback", inline_code)
+        self.assertNotIn("inline documentation for behavior and intent", inline_code.lower())
+
+    async def test_run_devflow_job_doc_inline_escalates_to_code_model_3(self) -> None:
+        class FakeOllama:
+            async def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                temperature: float,
+                num_ctx: int,
+            ) -> str:
+                _ = (temperature, num_ctx)
+                prompt = str(messages[-1]["content"])
+                if "You are documenting existing code for maintainers." in prompt:
+                    if model == "doc-i":
+                        raise TimeoutError("doc inline slot timeout")
+                    if model == "code-3":
+                        return "```python\ndef root():\n    return {'ok': True}\n```"
+                if "Generate deterministic git notes for the generated code." in prompt:
+                    return (
+                        "Commit Title: add generated implementation\n\n"
+                        "Commit Body:\n- Add implementation\n\n"
+                        "Validation Checklist:\n- Run tests\n\n"
+                        "Risk Notes:\n- Review output"
+                    )
+                return "ok"
+
+        role_models = {
+            "intent_reasoner": "intent-r",
+            "intent_knowledge": "intent-k",
+            "intent_feasibility": "intent-f",
+            "code_model_1": "code-1",
+            "code_model_2": "code-2",
+            "code_model_3": "code-3",
+            "doc_inline": "doc-i",
+            "doc_git": "doc-g",
+            "doc_release": "doc-r",
+        }
+        job = DevflowJob(
+            job_id="job-runner-inline-escalated",
+            actor_id="actor",
+            prompt="Create a tiny FastAPI service.",
+            selected_model="fallback-model",
+            role_models=role_models,
+        )
+        events: list[dict[str, object]] = []
+
+        async def emit(payload: dict[str, object]) -> None:
+            events.append(payload)
+
+        await _run_devflow_job(job=job, ollama=FakeOllama(), emit_event=emit)
+
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.outputs.get("doc_inline_source"), "escalated")
+        self.assertTrue(str(job.outputs.get("doc_inline_error", "")).strip())
+
+        doc_inline_stage_events = [
+            e
+            for e in events
+            if e.get("type") == "devflow_stage_result"
+            and e.get("role") == "doc_inline"
+            and e.get("status") == "completed"
+        ]
+        self.assertTrue(doc_inline_stage_events)
+        self.assertEqual(doc_inline_stage_events[-1].get("model"), "code-3")
+        self.assertEqual(doc_inline_stage_events[-1].get("attempt_path"), "escalated")
+        self.assertEqual(doc_inline_stage_events[-1].get("attempt_index"), 2)
 
     async def test_run_devflow_job_inline_fallback_generates_commented_code_block(self) -> None:
         class FakeOllama:
@@ -253,7 +377,7 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
             ) -> str:
                 _ = (model, temperature, num_ctx)
                 prompt = str(messages[-1]["content"])
-                if "Return ONLY a single fenced code block" in prompt:
+                if "return ONLY one fenced code block" in prompt:
                     raise TimeoutError("inline doc timeout")
                 if "Round 3 chain step 3" in prompt:
                     return (
@@ -287,8 +411,9 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("```python", inline_code)
         self.assertIn("# root:", inline_code)
         self.assertIn("Inline documentation fallback", inline_code)
-        self.assertEqual(inline_code.count("# root: inline documentation for behavior and intent."), 1)
-        self.assertIn('"""Describe the purpose, inputs, and outputs for root."""', inline_code)
+        self.assertEqual(inline_code.count("# root:"), 1)
+        self.assertNotIn("inline documentation for behavior and intent", inline_code.lower())
+        self.assertIn('"""Handle GET / requests for this API endpoint.', inline_code)
 
 
 class DevflowWebSocketTests(unittest.TestCase):

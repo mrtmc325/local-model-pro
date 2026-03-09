@@ -58,6 +58,9 @@ class DevflowRuntimeConfig:
     role_timeout_seconds: int
     run_retention: int
     artifact_dir: Path
+    doc_inline_max_input_chars: int = 5000
+    doc_git_max_input_chars: int = 3500
+    doc_escalation_enabled: bool = True
     retry_count: int = 1
 
 
@@ -148,10 +151,32 @@ def build_documentation_markdown(
 ) -> str:
     inline_doc_code = outputs.get("doc_inline_code", "").strip() or outputs.get("doc_inline", "").strip()
     fallback_notes: list[str] = []
-    if outputs.get("doc_inline_fallback_used") == "true":
+    doc_inline_source = str(outputs.get("doc_inline_source", "")).strip()
+    doc_inline_error = str(outputs.get("doc_inline_error", "")).strip()
+    if doc_inline_source == "fallback":
+        fallback_notes.append("doc_inline used fallback annotator output after role failure.")
+    elif doc_inline_source == "escalated":
+        fallback_notes.append("doc_inline succeeded via escalation to code_model_3.")
+    elif doc_inline_source == "role":
+        fallback_notes.append("doc_inline succeeded on its assigned role model.")
+    elif outputs.get("doc_inline_fallback_used") == "true":
         fallback_notes.append("doc_inline used fallback annotator output due to role timeout/failure.")
-    if outputs.get("doc_git_fallback_used") == "true":
+    if doc_inline_error:
+        fallback_notes.append(f"doc_inline prior error: {doc_inline_error}")
+
+    doc_git_source = str(outputs.get("doc_git_source", "")).strip()
+    doc_git_error = str(outputs.get("doc_git_error", "")).strip()
+    if doc_git_source == "fallback":
+        fallback_notes.append("doc_git used fallback notes after role failure.")
+    elif doc_git_source == "escalated":
+        fallback_notes.append("doc_git succeeded via escalation to code_model_3.")
+    elif doc_git_source == "role":
+        fallback_notes.append("doc_git succeeded on its assigned role model.")
+    elif outputs.get("doc_git_fallback_used") == "true":
         fallback_notes.append("doc_git used fallback notes due to role timeout/failure.")
+    if doc_git_error:
+        fallback_notes.append(f"doc_git prior error: {doc_git_error}")
+
     if outputs.get("doc_release_fallback_used") == "true":
         fallback_notes.append("doc_release used fallback notes due to role timeout/failure.")
     inline_notes = (
