@@ -202,7 +202,7 @@
           <summary>Profile Settings</summary>
           <div class="drawer-tab-body">
             <div class="field-help">
-              Personal workspace preferences for this actor profile.
+              Browser CLI Pro style profile controls for interface, terminal, sessions/models, and security.
             </div>
             <div class="field">
               <span>Actor ID</span>
@@ -216,68 +216,240 @@
             </div>
             <div class="row">
               <button id="profileLoadBtn" class="tool-action" type="button">Load</button>
-              <button id="profileSaveBtn" class="tool-action" type="button">Save</button>
-              <button id="profileResetBtn" class="tool-action" type="button">Reset</button>
             </div>
             <div id="profileMeta" class="field-help">No profile loaded.</div>
 
-            <div class="field">
-              <span>Theme</span>
-              <select id="profileThemeSelect" aria-label="Profile theme">
-                <option value="aurora-dusk">Aurora Dusk</option>
-                <option value="graphite-ocean">Graphite Ocean</option>
-              </select>
-            </div>
+            <details class="profile-group" open>
+              <summary class="profile-group-summary">
+                <span>Interface</span>
+                <small>Theme, appearance, accessibility</small>
+              </summary>
+              <div class="profile-group-body">
+                <div class="field">
+                  <span>Theme</span>
+                  <select id="profileThemeSelect" aria-label="Profile theme">
+                    <option value="aurora-dusk">Aurora Dusk</option>
+                    <option value="graphite-ocean">Graphite Ocean</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <span>Density</span>
+                  <select id="profileDensitySelect" aria-label="Profile density">
+                    <option value="comfortable">Comfortable</option>
+                    <option value="compact">Compact</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <span>Font Scale</span>
+                  <input id="profileFontScaleInput" type="range" min="0.8" max="1.5" step="0.05" value="1.0" />
+                </div>
+                <div class="admin-grid">
+                  <label class="checkbox-field"><input id="profileReducedMotionInput" type="checkbox" /> <span>Reduced motion</span></label>
+                  <label class="checkbox-field"><input id="profileHighContrastInput" type="checkbox" /> <span>High contrast mode</span></label>
+                  <label class="checkbox-field"><input id="profileLargeTargetsInput" type="checkbox" /> <span>Large click targets</span></label>
+                  <label class="checkbox-field"><input id="profileFocusRingInput" type="checkbox" checked /> <span>Enhanced focus ring</span></label>
+                </div>
+              </div>
+            </details>
 
-            <div class="field">
-              <span>Density</span>
-              <select id="profileDensitySelect" aria-label="Profile density">
-                <option value="comfortable">Comfortable</option>
-                <option value="compact">Compact</option>
-              </select>
-            </div>
+            <details class="profile-group">
+              <summary class="profile-group-summary">
+                <span>Terminal</span>
+                <small>Behavior and export defaults</small>
+              </summary>
+              <div class="profile-group-body">
+                <div class="profile-grid profile-grid-terminal">
+                  <label class="field">
+                    <span>Font Family</span>
+                    <select id="profileTerminalFontFamilySelect" aria-label="Terminal font family">
+                      <option value="IBM Plex Mono" selected>IBM Plex Mono</option>
+                      <option value="JetBrains Mono">JetBrains Mono</option>
+                      <option value="Fira Code">Fira Code</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Font Size</span>
+                    <input id="profileTerminalFontSizeInput" type="number" min="10" max="24" value="14" />
+                  </label>
+                  <label class="field">
+                    <span>Cursor Style</span>
+                    <select id="profileTerminalCursorStyleSelect" aria-label="Terminal cursor style">
+                      <option value="block" selected>Block</option>
+                      <option value="bar">Bar</option>
+                      <option value="underline">Underline</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Scrollback Lines</span>
+                    <input id="profileTerminalScrollbackInput" type="number" min="0" value="0" />
+                  </label>
+                </div>
+                <div class="admin-grid">
+                  <label class="checkbox-field"><input id="profileTerminalCursorBlinkInput" type="checkbox" checked /> <span>Cursor blink</span></label>
+                  <label class="checkbox-field"><input id="profileTerminalCopyOnSelectInput" type="checkbox" /> <span>Copy on select</span></label>
+                  <label class="checkbox-field"><input id="profileTerminalPasteWarningInput" type="checkbox" checked /> <span>Paste warning</span></label>
+                  <label class="checkbox-field"><input id="profileTerminalBellInput" type="checkbox" /> <span>Bell enabled</span></label>
+                </div>
 
-            <div class="field">
-              <span>Font Scale</span>
-              <input id="profileFontScaleInput" type="range" min="0.8" max="1.5" step="0.05" value="1.0" />
-            </div>
+                <div class="profile-grid">
+                  <label class="field">
+                    <span>Export Format</span>
+                    <select id="profileExportFormatSelect" aria-label="Default export format">
+                      <option value="txt" selected>TXT</option>
+                      <option value="json">JSON</option>
+                      <option value="md">Markdown</option>
+                    </select>
+                  </label>
+                  <label class="field field-wide">
+                    <span>Filename Template</span>
+                    <input id="profileExportFilenameTemplateInput" type="text" value="{model}_{timestamp}" />
+                  </label>
+                </div>
+                <div class="admin-grid">
+                  <label class="checkbox-field"><input id="profileExportIncludeTimestampsInput" type="checkbox" checked /> <span>Include timestamps</span></label>
+                  <label class="checkbox-field"><input id="profileExportIncludeMetadataInput" type="checkbox" checked /> <span>Include session metadata</span></label>
+                </div>
+              </div>
+            </details>
 
-            <div class="field">
-              <span>Default Reasoning Mode</span>
-              <select id="profileReasoningSelect" aria-label="Profile default reasoning">
-                <option value="hidden">Hidden</option>
-                <option value="summary" selected>Summary</option>
-                <option value="full">Full</option>
-              </select>
-            </div>
+            <details class="profile-group">
+              <summary class="profile-group-summary">
+                <span>Sessions and Models</span>
+                <small>Session defaults and model behavior</small>
+              </summary>
+              <div class="profile-group-body">
+                <div class="profile-grid">
+                  <label class="field">
+                    <span>Default Reasoning Mode</span>
+                    <select id="profileReasoningSelect" aria-label="Profile default reasoning">
+                      <option value="hidden">Hidden</option>
+                      <option value="summary" selected>Summary</option>
+                      <option value="full">Full</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Send Shortcut</span>
+                    <select id="profileSendShortcutSelect" aria-label="Profile send shortcut">
+                      <option value="enter" selected>Enter to send</option>
+                      <option value="ctrl_enter">Ctrl/Cmd+Enter to send</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Default Context Window</span>
+                    <input id="profileDefaultNumCtxInput" type="number" min="512" max="32768" step="128" value="4096" />
+                  </label>
+                  <label class="field">
+                    <span>Default Temperature</span>
+                    <input id="profileDefaultTemperatureInput" type="number" min="0" max="2" step="0.05" value="0.2" />
+                  </label>
+                  <label class="field">
+                    <span>Startup View</span>
+                    <select id="profileStartupViewSelect" aria-label="Startup view">
+                      <option value="models" selected>Models</option>
+                      <option value="chat">Chat</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Tab Restore Policy</span>
+                    <select id="profileTabRestorePolicySelect" aria-label="Tab restore policy">
+                      <option value="none" selected>None</option>
+                      <option value="last">Last</option>
+                      <option value="all">All</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="admin-grid">
+                  <label class="checkbox-field"><input id="profileAutoFocusTerminalInput" type="checkbox" checked /> <span>Auto-focus terminal</span></label>
+                </div>
+                <div class="field">
+                  <span>Default System Prompt</span>
+                  <textarea
+                    id="profileSystemPromptInput"
+                    rows="4"
+                    placeholder="Optional default prompt for new sessions"
+                  ></textarea>
+                </div>
+              </div>
+            </details>
 
-            <div class="field">
-              <span>Send Shortcut</span>
-              <select id="profileSendShortcutSelect" aria-label="Profile send shortcut">
-                <option value="enter" selected>Enter to send</option>
-                <option value="ctrl_enter">Ctrl/Cmd+Enter to send</option>
-              </select>
-            </div>
+            <details class="profile-group">
+              <summary class="profile-group-summary">
+                <span>Security, Audit, and Account</span>
+                <small>Policy, notifications, identity</small>
+              </summary>
+              <div class="profile-group-body">
+                <div class="profile-grid">
+                  <label class="field">
+                    <span>Idle Timeout (minutes)</span>
+                    <input id="profileIdleTimeoutInput" type="number" min="1" max="480" value="30" />
+                  </label>
+                  <label class="field">
+                    <span>Reauth TTL (minutes)</span>
+                    <input id="profileReauthTtlInput" type="number" min="1" max="240" value="10" />
+                  </label>
+                  <label class="field">
+                    <span>Audit Timezone</span>
+                    <input id="profileAuditTimezoneInput" type="text" value="UTC" />
+                  </label>
+                  <label class="field">
+                    <span>Audit Date Format</span>
+                    <select id="profileAuditDatetimeFormatSelect" aria-label="Audit date format">
+                      <option value="locale" selected>Locale</option>
+                      <option value="iso">ISO</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Default Audit Limit</span>
+                    <input id="profileAuditDefaultLimitInput" type="number" min="1" max="1000" value="100" />
+                  </label>
+                  <label class="field">
+                    <span>Toast Level</span>
+                    <select id="profileToastLevelSelect" aria-label="Toast level">
+                      <option value="all" selected>All</option>
+                      <option value="errors_only">Errors only</option>
+                      <option value="none">None</option>
+                    </select>
+                  </label>
+                </div>
 
-            <label class="field checkbox-field">
-              <input id="profileTerminalConfirmInput" type="checkbox" checked />
-              <span>Require preview before /run! execution</span>
-            </label>
-            <label class="field checkbox-field">
-              <input id="profileSystemMessagesInput" type="checkbox" checked />
-              <span>Show system status messages in chat</span>
-            </label>
-            <label class="field checkbox-field">
-              <input id="profileVerboseErrorsInput" type="checkbox" />
-              <span>Verbose errors in UI notifications</span>
-            </label>
-            <div class="field">
-              <span>Default System Prompt</span>
-              <textarea
-                id="profileSystemPromptInput"
-                rows="4"
-                placeholder="Optional default prompt for new sessions"
-              ></textarea>
+                <div class="admin-grid">
+                  <label class="checkbox-field"><input id="profileAutoLockOnBlurInput" type="checkbox" /> <span>Auto lock on blur</span></label>
+                  <label class="checkbox-field"><input id="profileDestructiveReauthInput" type="checkbox" checked /> <span>Require reauth for destructive actions</span></label>
+                  <label class="checkbox-field"><input id="profileMaskSensitiveCommandsInput" type="checkbox" checked /> <span>Mask sensitive commands</span></label>
+                  <label class="checkbox-field"><input id="profileTerminalConfirmInput" type="checkbox" checked /> <span>Require preview before /run! execution</span></label>
+                  <label class="checkbox-field"><input id="profileShowConnectEventsInput" type="checkbox" checked /> <span>Show connect events</span></label>
+                  <label class="checkbox-field"><input id="profileShowDisconnectEventsInput" type="checkbox" checked /> <span>Show disconnect events</span></label>
+                  <label class="checkbox-field"><input id="profileSystemMessagesInput" type="checkbox" checked /> <span>Show system status messages</span></label>
+                  <label class="checkbox-field"><input id="profileVerboseErrorsInput" type="checkbox" /> <span>Verbose error details</span></label>
+                </div>
+
+                <div class="profile-grid">
+                  <label class="field">
+                    <span>Display Name</span>
+                    <input id="profileDisplayNameInput" type="text" placeholder="optional display name" />
+                  </label>
+                  <label class="field">
+                    <span>Email</span>
+                    <input id="profileEmailInput" type="email" placeholder="optional email" />
+                  </label>
+                </div>
+              </div>
+            </details>
+
+            <input
+              id="profileImportInput"
+              class="visually-hidden-input"
+              type="file"
+              accept=".json,application/json"
+            />
+            <div class="profile-utility-actions">
+              <button id="profileExportBtn" class="tool-action" type="button">Export Settings</button>
+              <button id="profileImportBtn" class="tool-action" type="button">Import Settings</button>
+            </div>
+            <div class="row">
+              <button id="profileResetBtn" class="tool-action danger" type="button">Reset Preferences</button>
+              <button id="profileCloseBtn" class="tool-action secondary" type="button">Close</button>
+              <button id="profileApplyBtn" class="tool-action" type="button">Apply</button>
             </div>
           </div>
         </details>
@@ -339,6 +511,9 @@
             <div class="field">
               <span>Recent Admin Events</span>
               <div id="adminEventsList" class="admin-events-list"></div>
+            </div>
+            <div class="row">
+              <button id="adminCloseBtn" class="tool-action secondary" type="button">Close</button>
             </div>
           </div>
         </details>

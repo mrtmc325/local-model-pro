@@ -387,6 +387,49 @@ class ServerChatTests(unittest.TestCase):
         self.assertIn("Tool error:", text)
         self.assertIn("disabled", text)
 
+    def test_profile_sessions_models_defaults_apply_to_generation(self) -> None:
+        client = TestClient(app)
+        patch = client.patch(
+            "/api/v1/profile/preferences",
+            json={
+                "actor_id": "anonymous",
+                "patch": {
+                    "sessions_models": {
+                        "default_num_ctx": 8192,
+                        "default_temperature": 0.55,
+                        "startup_view": "models",
+                        "tab_restore_policy": "none",
+                        "auto_focus_terminal": True,
+                    }
+                },
+            },
+        )
+        self.assertEqual(patch.status_code, 200)
+
+        seen: list[tuple[float, int]] = []
+
+        async def fake_stream_chat(
+            _self: object,
+            *,
+            model: str,
+            messages: list[dict[str, str]],
+            temperature: float,
+            num_ctx: int,
+            think: bool | str | None = None,
+        ):
+            _ = (model, messages, think)
+            seen.append((temperature, num_ctx))
+            yield "ok"
+
+        with mock.patch("local_model_pro.server.OllamaClient.stream_chat", new=fake_stream_chat):
+            with client.websocket_connect("/ws/chat") as ws:
+                self._consume_until_ready(ws)
+                self._run_turn(ws, "hello")
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 0.55)
+        self.assertEqual(seen[0][1], 8192)
+
 
 if __name__ == "__main__":
     unittest.main()

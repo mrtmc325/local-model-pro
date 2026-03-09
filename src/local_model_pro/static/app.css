@@ -45,6 +45,32 @@ body.density-compact .row {
   gap: 0.38rem;
 }
 
+body.accessibility-high-contrast {
+  --text: #f4fbff;
+  --muted: #d0deea;
+  --card-border: rgba(184, 223, 248, 0.5);
+  --border-subtle: rgba(188, 223, 245, 0.45);
+}
+
+body.accessibility-large-targets button,
+body.accessibility-large-targets select,
+body.accessibility-large-targets input,
+body.accessibility-large-targets textarea {
+  min-height: 2.6rem;
+}
+
+body.accessibility-focus-ring *:focus-visible {
+  outline: 2px solid rgba(151, 222, 255, 0.9);
+  outline-offset: 2px;
+}
+
+body.accessibility-reduced-motion *,
+body.accessibility-reduced-motion *::before,
+body.accessibility-reduced-motion *::after {
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -471,6 +497,11 @@ button:disabled {
   font-size: 0.84rem;
 }
 
+.tool-action.secondary {
+  background: var(--button-secondary-bg);
+  border-color: var(--border-strong);
+}
+
 .tool-action.danger {
   background: linear-gradient(120deg, #7c3045, #8c4638);
 }
@@ -526,6 +557,72 @@ button:disabled {
 
 .store-result-link:hover {
   text-decoration: underline;
+}
+
+.profile-group {
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.62rem;
+  background: rgba(10, 22, 34, 0.72);
+  overflow: hidden;
+}
+
+.profile-group + .profile-group {
+  margin-top: 0.5rem;
+}
+
+.profile-group-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: center;
+  cursor: pointer;
+  list-style: none;
+  padding: 0.52rem 0.62rem;
+  font-size: 0.86rem;
+}
+
+.profile-group-summary small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.profile-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.profile-group-body {
+  border-top: 1px solid var(--border-subtle);
+  padding: 0.58rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.42rem;
+}
+
+.profile-grid-terminal {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field-wide {
+  grid-column: 1 / -1;
+}
+
+.profile-utility-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.visually-hidden-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .admin-grid {
@@ -697,6 +794,11 @@ button:disabled {
 
   .admin-user-controls {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .profile-grid,
+  .profile-grid-terminal {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

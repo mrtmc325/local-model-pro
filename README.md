@@ -19,8 +19,13 @@ Local chat server and browser/terminal clients for Ollama models, with optional 
   - open store search pages from frontend
   - optional API search against supported stores
 - Profile settings API + UI:
-  - per-actor preferences (theme, density, font scale, default reasoning mode, send shortcut)
+  - per-actor preferences across Browser CLI Pro style sections:
+    - Interface
+    - Terminal
+    - Sessions and Models
+    - Security, Audit, and Account
   - default system prompt for new sessions
+  - settings Export/Import, Reset Preferences, Apply, and Close controls
 - Admin settings API + UI:
   - runtime platform policy toggles (pull/delete/tools/readonly)
   - lightweight local admin user registry

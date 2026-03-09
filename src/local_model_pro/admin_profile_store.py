@@ -21,6 +21,58 @@ def _default_preferences() -> dict[str, dict[str, Any]]:
             "density": "comfortable",
             "font_scale": 1.0,
         },
+        "accessibility": {
+            "reduced_motion": False,
+            "high_contrast_mode": False,
+            "large_click_targets": False,
+            "enhanced_focus_ring": True,
+        },
+        "terminal": {
+            "font_family": "IBM Plex Mono",
+            "font_size": 14,
+            "cursor_style": "block",
+            "cursor_blink": True,
+            "copy_on_select": False,
+            "paste_warning": True,
+            "bell_enabled": False,
+            "scrollback_lines": 0,
+        },
+        "sessions_models": {
+            "default_num_ctx": 4096,
+            "default_temperature": 0.2,
+            "startup_view": "models",
+            "tab_restore_policy": "none",
+            "auto_focus_terminal": True,
+        },
+        "security": {
+            "idle_timeout_minutes": 30,
+            "auto_lock_on_blur": False,
+            "destructive_reauth_enabled": True,
+            "destructive_reauth_ttl_minutes": 10,
+        },
+        "audit": {
+            "timezone": "UTC",
+            "datetime_format": "locale",
+            "default_limit": 100,
+            "mask_sensitive_commands": True,
+        },
+        "notifications": {
+            "toast_level": "all",
+            "show_connect_events": True,
+            "show_disconnect_events": True,
+            "verbose_error_details": False,
+            "show_system_messages": True,
+        },
+        "export": {
+            "default_format": "txt",
+            "filename_template": "{model}_{timestamp}",
+            "include_timestamps": True,
+            "include_session_metadata": True,
+        },
+        "account": {
+            "display_name": "",
+            "email": "",
+        },
         "chat": {
             "reasoning_mode_default": "summary",
             "system_prompt": "",
@@ -29,10 +81,6 @@ def _default_preferences() -> dict[str, dict[str, Any]]:
         "tools": {
             "terminal_require_confirm": True,
             "show_tool_tips": True,
-        },
-        "notifications": {
-            "show_system_messages": True,
-            "verbose_errors": False,
         },
     }
 
@@ -454,6 +502,101 @@ class AdminProfileStore:
         if not isinstance(font_scale, (int, float)) or not (0.8 <= float(font_scale) <= 1.5):
             raise PreferenceValidationError("appearance.font_scale must be between 0.8 and 1.5")
 
+        accessibility = preferences["accessibility"]
+        for key in (
+            "reduced_motion",
+            "high_contrast_mode",
+            "large_click_targets",
+            "enhanced_focus_ring",
+        ):
+            if not isinstance(accessibility.get(key), bool):
+                raise PreferenceValidationError(f"accessibility.{key} must be boolean")
+
+        terminal = preferences["terminal"]
+        if terminal.get("font_family") not in {"IBM Plex Mono", "JetBrains Mono", "Fira Code"}:
+            raise PreferenceValidationError("terminal.font_family is invalid")
+        font_size = terminal.get("font_size")
+        if not isinstance(font_size, int) or not (10 <= font_size <= 24):
+            raise PreferenceValidationError("terminal.font_size must be an integer between 10 and 24")
+        if terminal.get("cursor_style") not in {"block", "bar", "underline"}:
+            raise PreferenceValidationError("terminal.cursor_style is invalid")
+        for key in ("cursor_blink", "copy_on_select", "paste_warning", "bell_enabled"):
+            if not isinstance(terminal.get(key), bool):
+                raise PreferenceValidationError(f"terminal.{key} must be boolean")
+        scrollback_lines = terminal.get("scrollback_lines")
+        if not isinstance(scrollback_lines, int) or not (0 <= scrollback_lines <= 500000):
+            raise PreferenceValidationError("terminal.scrollback_lines must be an integer between 0 and 500000")
+
+        sessions_models = preferences["sessions_models"]
+        default_num_ctx = sessions_models.get("default_num_ctx")
+        if not isinstance(default_num_ctx, int) or not (512 <= default_num_ctx <= 32768):
+            raise PreferenceValidationError("sessions_models.default_num_ctx must be an integer between 512 and 32768")
+        default_temperature = sessions_models.get("default_temperature")
+        if not isinstance(default_temperature, (int, float)) or not (0 <= float(default_temperature) <= 2):
+            raise PreferenceValidationError("sessions_models.default_temperature must be between 0 and 2")
+        if sessions_models.get("startup_view") not in {"models", "chat"}:
+            raise PreferenceValidationError("sessions_models.startup_view is invalid")
+        if sessions_models.get("tab_restore_policy") not in {"none", "last", "all"}:
+            raise PreferenceValidationError("sessions_models.tab_restore_policy is invalid")
+        if not isinstance(sessions_models.get("auto_focus_terminal"), bool):
+            raise PreferenceValidationError("sessions_models.auto_focus_terminal must be boolean")
+
+        security = preferences["security"]
+        idle_timeout = security.get("idle_timeout_minutes")
+        if not isinstance(idle_timeout, int) or not (1 <= idle_timeout <= 480):
+            raise PreferenceValidationError("security.idle_timeout_minutes must be between 1 and 480")
+        if not isinstance(security.get("auto_lock_on_blur"), bool):
+            raise PreferenceValidationError("security.auto_lock_on_blur must be boolean")
+        if not isinstance(security.get("destructive_reauth_enabled"), bool):
+            raise PreferenceValidationError("security.destructive_reauth_enabled must be boolean")
+        ttl = security.get("destructive_reauth_ttl_minutes")
+        if not isinstance(ttl, int) or not (1 <= ttl <= 240):
+            raise PreferenceValidationError(
+                "security.destructive_reauth_ttl_minutes must be between 1 and 240"
+            )
+
+        audit = preferences["audit"]
+        timezone = audit.get("timezone")
+        if not isinstance(timezone, str) or not timezone.strip() or len(timezone) > 80:
+            raise PreferenceValidationError("audit.timezone must be a non-empty string <= 80 chars")
+        if audit.get("datetime_format") not in {"locale", "iso"}:
+            raise PreferenceValidationError("audit.datetime_format is invalid")
+        default_limit = audit.get("default_limit")
+        if not isinstance(default_limit, int) or not (1 <= default_limit <= 1000):
+            raise PreferenceValidationError("audit.default_limit must be between 1 and 1000")
+        if not isinstance(audit.get("mask_sensitive_commands"), bool):
+            raise PreferenceValidationError("audit.mask_sensitive_commands must be boolean")
+
+        notifications = preferences["notifications"]
+        if not isinstance(notifications.get("show_system_messages"), bool):
+            raise PreferenceValidationError("notifications.show_system_messages must be boolean")
+        if notifications.get("toast_level") not in {"all", "errors_only", "none"}:
+            raise PreferenceValidationError("notifications.toast_level is invalid")
+        for key in ("show_connect_events", "show_disconnect_events", "verbose_error_details"):
+            if not isinstance(notifications.get(key), bool):
+                raise PreferenceValidationError(f"notifications.{key} must be boolean")
+
+        export = preferences["export"]
+        if export.get("default_format") not in {"txt", "json", "md"}:
+            raise PreferenceValidationError("export.default_format is invalid")
+        filename_template = export.get("filename_template")
+        if not isinstance(filename_template, str) or not filename_template.strip() or len(filename_template) > 120:
+            raise PreferenceValidationError("export.filename_template must be a non-empty string <= 120 chars")
+        if not isinstance(export.get("include_timestamps"), bool):
+            raise PreferenceValidationError("export.include_timestamps must be boolean")
+        if not isinstance(export.get("include_session_metadata"), bool):
+            raise PreferenceValidationError("export.include_session_metadata must be boolean")
+
+        account = preferences["account"]
+        display_name = account.get("display_name")
+        if not isinstance(display_name, str) or len(display_name) > 80:
+            raise PreferenceValidationError("account.display_name must be a string <= 80 chars")
+        email = account.get("email")
+        if not isinstance(email, str) or len(email) > 120:
+            raise PreferenceValidationError("account.email must be a string <= 120 chars")
+        if email and "@" not in email:
+            raise PreferenceValidationError("account.email must be valid or empty")
+
         chat = preferences["chat"]
         if chat.get("reasoning_mode_default") not in {"hidden", "summary", "full"}:
             raise PreferenceValidationError("chat.reasoning_mode_default is invalid")
@@ -468,12 +611,6 @@ class AdminProfileStore:
             raise PreferenceValidationError("tools.terminal_require_confirm must be boolean")
         if not isinstance(tools.get("show_tool_tips"), bool):
             raise PreferenceValidationError("tools.show_tool_tips must be boolean")
-
-        notifications = preferences["notifications"]
-        if not isinstance(notifications.get("show_system_messages"), bool):
-            raise PreferenceValidationError("notifications.show_system_messages must be boolean")
-        if not isinstance(notifications.get("verbose_errors"), bool):
-            raise PreferenceValidationError("notifications.verbose_errors must be boolean")
 
     def _apply_preference_patch(
         self,

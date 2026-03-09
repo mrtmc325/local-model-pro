@@ -43,21 +43,60 @@ const toolRunPreviewBtn = document.getElementById("toolRunPreviewBtn");
 const toolRunExecBtn = document.getElementById("toolRunExecBtn");
 const profileActorInput = document.getElementById("profileActorInput");
 const profileLoadBtn = document.getElementById("profileLoadBtn");
-const profileSaveBtn = document.getElementById("profileSaveBtn");
+const profileApplyBtn = document.getElementById("profileApplyBtn");
 const profileResetBtn = document.getElementById("profileResetBtn");
+const profileCloseBtn = document.getElementById("profileCloseBtn");
+const profileExportBtn = document.getElementById("profileExportBtn");
+const profileImportBtn = document.getElementById("profileImportBtn");
+const profileImportInput = document.getElementById("profileImportInput");
 const profileMeta = document.getElementById("profileMeta");
 const profileThemeSelect = document.getElementById("profileThemeSelect");
 const profileDensitySelect = document.getElementById("profileDensitySelect");
 const profileFontScaleInput = document.getElementById("profileFontScaleInput");
+const profileReducedMotionInput = document.getElementById("profileReducedMotionInput");
+const profileHighContrastInput = document.getElementById("profileHighContrastInput");
+const profileLargeTargetsInput = document.getElementById("profileLargeTargetsInput");
+const profileFocusRingInput = document.getElementById("profileFocusRingInput");
+const profileTerminalFontFamilySelect = document.getElementById("profileTerminalFontFamilySelect");
+const profileTerminalFontSizeInput = document.getElementById("profileTerminalFontSizeInput");
+const profileTerminalCursorStyleSelect = document.getElementById("profileTerminalCursorStyleSelect");
+const profileTerminalScrollbackInput = document.getElementById("profileTerminalScrollbackInput");
+const profileTerminalCursorBlinkInput = document.getElementById("profileTerminalCursorBlinkInput");
+const profileTerminalCopyOnSelectInput = document.getElementById("profileTerminalCopyOnSelectInput");
+const profileTerminalPasteWarningInput = document.getElementById("profileTerminalPasteWarningInput");
+const profileTerminalBellInput = document.getElementById("profileTerminalBellInput");
+const profileExportFormatSelect = document.getElementById("profileExportFormatSelect");
+const profileExportFilenameTemplateInput = document.getElementById("profileExportFilenameTemplateInput");
+const profileExportIncludeTimestampsInput = document.getElementById("profileExportIncludeTimestampsInput");
+const profileExportIncludeMetadataInput = document.getElementById("profileExportIncludeMetadataInput");
 const profileReasoningSelect = document.getElementById("profileReasoningSelect");
 const profileSendShortcutSelect = document.getElementById("profileSendShortcutSelect");
+const profileDefaultNumCtxInput = document.getElementById("profileDefaultNumCtxInput");
+const profileDefaultTemperatureInput = document.getElementById("profileDefaultTemperatureInput");
+const profileStartupViewSelect = document.getElementById("profileStartupViewSelect");
+const profileTabRestorePolicySelect = document.getElementById("profileTabRestorePolicySelect");
+const profileAutoFocusTerminalInput = document.getElementById("profileAutoFocusTerminalInput");
 const profileTerminalConfirmInput = document.getElementById("profileTerminalConfirmInput");
+const profileIdleTimeoutInput = document.getElementById("profileIdleTimeoutInput");
+const profileReauthTtlInput = document.getElementById("profileReauthTtlInput");
+const profileAutoLockOnBlurInput = document.getElementById("profileAutoLockOnBlurInput");
+const profileDestructiveReauthInput = document.getElementById("profileDestructiveReauthInput");
+const profileAuditTimezoneInput = document.getElementById("profileAuditTimezoneInput");
+const profileAuditDatetimeFormatSelect = document.getElementById("profileAuditDatetimeFormatSelect");
+const profileAuditDefaultLimitInput = document.getElementById("profileAuditDefaultLimitInput");
+const profileMaskSensitiveCommandsInput = document.getElementById("profileMaskSensitiveCommandsInput");
+const profileToastLevelSelect = document.getElementById("profileToastLevelSelect");
+const profileShowConnectEventsInput = document.getElementById("profileShowConnectEventsInput");
+const profileShowDisconnectEventsInput = document.getElementById("profileShowDisconnectEventsInput");
 const profileSystemMessagesInput = document.getElementById("profileSystemMessagesInput");
 const profileVerboseErrorsInput = document.getElementById("profileVerboseErrorsInput");
+const profileDisplayNameInput = document.getElementById("profileDisplayNameInput");
+const profileEmailInput = document.getElementById("profileEmailInput");
 const profileSystemPromptInput = document.getElementById("profileSystemPromptInput");
 const adminTokenInput = document.getElementById("adminTokenInput");
 const adminLoadBtn = document.getElementById("adminLoadBtn");
 const adminRefreshEventsBtn = document.getElementById("adminRefreshEventsBtn");
+const adminCloseBtn = document.getElementById("adminCloseBtn");
 const adminSavePlatformBtn = document.getElementById("adminSavePlatformBtn");
 const adminCreateUsernameInput = document.getElementById("adminCreateUsernameInput");
 const adminCreateRoleSelect = document.getElementById("adminCreateRoleSelect");
@@ -185,18 +224,66 @@ function profilePayloadFromForm() {
       density: String(profileDensitySelect?.value || "comfortable"),
       font_scale: Number(profileFontScaleInput?.value || 1),
     },
+    accessibility: {
+      reduced_motion: Boolean(profileReducedMotionInput?.checked),
+      high_contrast_mode: Boolean(profileHighContrastInput?.checked),
+      large_click_targets: Boolean(profileLargeTargetsInput?.checked),
+      enhanced_focus_ring: Boolean(profileFocusRingInput?.checked),
+    },
+    terminal: {
+      font_family: String(profileTerminalFontFamilySelect?.value || "IBM Plex Mono"),
+      font_size: Number(profileTerminalFontSizeInput?.value || 14),
+      cursor_style: String(profileTerminalCursorStyleSelect?.value || "block"),
+      cursor_blink: Boolean(profileTerminalCursorBlinkInput?.checked),
+      copy_on_select: Boolean(profileTerminalCopyOnSelectInput?.checked),
+      paste_warning: Boolean(profileTerminalPasteWarningInput?.checked),
+      bell_enabled: Boolean(profileTerminalBellInput?.checked),
+      scrollback_lines: Number(profileTerminalScrollbackInput?.value || 0),
+    },
+    sessions_models: {
+      default_num_ctx: Number(profileDefaultNumCtxInput?.value || 4096),
+      default_temperature: Number(profileDefaultTemperatureInput?.value || 0.2),
+      startup_view: String(profileStartupViewSelect?.value || "models"),
+      tab_restore_policy: String(profileTabRestorePolicySelect?.value || "none"),
+      auto_focus_terminal: Boolean(profileAutoFocusTerminalInput?.checked),
+    },
+    security: {
+      idle_timeout_minutes: Number(profileIdleTimeoutInput?.value || 30),
+      auto_lock_on_blur: Boolean(profileAutoLockOnBlurInput?.checked),
+      destructive_reauth_enabled: Boolean(profileDestructiveReauthInput?.checked),
+      destructive_reauth_ttl_minutes: Number(profileReauthTtlInput?.value || 10),
+    },
+    audit: {
+      timezone: String(profileAuditTimezoneInput?.value || "UTC"),
+      datetime_format: String(profileAuditDatetimeFormatSelect?.value || "locale"),
+      default_limit: Number(profileAuditDefaultLimitInput?.value || 100),
+      mask_sensitive_commands: Boolean(profileMaskSensitiveCommandsInput?.checked),
+    },
     chat: {
       reasoning_mode_default: String(profileReasoningSelect?.value || "summary"),
       system_prompt: String(profileSystemPromptInput?.value || ""),
       send_shortcut: String(profileSendShortcutSelect?.value || "enter"),
+    },
+    export: {
+      default_format: String(profileExportFormatSelect?.value || "txt"),
+      filename_template: String(profileExportFilenameTemplateInput?.value || "{model}_{timestamp}"),
+      include_timestamps: Boolean(profileExportIncludeTimestampsInput?.checked),
+      include_session_metadata: Boolean(profileExportIncludeMetadataInput?.checked),
+    },
+    account: {
+      display_name: String(profileDisplayNameInput?.value || ""),
+      email: String(profileEmailInput?.value || ""),
     },
     tools: {
       terminal_require_confirm: Boolean(profileTerminalConfirmInput?.checked),
       show_tool_tips: true,
     },
     notifications: {
+      toast_level: String(profileToastLevelSelect?.value || "all"),
+      show_connect_events: Boolean(profileShowConnectEventsInput?.checked),
+      show_disconnect_events: Boolean(profileShowDisconnectEventsInput?.checked),
+      verbose_error_details: Boolean(profileVerboseErrorsInput?.checked),
       show_system_messages: Boolean(profileSystemMessagesInput?.checked),
-      verbose_errors: Boolean(profileVerboseErrorsInput?.checked),
     },
   };
 }
@@ -204,7 +291,14 @@ function profilePayloadFromForm() {
 function applyProfilePreferences(preferences, { updateControls = true } = {}) {
   const payload = preferences || {};
   const appearance = payload.appearance || {};
+  const accessibility = payload.accessibility || {};
+  const terminal = payload.terminal || {};
+  const sessionsModels = payload.sessions_models || {};
+  const security = payload.security || {};
+  const audit = payload.audit || {};
   const chat = payload.chat || {};
+  const exportDefaults = payload.export || {};
+  const account = payload.account || {};
   const tools = payload.tools || {};
   const notifications = payload.notifications || {};
 
@@ -217,6 +311,10 @@ function applyProfilePreferences(preferences, { updateControls = true } = {}) {
   }
 
   document.body.classList.toggle("density-compact", String(appearance.density || "comfortable") === "compact");
+  document.body.classList.toggle("accessibility-reduced-motion", Boolean(accessibility.reduced_motion));
+  document.body.classList.toggle("accessibility-high-contrast", Boolean(accessibility.high_contrast_mode));
+  document.body.classList.toggle("accessibility-large-targets", Boolean(accessibility.large_click_targets));
+  document.body.classList.toggle("accessibility-focus-ring", Boolean(accessibility.enhanced_focus_ring));
 
   if (updateControls) {
     if (profileThemeSelect) {
@@ -228,11 +326,112 @@ function applyProfilePreferences(preferences, { updateControls = true } = {}) {
     if (profileFontScaleInput) {
       profileFontScaleInput.value = String(fontScale || 1);
     }
+    if (profileReducedMotionInput) {
+      profileReducedMotionInput.checked = Boolean(accessibility.reduced_motion);
+    }
+    if (profileHighContrastInput) {
+      profileHighContrastInput.checked = Boolean(accessibility.high_contrast_mode);
+    }
+    if (profileLargeTargetsInput) {
+      profileLargeTargetsInput.checked = Boolean(accessibility.large_click_targets);
+    }
+    if (profileFocusRingInput) {
+      profileFocusRingInput.checked = Boolean(accessibility.enhanced_focus_ring);
+    }
+
+    if (profileTerminalFontFamilySelect) {
+      profileTerminalFontFamilySelect.value = String(terminal.font_family || "IBM Plex Mono");
+    }
+    if (profileTerminalFontSizeInput) {
+      profileTerminalFontSizeInput.value = String(Number(terminal.font_size || 14));
+    }
+    if (profileTerminalCursorStyleSelect) {
+      profileTerminalCursorStyleSelect.value = String(terminal.cursor_style || "block");
+    }
+    if (profileTerminalScrollbackInput) {
+      profileTerminalScrollbackInput.value = String(Number(terminal.scrollback_lines || 0));
+    }
+    if (profileTerminalCursorBlinkInput) {
+      profileTerminalCursorBlinkInput.checked = Boolean(terminal.cursor_blink);
+    }
+    if (profileTerminalCopyOnSelectInput) {
+      profileTerminalCopyOnSelectInput.checked = Boolean(terminal.copy_on_select);
+    }
+    if (profileTerminalPasteWarningInput) {
+      profileTerminalPasteWarningInput.checked = Boolean(terminal.paste_warning);
+    }
+    if (profileTerminalBellInput) {
+      profileTerminalBellInput.checked = Boolean(terminal.bell_enabled);
+    }
+    if (profileExportFormatSelect) {
+      profileExportFormatSelect.value = String(exportDefaults.default_format || "txt");
+    }
+    if (profileExportFilenameTemplateInput) {
+      profileExportFilenameTemplateInput.value = String(
+        exportDefaults.filename_template || "{model}_{timestamp}"
+      );
+    }
+    if (profileExportIncludeTimestampsInput) {
+      profileExportIncludeTimestampsInput.checked = Boolean(exportDefaults.include_timestamps);
+    }
+    if (profileExportIncludeMetadataInput) {
+      profileExportIncludeMetadataInput.checked = Boolean(exportDefaults.include_session_metadata);
+    }
+
     if (profileReasoningSelect) {
       profileReasoningSelect.value = String(chat.reasoning_mode_default || "summary");
     }
     if (profileSendShortcutSelect) {
       profileSendShortcutSelect.value = String(chat.send_shortcut || "enter");
+    }
+    if (profileDefaultNumCtxInput) {
+      profileDefaultNumCtxInput.value = String(Number(sessionsModels.default_num_ctx || 4096));
+    }
+    if (profileDefaultTemperatureInput) {
+      profileDefaultTemperatureInput.value = String(Number(sessionsModels.default_temperature || 0.2));
+    }
+    if (profileStartupViewSelect) {
+      profileStartupViewSelect.value = String(sessionsModels.startup_view || "models");
+    }
+    if (profileTabRestorePolicySelect) {
+      profileTabRestorePolicySelect.value = String(sessionsModels.tab_restore_policy || "none");
+    }
+    if (profileAutoFocusTerminalInput) {
+      profileAutoFocusTerminalInput.checked = Boolean(sessionsModels.auto_focus_terminal);
+    }
+
+    if (profileIdleTimeoutInput) {
+      profileIdleTimeoutInput.value = String(Number(security.idle_timeout_minutes || 30));
+    }
+    if (profileReauthTtlInput) {
+      profileReauthTtlInput.value = String(Number(security.destructive_reauth_ttl_minutes || 10));
+    }
+    if (profileAutoLockOnBlurInput) {
+      profileAutoLockOnBlurInput.checked = Boolean(security.auto_lock_on_blur);
+    }
+    if (profileDestructiveReauthInput) {
+      profileDestructiveReauthInput.checked = Boolean(security.destructive_reauth_enabled);
+    }
+    if (profileAuditTimezoneInput) {
+      profileAuditTimezoneInput.value = String(audit.timezone || "UTC");
+    }
+    if (profileAuditDatetimeFormatSelect) {
+      profileAuditDatetimeFormatSelect.value = String(audit.datetime_format || "locale");
+    }
+    if (profileAuditDefaultLimitInput) {
+      profileAuditDefaultLimitInput.value = String(Number(audit.default_limit || 100));
+    }
+    if (profileMaskSensitiveCommandsInput) {
+      profileMaskSensitiveCommandsInput.checked = Boolean(audit.mask_sensitive_commands);
+    }
+    if (profileToastLevelSelect) {
+      profileToastLevelSelect.value = String(notifications.toast_level || "all");
+    }
+    if (profileShowConnectEventsInput) {
+      profileShowConnectEventsInput.checked = Boolean(notifications.show_connect_events);
+    }
+    if (profileShowDisconnectEventsInput) {
+      profileShowDisconnectEventsInput.checked = Boolean(notifications.show_disconnect_events);
     }
     if (profileTerminalConfirmInput) {
       profileTerminalConfirmInput.checked = Boolean(tools.terminal_require_confirm);
@@ -241,7 +440,13 @@ function applyProfilePreferences(preferences, { updateControls = true } = {}) {
       profileSystemMessagesInput.checked = Boolean(notifications.show_system_messages);
     }
     if (profileVerboseErrorsInput) {
-      profileVerboseErrorsInput.checked = Boolean(notifications.verbose_errors);
+      profileVerboseErrorsInput.checked = Boolean(notifications.verbose_error_details);
+    }
+    if (profileDisplayNameInput) {
+      profileDisplayNameInput.value = String(account.display_name || "");
+    }
+    if (profileEmailInput) {
+      profileEmailInput.value = String(account.email || "");
     }
     if (profileSystemPromptInput) {
       profileSystemPromptInput.value = String(chat.system_prompt || "");
@@ -787,11 +992,8 @@ async function loadProfilePreferences() {
   }
 }
 
-async function saveProfilePreferences() {
+async function patchProfilePreferences(patch, metaPrefix = "Applied profile settings.") {
   const actorId = currentActorId();
-  if (profileSaveBtn) {
-    profileSaveBtn.disabled = true;
-  }
   try {
     const payload = await apiJson("/api/v1/profile/preferences", {
       method: "PATCH",
@@ -799,7 +1001,7 @@ async function saveProfilePreferences() {
       body: JSON.stringify({
         actor_id: actorId,
         base_version: state.profileVersion,
-        patch: profilePayloadFromForm(),
+        patch,
       }),
     });
     state.profileVersion = Number(payload.version || state.profileVersion || 1);
@@ -807,13 +1009,24 @@ async function saveProfilePreferences() {
     state.profilePreferences = payload.preferences || {};
     applyProfilePreferences(state.profilePreferences);
     setProfileMeta(
-      `Saved profile. version=${state.profileVersion} keys=${(payload.updated_keys || []).length}`
+      `${metaPrefix} version=${state.profileVersion} keys=${(payload.updated_keys || []).length}`
     );
+    return payload;
   } catch (error) {
-    setProfileMeta(`Profile save error: ${error.message}`);
+    setProfileMeta(`Profile apply error: ${error.message}`);
+    return null;
+  }
+}
+
+async function applyProfilePreferencesFromForm() {
+  if (profileApplyBtn) {
+    profileApplyBtn.disabled = true;
+  }
+  try {
+    await patchProfilePreferences(profilePayloadFromForm(), "Applied profile settings.");
   } finally {
-    if (profileSaveBtn) {
-      profileSaveBtn.disabled = false;
+    if (profileApplyBtn) {
+      profileApplyBtn.disabled = false;
     }
   }
 }
@@ -839,6 +1052,81 @@ async function resetProfilePreferences() {
   } finally {
     if (profileResetBtn) {
       profileResetBtn.disabled = false;
+    }
+  }
+}
+
+function exportProfileSettings() {
+  const payload = {
+    format: "local-model-pro.profile.v1",
+    exported_at: new Date().toISOString(),
+    actor_id: currentActorId(),
+    version: state.profileVersion,
+    preferences: profilePayloadFromForm(),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const suffix = currentActorId().replace(/[^a-z0-9._-]+/gi, "-").toLowerCase();
+  const timestamp = new Date().toISOString().replace(/[:]/g, "-");
+  link.href = url;
+  link.download = `local-model-pro-settings-${suffix}-${timestamp}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  setProfileMeta("Exported settings file.");
+}
+
+function triggerProfileImportPicker() {
+  profileImportInput?.click();
+}
+
+async function handleProfileImportFile(event) {
+  const input = event.currentTarget;
+  const file = input?.files?.[0];
+  if (!file) {
+    return;
+  }
+  try {
+    const rawText = await file.text();
+    const parsed = JSON.parse(rawText);
+    const maybePreferences =
+      parsed && typeof parsed === "object" && parsed.preferences && typeof parsed.preferences === "object"
+        ? parsed.preferences
+        : parsed;
+    if (!maybePreferences || typeof maybePreferences !== "object" || Array.isArray(maybePreferences)) {
+      throw new Error("Invalid settings file format.");
+    }
+    const allowedCategories = [
+      "appearance",
+      "accessibility",
+      "terminal",
+      "sessions_models",
+      "security",
+      "audit",
+      "notifications",
+      "export",
+      "account",
+      "chat",
+      "tools",
+    ];
+    const patch = {};
+    allowedCategories.forEach((category) => {
+      const value = maybePreferences[category];
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        patch[category] = value;
+      }
+    });
+    if (!Object.keys(patch).length) {
+      throw new Error("No supported settings categories found.");
+    }
+    await patchProfilePreferences(patch, "Imported and applied settings.");
+  } catch (error) {
+    setProfileMeta(`Import failed: ${error.message}`);
+  } finally {
+    if (input) {
+      input.value = "";
     }
   }
 }
@@ -1541,9 +1829,9 @@ if (profileLoadBtn) {
     void loadProfilePreferences();
   });
 }
-if (profileSaveBtn) {
-  profileSaveBtn.addEventListener("click", () => {
-    void saveProfilePreferences();
+if (profileApplyBtn) {
+  profileApplyBtn.addEventListener("click", () => {
+    void applyProfilePreferencesFromForm();
   });
 }
 if (profileResetBtn) {
@@ -1551,21 +1839,40 @@ if (profileResetBtn) {
     void resetProfilePreferences();
   });
 }
-if (profileThemeSelect) {
-  profileThemeSelect.addEventListener("change", () => {
-    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+if (profileCloseBtn) {
+  profileCloseBtn.addEventListener("click", () => {
+    closeDrawer();
   });
 }
-if (profileDensitySelect) {
-  profileDensitySelect.addEventListener("change", () => {
-    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+if (profileExportBtn) {
+  profileExportBtn.addEventListener("click", exportProfileSettings);
+}
+if (profileImportBtn) {
+  profileImportBtn.addEventListener("click", triggerProfileImportPicker);
+}
+if (profileImportInput) {
+  profileImportInput.addEventListener("change", (event) => {
+    void handleProfileImportFile(event);
   });
 }
-if (profileFontScaleInput) {
-  profileFontScaleInput.addEventListener("input", () => {
-    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+
+const profilePreviewElements = [
+  profileThemeSelect,
+  profileDensitySelect,
+  profileFontScaleInput,
+  profileReducedMotionInput,
+  profileHighContrastInput,
+  profileLargeTargetsInput,
+  profileFocusRingInput,
+];
+profilePreviewElements
+  .filter(Boolean)
+  .forEach((element) => {
+    const eventName = element === profileFontScaleInput ? "input" : "change";
+    element.addEventListener(eventName, () => {
+      applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+    });
   });
-}
 if (profileReasoningSelect) {
   profileReasoningSelect.addEventListener("change", () => {
     if (reasoningViewSelect && !reasoningViewSelect.dataset.userChanged) {
@@ -1591,6 +1898,11 @@ if (adminSavePlatformBtn) {
 if (adminCreateUserBtn) {
   adminCreateUserBtn.addEventListener("click", () => {
     void createAdminUser();
+  });
+}
+if (adminCloseBtn) {
+  adminCloseBtn.addEventListener("click", () => {
+    closeDrawer();
   });
 }
 if (reasoningViewSelect) {

@@ -351,6 +351,8 @@ async def _handle_local_tool_command(
     model: str,
     ollama: OllamaClient,
     terminal_require_confirm: bool,
+    temperature: float,
+    num_ctx: int,
 ) -> str:
     trimmed = prompt.strip()
     if not trimmed.startswith("/"):
@@ -446,8 +448,8 @@ async def _handle_local_tool_command(
                     "content": context,
                 },
             ],
-            temperature=settings.default_temperature,
-            num_ctx=settings.default_num_ctx,
+            temperature=temperature,
+            num_ctx=num_ctx,
         )
         return summary.strip() or "No summary generated."
 
@@ -982,6 +984,16 @@ async def chat_ws(websocket: WebSocket) -> None:
             terminal_require_confirm = bool(settings.terminal_require_confirm) or bool(
                 profile_snapshot.preferences.get("tools", {}).get("terminal_require_confirm", True)
             )
+            session_temperature = float(
+                profile_snapshot.preferences.get("sessions_models", {}).get(
+                    "default_temperature", settings.default_temperature
+                )
+            )
+            session_num_ctx = int(
+                profile_snapshot.preferences.get("sessions_models", {}).get(
+                    "default_num_ctx", settings.default_num_ctx
+                )
+            )
 
             request_id = str(uuid.uuid4())
             session.messages.append({"role": "user", "content": prompt})
@@ -999,6 +1011,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                         model=session.model,
                         ollama=ollama,
                         terminal_require_confirm=terminal_require_confirm,
+                        temperature=session_temperature,
+                        num_ctx=session_num_ctx,
                     )
                 except (WorkspaceToolError, WorkspaceSecurityError) as exc:
                     tool_output = f"Tool error: {exc}"
@@ -1032,8 +1046,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                 async for chunk in ollama.stream_chat(
                     model=session.model,
                     messages=list(session.messages),
-                    temperature=settings.default_temperature,
-                    num_ctx=settings.default_num_ctx,
+                    temperature=session_temperature,
+                    num_ctx=session_num_ctx,
                     think=_resolve_think_setting(model=session.model, reasoning_mode=reasoning_mode),
                 ):
                     assistant_chunks.append(chunk)
