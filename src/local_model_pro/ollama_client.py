@@ -65,6 +65,7 @@ class OllamaClient:
         messages: list[dict[str, str]],
         temperature: float,
         num_ctx: int,
+        think: bool | str | None = None,
     ) -> AsyncIterator[str]:
         payload: dict[str, Any] = {
             "model": model,
@@ -75,7 +76,10 @@ class OllamaClient:
                 "num_ctx": num_ctx,
             },
         }
+        if think is not None:
+            payload["think"] = think
         url = f"{self._base_url}/api/chat"
+        thinking_open = False
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             async with client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
@@ -96,11 +100,24 @@ class OllamaClient:
                         raise OllamaStreamError(str(item["error"]))
 
                     message = item.get("message", {})
+                    thinking = message.get("thinking", "")
+                    if thinking:
+                        if not thinking_open:
+                            thinking_open = True
+                            yield "<think>"
+                        yield str(thinking)
+
                     content = message.get("content", "")
                     if content:
-                        yield content
+                        if thinking_open:
+                            thinking_open = False
+                            yield "</think>"
+                        yield str(content)
 
                     if item.get("done", False):
+                        if thinking_open:
+                            thinking_open = False
+                            yield "</think>"
                         break
 
     async def chat(
@@ -145,52 +162,3 @@ class OllamaClient:
         if not isinstance(content, str):
             raise OllamaStreamError("Missing string 'message.content' in /api/chat response.")
         return content
-
-    async def embed(
-        self,
-        *,
-        model: str,
-        text: str,
-    ) -> list[float]:
-        normalized = text.strip()
-        if not normalized:
-            raise OllamaStreamError("Embedding input text cannot be empty.")
-
-        # Older Ollama endpoint.
-        payload_v1 = {"model": model, "prompt": normalized}
-        url_v1 = f"{self._base_url}/api/embeddings"
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response_v1 = await client.post(url_v1, json=payload_v1)
-
-        if response_v1.status_code == 200:
-            try:
-                body = response_v1.json()
-            except ValueError as exc:
-                raise OllamaStreamError("Invalid JSON payload from /api/embeddings") from exc
-            vector = body.get("embedding", [])
-            if not isinstance(vector, list) or not vector:
-                raise OllamaStreamError("Invalid embedding vector payload from /api/embeddings.")
-            return [float(value) for value in vector]
-
-        # Newer Ollama endpoint fallback.
-        payload_v2 = {"model": model, "input": normalized}
-        url_v2 = f"{self._base_url}/api/embed"
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response_v2 = await client.post(url_v2, json=payload_v2)
-
-        if response_v2.status_code != 200:
-            raise OllamaStreamError(
-                f"Ollama embedding error {response_v2.status_code}: {response_v2.text[:500]}"
-            )
-        try:
-            body = response_v2.json()
-        except ValueError as exc:
-            raise OllamaStreamError("Invalid JSON payload from /api/embed") from exc
-
-        embeddings = body.get("embeddings", [])
-        if not isinstance(embeddings, list) or not embeddings:
-            raise OllamaStreamError("Invalid embeddings payload from /api/embed.")
-        first = embeddings[0]
-        if not isinstance(first, list) or not first:
-            raise OllamaStreamError("Missing embedding vector in /api/embed response.")
-        return [float(value) for value in first]

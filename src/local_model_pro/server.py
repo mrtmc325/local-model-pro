@@ -1,35 +1,36 @@
 from __future__ import annotations
 
-import asyncio
 import argparse
+import asyncio
 import json
-import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+from local_model_pro.admin_profile_store import (
+    AdminProfileStore,
+    PreferenceConflictError,
+    PreferenceValidationError,
+)
 from local_model_pro.config import settings
-from local_model_pro.conversation_store import ConversationStore
-from local_model_pro.ingestion_intents import PromptIngestionIntent, parse_prompt_ingestion_intent
-from local_model_pro.knowledge_assist import (
-    EvidenceCard,
-    GroundedResponse,
-    KnowledgeAssistService,
-    QueryPlan,
-    SavedMemoryEvent,
-    URLReviewSavedItem,
+from local_model_pro.local_tools import (
+    CommandResult,
+    LocalWorkspaceTools,
+    WorkspaceSecurityError,
+    WorkspaceToolError,
 )
 from local_model_pro.ollama_client import OllamaClient, OllamaStreamError
-from local_model_pro.qdrant_memory import MemoryResult, QdrantMemoryIndex
-from local_model_pro.web_search import WebSearchClient, WebSearchError, WebSearchResult
 
 app = FastAPI(title="Local Model Pro Server", version="0.1.0")
 
@@ -37,9 +38,58 @@ runtime_default_model = settings.default_model
 runtime_ollama_base_url = settings.ollama_base_url
 static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+admin_profile_store = AdminProfileStore(
+    state_path=Path(settings.admin_state_path),
+    default_actor_id=settings.default_actor_id,
+)
 
-conversation_store = ConversationStore(db_path=settings.sqlite_db_path)
-_REASONING_MODES = {"hidden", "summary", "verbose", "debug"}
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+DEFAULT_MODEL_STORES: list[dict[str, Any]] = [
+    {
+        "id": "ollama_library",
+        "name": "Ollama Library",
+        "description": "Official Ollama model library",
+        "search_url_template": "https://ollama.com/search?q={query}",
+        "model_url_template": "https://ollama.com/library/{model}",
+        "supports_api_search": False,
+    },
+    {
+        "id": "huggingface",
+        "name": "Hugging Face",
+        "description": "Open model hub and metadata",
+        "search_url_template": "https://huggingface.co/models?search={query}",
+        "api_url_template": "https://huggingface.co/api/models?search={query}&limit=8",
+        "supports_api_search": True,
+    },
+    {
+        "id": "lmstudio_directory",
+        "name": "LM Studio Model Directory",
+        "description": "Curated model discovery site",
+        "search_url_template": "https://lmstudio.ai/models?q={query}",
+        "supports_api_search": False,
+    },
+]
+
+
+@dataclass
+class PullJob:
+    job_id: str
+    model: str
+    status: str
+    detail: str
+    started_at: str
+    finished_at: str | None = None
+    total: int | None = None
+    completed: int | None = None
+    error: str | None = None
+
+
+pull_jobs: dict[str, PullJob] = {}
+pull_jobs_lock = asyncio.Lock()
 
 
 @dataclass
@@ -48,11 +98,6 @@ class ChatSession:
     model: str
     actor_id: str = settings.default_actor_id
     system_prompt: str | None = None
-    web_assist_enabled: bool = settings.web_assist_default
-    knowledge_assist_enabled: bool = settings.knowledge_assist_default
-    grounded_mode_enabled: bool = settings.grounded_mode_default
-    grounded_profile: str = settings.grounded_profile_default
-    reasoning_mode: str = settings.reasoning_mode_default
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -61,798 +106,508 @@ class ChatSession:
             self.messages.append({"role": "system", "content": self.system_prompt})
 
 
-@dataclass(frozen=True)
-class AssistResolution:
-    query_plan: QueryPlan | None
-    memory_query: str
-    web_query: str
-    memory_results: list[MemoryResult]
-    exact_required: bool
-
-
-@dataclass(frozen=True)
-class IngestionResolution:
-    intent: PromptIngestionIntent
-    save_event: SavedMemoryEvent | None
-    review_items: list[URLReviewSavedItem]
-    review_evidence_cards: list[EvidenceCard]
-
-
-@dataclass(frozen=True)
-class WebResearchResolution:
-    queries: list[str]
-    raw_results: list[WebSearchResult]
-    deduped_results: list[WebSearchResult]
-    trusted_results: list[WebSearchResult]
-    errors: list[str]
-
-
-def _safe_text(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("Expected a string")
-    cleaned = value.strip()
-    if not cleaned:
-        raise ValueError("Expected non-empty string")
-    return cleaned
-
-
-def _safe_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-    raise ValueError("Expected a boolean.")
-
-
-def _safe_profile(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("Expected grounded profile string.")
-    profile = value.strip().lower()
-    if profile not in {"strict", "balanced"}:
-        raise ValueError("grounded_profile must be one of: strict, balanced")
-    return profile
-
-
-def _safe_reasoning_mode(value: Any, *, default: str = "hidden") -> str:
-    if value is None:
-        return default
-    if not isinstance(value, str):
-        raise ValueError("reasoning_mode must be one of: hidden, summary, verbose, debug")
-    mode = value.strip().lower()
-    if mode not in _REASONING_MODES:
-        raise ValueError("reasoning_mode must be one of: hidden, summary, verbose, debug")
-    return mode
-
-
-def _chunks(text: str, chunk_size: int = 64) -> list[str]:
-    if not text:
-        return []
-    return [text[idx : idx + chunk_size] for idx in range(0, len(text), chunk_size)]
-
-
-def _build_reasoning_instruction(reasoning_mode: str) -> str:
-    mode = reasoning_mode.strip().lower()
-    if mode == "hidden":
-        return ""
-    detail = {
-        "summary": "Keep reasoning concise (2-4 short lines) and tied to retrieved context only.",
-        "verbose": "Provide detailed reasoning notes tied to retrieved context only.",
-        "debug": "Provide concise reasoning and include lightweight retrieval/debug notes.",
-    }.get(mode, "Keep reasoning concise and grounded to retrieved context.")
-    debug_line = (
-        "\n- Include <debug> only in debug mode with retrieval transparency metadata."
-        if mode == "debug"
-        else ""
-    )
-    return (
-        "Reasoning visibility mode is enabled.\n"
-        "Return response in XML tags with this exact structure:\n"
-        "<reasoning>...</reasoning>\n"
-        "<answer>...</answer>\n"
-        f"{'<debug>...</debug>' if mode == 'debug' else ''}\n"
-        "Rules:\n"
-        f"- {detail}\n"
-        "- Do not reveal hidden/internal chain-of-thought.\n"
-        "- Keep final answer content inside <answer> only."
-        f"{debug_line}"
-    )
-
-
-def _extract_tag_block(text: str, tag: str) -> str:
-    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.IGNORECASE | re.DOTALL)
-    match = pattern.search(text)
-    if not match:
-        return ""
-    return match.group(1).strip()
-
-
-def _parse_reasoning_output(raw_text: str, reasoning_mode: str) -> tuple[str, str, str]:
-    payload = (raw_text or "").strip()
-    if not payload:
-        return "", "", ""
-
-    reasoning_text = _extract_tag_block(payload, "reasoning")
-    answer_text = _extract_tag_block(payload, "answer")
-    debug_text = _extract_tag_block(payload, "debug") if reasoning_mode == "debug" else ""
-
-    if not answer_text:
-        # Graceful fallback for models that ignore structured tags.
-        return "", payload, ""
-    return reasoning_text, answer_text, debug_text
-
-
-def _build_debug_metadata(
-    *,
-    assist: AssistResolution,
-    web_results: list[WebSearchResult],
-    web_review_items: list[URLReviewSavedItem] | None = None,
-    reasoning_mode: str,
-    grounded: GroundedResponse | None = None,
-    evidence_cards: list[EvidenceCard] | None = None,
-    web_research_stats: dict[str, Any] | None = None,
-    excluded_memory_count: int = 0,
-) -> dict[str, Any]:
-    memory_ids = [item.evidence_id for item in assist.memory_results if item.evidence_id][:5]
-    metadata: dict[str, Any] = {
-        "reasoning_mode": reasoning_mode,
-        "memory_query": assist.memory_query,
-        "memory_hits": len(assist.memory_results),
-        "top_memory_evidence_ids": memory_ids,
-        "web_used": bool(web_results),
-        "web_result_count": len(web_results),
-        "exact_required": assist.exact_required,
-        "excluded_actor_memory_count": excluded_memory_count,
-    }
-    if web_research_stats:
-        metadata.update(web_research_stats)
-    if web_review_items is not None:
-        saved_count = sum(1 for item in web_review_items if item.status == "saved")
-        metadata["web_page_reviewed_count"] = saved_count
-        metadata["web_page_review_failed_count"] = max(0, len(web_review_items) - saved_count)
-        metadata["web_page_review_total"] = len(web_review_items)
-        metadata["web_page_reviewed_chars_total"] = sum(
-            int(item.reviewed_chars or 0) for item in web_review_items
-        )
-    if evidence_cards is not None:
-        metadata["top_evidence_labels"] = [card.label for card in evidence_cards[:5]]
-        metadata["top_evidence_ids"] = [card.evidence_id for card in evidence_cards[:5]]
-        source_counts: dict[str, int] = {}
-        for card in evidence_cards:
-            source_counts[card.source_type] = source_counts.get(card.source_type, 0) + 1
-        metadata["evidence_source_counts"] = source_counts
-    if grounded is not None:
-        metadata["grounded_status"] = grounded.status
-        metadata["grounded_confidence"] = round(grounded.overall_confidence, 3)
-        metadata["clarify_needed"] = grounded.status == "insufficient"
-    return metadata
-
-
-def _debug_metadata_to_text(meta: dict[str, Any]) -> str:
-    lines = [
-        f"reasoning_mode={meta.get('reasoning_mode')}",
-        f"memory_query={meta.get('memory_query')}",
-        f"memory_hits={meta.get('memory_hits')}",
-        f"top_memory_evidence_ids={meta.get('top_memory_evidence_ids')}",
-        f"web_used={meta.get('web_used')}",
-        f"web_result_count={meta.get('web_result_count')}",
-        f"web_research_query_count={meta.get('web_research_query_count')}",
-        f"web_raw_result_count={meta.get('web_raw_result_count')}",
-        f"web_deduped_result_count={meta.get('web_deduped_result_count')}",
-        f"web_trusted_kept_count={meta.get('web_trusted_kept_count')}",
-        f"web_trusted_dropped_count={meta.get('web_trusted_dropped_count')}",
-        f"web_search_error_count={meta.get('web_search_error_count')}",
-        f"web_page_reviewed_count={meta.get('web_page_reviewed_count')}",
-        f"web_page_review_failed_count={meta.get('web_page_review_failed_count')}",
-        f"web_page_review_total={meta.get('web_page_review_total')}",
-        f"web_page_reviewed_chars_total={meta.get('web_page_reviewed_chars_total')}",
-        f"excluded_actor_memory_count={meta.get('excluded_actor_memory_count')}",
-        f"exact_required={meta.get('exact_required')}",
-    ]
-    if "top_evidence_labels" in meta:
-        lines.append(f"top_evidence_labels={meta.get('top_evidence_labels')}")
-    if "top_evidence_ids" in meta:
-        lines.append(f"top_evidence_ids={meta.get('top_evidence_ids')}")
-    if "evidence_source_counts" in meta:
-        lines.append(f"evidence_source_counts={meta.get('evidence_source_counts')}")
-    if "grounded_status" in meta:
-        lines.append(f"grounded_status={meta.get('grounded_status')}")
-    if "grounded_confidence" in meta:
-        lines.append(f"grounded_confidence={meta.get('grounded_confidence')}")
-    if "clarify_needed" in meta:
-        lines.append(f"clarify_needed={meta.get('clarify_needed')}")
-    return "\n".join(lines)
-
-
-def _memory_scope(item: MemoryResult, session: ChatSession) -> str:
-    if item.source_session == session.session_id:
-        return "same_session"
-    if item.actor_id == session.actor_id:
-        return "same_user"
-    return "shared"
-
-
-def _filter_memory_for_web_synthesis(
-    *,
-    memory_results: list[MemoryResult],
-    session: ChatSession,
-    exact_required: bool,
-    has_web_results: bool,
-) -> tuple[list[MemoryResult], int]:
-    """
-    For exact/recency prompts backed by fresh web retrieval, avoid recycling
-    actor-owned memory summaries into synthesis context.
-    """
-    if not (exact_required and has_web_results):
-        return memory_results, 0
-
-    filtered: list[MemoryResult] = []
-    excluded_count = 0
-    for item in memory_results:
-        scope = _memory_scope(item, session)
-        if scope in {"same_session", "same_user"}:
-            excluded_count += 1
-            continue
-        filtered.append(item)
-    return filtered, excluded_count
-
-
-def _canonical_url(url: str) -> str:
-    parsed = urlparse(url.strip())
-    scheme = (parsed.scheme or "https").lower()
-    host = (parsed.netloc or "").lower().strip().rstrip(".")
-    if host.startswith("www."):
-        host = host[4:]
-    path = parsed.path or "/"
-    if path != "/":
-        path = path.rstrip("/")
-    return f"{scheme}://{host}{path}"
-
-
-def _trusted_domain_for_url(url: str) -> str:
-    host = (urlparse(url).netloc or "").lower().strip().rstrip(".")
-    if host.startswith("www."):
-        host = host[4:]
-    return host
-
-
-def _is_trusted_url(url: str) -> bool:
-    if not settings.web_trusted_only:
-        return True
-    host = _trusted_domain_for_url(url)
-    if not host:
-        return False
-    trusted = settings.web_trusted_domains
-    if not trusted:
-        return True
-    for domain in trusted:
-        if host == domain or host.endswith(f".{domain}"):
-            return True
-    return False
-
-
-def _build_web_research_queries(*, assist: AssistResolution, prompt: str) -> list[str]:
-    limit = max(1, min(settings.web_research_max_queries, 6))
-    now_year = datetime.now(timezone.utc).year
-    candidates: list[str] = []
-    base = (assist.web_query or prompt).strip()
-    if base:
-        candidates.append(base)
-        candidates.append(f"{base} latest updates")
-        candidates.append(f"{base} timeline {now_year}")
-        if assist.exact_required:
-            candidates.append(f"{base} official statements {now_year}")
-            candidates.append(f"{base} chronology so far")
-    if assist.query_plan:
-        meaning = assist.query_plan.meaning.strip()
-        purpose = assist.query_plan.purpose.strip()
-        if meaning:
-            candidates.append(f"{meaning} {now_year}")
-        if purpose:
-            candidates.append(f"{purpose} current developments")
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for query in candidates:
-        clean = re.sub(r"\s+", " ", query).strip()
-        if len(clean) < 4:
-            continue
-        key = clean.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(clean)
-        if len(deduped) >= limit:
-            break
-    return deduped or [prompt.strip()]
-
-
-def _dedupe_web_results(rows: list[WebSearchResult]) -> list[WebSearchResult]:
-    deduped: list[WebSearchResult] = []
-    seen: set[str] = set()
-    for row in rows:
-        key = _canonical_url(row.url)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
-    return deduped
-
-
-def _drop_untrusted_results(rows: list[WebSearchResult]) -> tuple[list[WebSearchResult], int]:
-    kept: list[WebSearchResult] = []
-    dropped = 0
-    for row in rows:
-        if _is_trusted_url(row.url):
-            kept.append(row)
-        else:
-            dropped += 1
-    return kept, dropped
-
-
-def _filter_snippet_rows_for_reviewed_urls(
-    *,
-    web_rows: list[dict[str, Any]],
-    review_items: list[URLReviewSavedItem],
-) -> tuple[list[dict[str, Any]], int]:
-    reviewed_keys: set[str] = set()
-    for item in review_items:
-        if item.status != "saved":
-            continue
-        chosen_url = (item.final_url or item.url or "").strip()
-        if not chosen_url:
-            continue
-        reviewed_keys.add(_canonical_url(chosen_url))
-
-    if not reviewed_keys:
-        return web_rows, 0
-
-    kept: list[dict[str, Any]] = []
-    dropped = 0
-    for row in web_rows:
-        row_url = str(row.get("url", "")).strip()
-        if row_url and _canonical_url(row_url) in reviewed_keys:
-            dropped += 1
-            continue
-        kept.append(row)
-    return kept, dropped
-
-
 async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(json.dumps(payload))
 
 
-def _serialize_web_results(results: list[WebSearchResult]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for item in results:
-        source_type = KnowledgeAssistService.classify_source_type_for_url(item.url)
-        out.append(
-            {
-                "title": item.title,
-                "url": item.url,
-                "snippet": item.snippet,
-                "source_type": source_type,
-                "source_tag": "user story / forum"
-                if source_type == "web_user_story_forum"
-                else source_type.replace("web_", ""),
-                "confidence": KnowledgeAssistService.source_confidence(source_type, 0.64),
-            }
+def _safe_text(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty")
+    return cleaned
+
+
+def _safe_reasoning_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        return "summary"
+    normalized = value.strip().lower()
+    return normalized if normalized in {"hidden", "summary", "full"} else "summary"
+
+
+def _resolve_think_setting(*, model: str, reasoning_mode: str) -> bool | str | None:
+    mode = _safe_reasoning_mode(reasoning_mode)
+    normalized_model = model.strip().lower()
+
+    if mode == "hidden":
+        return False
+    if mode == "summary":
+        if "gpt-oss" in normalized_model:
+            return "low"
+        return True
+    if mode == "full":
+        if "gpt-oss" in normalized_model:
+            return "high"
+        return True
+    return None
+
+
+class ModelMutationRequest(BaseModel):
+    model: str
+
+
+class ProfilePatchRequest(BaseModel):
+    actor_id: str | None = None
+    base_version: int | None = None
+    patch: dict[str, Any]
+
+
+class ProfileResetRequest(BaseModel):
+    actor_id: str | None = None
+    scope: str | None = None
+
+
+class AdminUserCreateRequest(BaseModel):
+    actor_id: str | None = None
+    username: str
+    role: str = "operator"
+
+
+class AdminUserUpdateRequest(BaseModel):
+    actor_id: str | None = None
+    role: str | None = None
+    status: str | None = None
+    disabled_reason: str | None = None
+
+
+class AdminPlatformPatchRequest(BaseModel):
+    actor_id: str | None = None
+    patch: dict[str, bool]
+
+
+def _safe_actor_id(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return settings.default_actor_id
+
+
+def _require_admin_token(x_admin_token: str | None) -> None:
+    required_token = settings.admin_api_token.strip()
+    if not required_token:
+        return
+    provided = (x_admin_token or "").strip()
+    if not provided or provided != required_token:
+        raise HTTPException(status_code=403, detail="Admin token is required.")
+
+
+def _feature_enabled(feature_key: str) -> bool:
+    if not admin_profile_store.is_enabled(feature_key):
+        return False
+    if admin_profile_store.is_enabled("readonly_mode") and feature_key in {
+        "allow_model_pull",
+        "allow_model_delete",
+        "allow_shell_execute",
+    }:
+        return False
+    return True
+
+
+def _get_store_by_id(store_id: str) -> dict[str, Any] | None:
+    for store in DEFAULT_MODEL_STORES:
+        if str(store.get("id", "")).strip() == store_id:
+            return store
+    return None
+
+
+async def _set_pull_job(job_id: str, **updates: Any) -> PullJob:
+    async with pull_jobs_lock:
+        job = pull_jobs[job_id]
+        for key, value in updates.items():
+            setattr(job, key, value)
+        return job
+
+
+async def _run_pull_model_job(*, job_id: str, model: str) -> None:
+    try:
+        await _set_pull_job(job_id, status="running", detail="Starting model pull...")
+
+        url = f"{runtime_ollama_base_url.rstrip('/')}/api/pull"
+        timeout = httpx.Timeout(timeout=3600.0, connect=20.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, json={"name": model, "stream": True}) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    message = body.decode("utf-8", errors="replace")[:500]
+                    await _set_pull_job(
+                        job_id,
+                        status="failed",
+                        detail="Pull failed.",
+                        error=f"Ollama error {response.status_code}: {message}",
+                        finished_at=_utc_now_iso(),
+                    )
+                    return
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    status = str(item.get("status", "")).strip() or "running"
+                    await _set_pull_job(
+                        job_id,
+                        status="running",
+                        detail=status,
+                        total=int(item.get("total")) if isinstance(item.get("total"), int) else None,
+                        completed=(
+                            int(item.get("completed"))
+                            if isinstance(item.get("completed"), int)
+                            else None
+                        ),
+                    )
+
+        await _set_pull_job(
+            job_id,
+            status="done",
+            detail="Model pull completed.",
+            finished_at=_utc_now_iso(),
+            error=None,
         )
-    return out
-
-
-def _serialize_memory_results(
-    results: list[MemoryResult],
-    *,
-    session: ChatSession,
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "insight": item.insight,
-            "score": item.score,
-            "source_session": item.source_session,
-            "speaker": item.speaker,
-            "created_at": item.created_at,
-            "source_type": {
-                "same_session": "memory_same_session",
-                "same_user": "memory_same_user",
-                "shared": "memory_shared",
-            }[_memory_scope(item, session)],
-            "memory_source_type": item.source_type,
-            "actor_scope": _memory_scope(item, session),
-            "pii_flag": item.pii_flag,
-            "verbatim": item.quote_text,
-            "evidence_id": item.evidence_id,
-        }
-        for item in results
-    ]
-
-
-def _serialize_query_plan(plan: QueryPlan) -> dict[str, Any]:
-    return {
-        "reason": plan.reason,
-        "meaning": plan.meaning,
-        "purpose": plan.purpose,
-        "db_query": plan.db_query,
-        "web_query": plan.web_query,
-        "fallback": plan.fallback,
-    }
-
-
-def _serialize_evidence_cards(cards: list[EvidenceCard]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for card in cards:
-        rows.append(
-            {
-                "label": card.label,
-                "evidence_id": card.evidence_id,
-                "source_type": card.source_type,
-                "actor_scope": card.actor_scope,
-                "content": card.content,
-                "url": card.url,
-                "source_session": card.source_session,
-                "confidence": card.confidence,
-                "pii_flag": card.pii_flag,
-                "used_verbatim": card.used_verbatim,
-            }
+    except Exception as exc:  # pragma: no cover - safety net
+        await _set_pull_job(
+            job_id,
+            status="failed",
+            detail="Pull failed.",
+            error=str(exc),
+            finished_at=_utc_now_iso(),
         )
-    return rows
 
 
-def _serialize_url_review_items(items: list[URLReviewSavedItem]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for item in items:
-        rows.append(
-            {
-                "url": item.url,
-                "status": item.status,
-                "raw_file": item.raw_file,
-                "meaning_file": item.meaning_file,
-                "artifact_id": item.artifact_id,
-                "indexed_count": item.indexed_count,
-                "error": item.error,
-                "final_url": item.final_url,
-                "title": item.title,
-                "meaning": item.meaning,
-                "key_facts": item.key_facts or [],
-                "domain": item.domain,
-                "source_type": item.source_type,
-                "reviewed_chars": item.reviewed_chars,
-            }
-        )
-    return rows
+def _start_pull_model_job(*, job_id: str, model: str) -> None:
+    asyncio.create_task(_run_pull_model_job(job_id=job_id, model=model))
 
 
-def _build_review_context(items: list[URLReviewSavedItem]) -> str:
-    lines = ["Reviewed URL context (meaning + key facts):"]
-    idx = 1
-    for item in items:
-        if item.status != "saved":
-            continue
-        meaning = (item.meaning or "").strip()
-        if not meaning:
-            continue
-        lines.append(f"{idx}. {item.title or item.url}")
-        lines.append(f"   URL: {item.final_url or item.url}")
-        lines.append(f"   Meaning: {meaning}")
-        for fact in (item.key_facts or [])[:4]:
-            lines.append(f"   Fact: {fact}")
-        idx += 1
-    return "\n".join(lines)
+async def _delete_model_on_ollama(model: str) -> dict[str, Any]:
+    url = f"{runtime_ollama_base_url.rstrip('/')}/api/delete"
+    timeout = httpx.Timeout(timeout=120.0, connect=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.request("DELETE", url, json={"name": model})
+    body = response.text
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=body[:500] or "Delete failed")
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"status": body[:500] or "ok"}
+    if not isinstance(payload, dict):
+        payload = {"status": "ok"}
+    return payload
 
 
-def _relabel_evidence_cards(cards: list[EvidenceCard], *, start_index: int) -> list[EvidenceCard]:
-    next_index = max(1, start_index)
-    relabeled: list[EvidenceCard] = []
-    for card in cards:
-        relabeled.append(
-            EvidenceCard(
-                evidence_id=card.evidence_id,
-                source_type=card.source_type,
-                actor_scope=card.actor_scope,
-                label=f"E{next_index}",
-                content=card.content,
-                url=card.url,
-                source_session=card.source_session,
-                confidence=card.confidence,
-                pii_flag=card.pii_flag,
-                used_verbatim=card.used_verbatim,
-            )
-        )
-        next_index += 1
-    return relabeled
+def _chunks(text: str, *, chunk_size: int = 280) -> list[str]:
+    normalized = text.strip()
+    if not normalized:
+        return []
+    return [normalized[idx : idx + chunk_size] for idx in range(0, len(normalized), chunk_size)]
 
 
-def _build_web_context(*, query: str, results: list[WebSearchResult]) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+def _format_command_result(result: CommandResult) -> str:
     lines = [
-        f"Web context retrieved at {timestamp} for query: {query}",
-        "Use the sources below for current facts. Prefer citing URLs in the answer.",
+        f"$ {result.command}",
+        f"exit_code: {result.returncode}",
     ]
-    for idx, item in enumerate(results, start=1):
-        lines.append(f"{idx}. {item.title}")
-        lines.append(f"   URL: {item.url}")
-        if item.snippet:
-            lines.append(f"   Snippet: {item.snippet}")
+    if result.timed_out:
+        lines.append("status: timed_out")
+    if result.output_truncated:
+        lines.append("status: output_truncated")
+    if result.stdout.strip():
+        lines.extend(["", "stdout:", result.stdout.rstrip()])
+    if result.stderr.strip():
+        lines.extend(["", "stderr:", result.stderr.rstrip()])
+    if not result.stdout.strip() and not result.stderr.strip():
+        lines.extend(["", "(no output)"])
     return "\n".join(lines)
 
 
-def _build_memory_context(*, query: str, results: list[MemoryResult], session: ChatSession) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    lines = [
-        f"Knowledge memory retrieved at {timestamp} for query: {query}",
-        "Use these memory records as supporting context; quotes are allowed where marked verbatim.",
-    ]
-    for idx, item in enumerate(results, start=1):
-        scope = _memory_scope(item, session)
-        lines.append(f"{idx}. Insight: {item.insight}")
-        lines.append(f"   Scope: {scope}  Score: {item.score:.3f}")
-        if item.quote_text and scope in {"same_session", "same_user"}:
-            lines.append(f"   Verbatim quote: {item.quote_text}")
-    return "\n".join(lines)
-
-
-async def _run_web_search(
-    web_search: WebSearchClient,
-    *,
-    query: str,
-    max_results: int,
-) -> list[WebSearchResult]:
-    return await asyncio.to_thread(
-        web_search.search,
-        query=query,
-        max_results=max_results,
+def _tool_help_text(*, terminal_require_confirm: bool) -> str:
+    confirmation_note = (
+        "Terminal confirmation is required. Use /run <cmd> to preview and /run! <cmd> to execute."
+        if terminal_require_confirm
+        else "Use /run <cmd> to execute shell commands in the workspace root."
+    )
+    return (
+        "Local tools:\n"
+        "- /tools\n"
+        "- /ls [path]\n"
+        "- /tree [path]\n"
+        "- /find <query> [path]\n"
+        "- /read <file_path>\n"
+        "- /summary [path]\n"
+        "- /run <command>\n"
+        "- /run! <command>\n\n"
+        f"Workspace root: {settings.workspace_root}\n"
+        f"{confirmation_note}"
     )
 
 
-async def _run_web_research(
+async def _handle_local_tool_command(
     *,
-    web_search: WebSearchClient,
-    assist: AssistResolution,
     prompt: str,
-    max_results: int,
-) -> WebResearchResolution:
-    queries = _build_web_research_queries(assist=assist, prompt=prompt)
-    raw_results: list[WebSearchResult] = []
-    errors: list[str] = []
+    tools: LocalWorkspaceTools,
+    model: str,
+    ollama: OllamaClient,
+    terminal_require_confirm: bool,
+) -> str:
+    trimmed = prompt.strip()
+    if not trimmed.startswith("/"):
+        raise WorkspaceToolError("Tool prompt must start with '/'.")
 
-    for query in queries:
-        try:
-            result_rows = await _run_web_search(
-                web_search,
-                query=query,
-                max_results=max_results,
-            )
-        except WebSearchError as exc:
-            errors.append(f"{query}: {exc}")
-            continue
-        raw_results.extend(result_rows)
-
-    deduped_results = _dedupe_web_results(raw_results)
-    trusted_results, _ = _drop_untrusted_results(deduped_results)
-    return WebResearchResolution(
-        queries=queries,
-        raw_results=raw_results,
-        deduped_results=deduped_results,
-        trusted_results=trusted_results,
-        errors=errors,
-    )
-
-
-def _schedule_background(coro: Any) -> None:
-    task = asyncio.create_task(coro)
-
-    def _swallow_exc(done: asyncio.Task[Any]) -> None:
-        try:
-            _ = done.result()
-        except Exception:
-            return
-
-    task.add_done_callback(_swallow_exc)
-
-
-async def _run_pre_assist_ingestion(
-    *,
-    session: ChatSession,
-    prompt: str,
-    request_id: str,
-    websocket: WebSocket,
-    knowledge: KnowledgeAssistService,
-) -> IngestionResolution:
-    intent = parse_prompt_ingestion_intent(prompt, max_urls=max(1, settings.url_review_max_urls))
-    save_event: SavedMemoryEvent | None = None
-    review_items: list[URLReviewSavedItem] = []
-    review_evidence_cards: list[EvidenceCard] = []
-
-    if intent.save_requested:
-        if settings.direct_save_enabled:
-            try:
-                save_event = await knowledge.save_direct_memory(
-                    session_id=session.session_id,
-                    actor_id=session.actor_id,
-                    request_id=request_id,
-                    model=session.model,
-                    save_text=intent.save_text or prompt,
-                    author=intent.author,
-                )
-            except Exception as exc:
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "memory_saved",
-                        "request_id": request_id,
-                        "artifact_id": "",
-                        "session_id": session.session_id,
-                        "actor_id": session.actor_id,
-                        "author": intent.author,
-                        "file_path": "",
-                        "indexed_count": 0,
-                        "note": f"Save failed: {exc}",
-                    },
-                )
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "info",
-                        "message": f"Direct save requested but failed: {exc}",
-                    },
-                )
-            else:
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "memory_saved",
-                        "request_id": request_id,
-                        "artifact_id": save_event.artifact_id,
-                        "session_id": session.session_id,
-                        "actor_id": session.actor_id,
-                        "author": save_event.author,
-                        "file_path": save_event.file_path,
-                        "indexed_count": save_event.indexed_count,
-                        "note": save_event.note,
-                    },
-                )
-        else:
-            await _send_json(
-                websocket,
-                {
-                    "type": "memory_saved",
-                    "request_id": request_id,
-                    "artifact_id": "",
-                    "session_id": session.session_id,
-                    "actor_id": session.actor_id,
-                    "author": intent.author,
-                    "file_path": "",
-                    "indexed_count": 0,
-                    "note": "Direct save is disabled by configuration.",
-                },
-            )
-
-    if intent.review_requested:
-        if settings.url_review_enabled:
-            review_items, review_evidence_cards = await knowledge.review_and_save_urls(
-                session_id=session.session_id,
-                actor_id=session.actor_id,
-                request_id=request_id,
-                model=session.model,
-                urls=intent.review_urls,
-                author=intent.author,
-            )
-        else:
-            review_items = [
-                URLReviewSavedItem(
-                    url=url,
-                    status="failed",
-                    raw_file=None,
-                    meaning_file=None,
-                    artifact_id=None,
-                    indexed_count=0,
-                    error="URL review is disabled by configuration.",
-                )
-                for url in intent.review_urls
-            ]
-        await _send_json(
-            websocket,
-            {
-                "type": "url_review_saved",
-                "request_id": request_id,
-                "items": _serialize_url_review_items(review_items),
-            },
+    if trimmed.startswith("/run!"):
+        if not settings.terminal_tools_enabled or not _feature_enabled("allow_terminal_tools"):
+            raise WorkspaceToolError("Terminal tools are disabled by configuration.")
+        if not _feature_enabled("allow_shell_execute"):
+            raise WorkspaceToolError("Terminal execute is disabled by admin policy.")
+        command = trimmed[len("/run!") :].strip()
+        if not command:
+            raise WorkspaceToolError("Usage: /run! <command>")
+        result = await tools.run_command(
+            command=command,
+            timeout_seconds=settings.terminal_timeout_seconds,
+            max_output_bytes=settings.terminal_max_output_bytes,
         )
+        return _format_command_result(result)
 
-        failures = [item for item in review_items if item.status != "saved"]
-        if failures:
-            await _send_json(
-                websocket,
+    if trimmed.startswith("/run"):
+        if not settings.terminal_tools_enabled or not _feature_enabled("allow_terminal_tools"):
+            raise WorkspaceToolError("Terminal tools are disabled by configuration.")
+        command = trimmed[len("/run") :].strip()
+        if not command:
+            raise WorkspaceToolError("Usage: /run <command>")
+        if terminal_require_confirm:
+            return f"Preview: {command}\nRun /run! {command} to execute."
+        result = await tools.run_command(
+            command=command,
+            timeout_seconds=settings.terminal_timeout_seconds,
+            max_output_bytes=settings.terminal_max_output_bytes,
+        )
+        return _format_command_result(result)
+
+    try:
+        parts = shlex.split(trimmed)
+    except ValueError as exc:
+        raise WorkspaceToolError(f"Invalid command syntax: {exc}") from exc
+
+    if not parts:
+        raise WorkspaceToolError("Empty command.")
+
+    cmd = parts[0].lower()
+    if cmd == "/tools":
+        return _tool_help_text(terminal_require_confirm=terminal_require_confirm)
+
+    if cmd == "/ls":
+        if not settings.filesystem_tools_enabled or not _feature_enabled("allow_filesystem_tools"):
+            raise WorkspaceToolError("Filesystem tools are disabled by configuration.")
+        target = parts[1] if len(parts) > 1 else "."
+        return tools.list_directory(target)
+
+    if cmd == "/tree":
+        if not settings.filesystem_tools_enabled or not _feature_enabled("allow_filesystem_tools"):
+            raise WorkspaceToolError("Filesystem tools are disabled by configuration.")
+        target = parts[1] if len(parts) > 1 else "."
+        return tools.render_tree(target, max_depth=4)
+
+    if cmd == "/find":
+        if not settings.filesystem_tools_enabled or not _feature_enabled("allow_filesystem_tools"):
+            raise WorkspaceToolError("Filesystem tools are disabled by configuration.")
+        if len(parts) < 2:
+            raise WorkspaceToolError("Usage: /find <query> [path]")
+        target = parts[2] if len(parts) > 2 else "."
+        return tools.find_paths(query=parts[1], raw_path=target)
+
+    if cmd == "/read":
+        if not settings.filesystem_tools_enabled or not _feature_enabled("allow_filesystem_tools"):
+            raise WorkspaceToolError("Filesystem tools are disabled by configuration.")
+        if len(parts) < 2:
+            raise WorkspaceToolError("Usage: /read <file_path>")
+        return tools.read_text_file(parts[1])
+
+    if cmd == "/summary":
+        if not settings.filesystem_tools_enabled or not _feature_enabled("allow_filesystem_tools"):
+            raise WorkspaceToolError("Filesystem tools are disabled by configuration.")
+        target = parts[1] if len(parts) > 1 else "."
+        context = tools.build_summary_context(target)
+        summary = await ollama.chat(
+            model=model,
+            messages=[
                 {
-                    "type": "info",
-                    "message": (
-                        f"URL review completed with {len(failures)} failure(s). "
-                        "Continuing chat with available context."
+                    "role": "system",
+                    "content": (
+                        "You summarize local project files for an operator. "
+                        "Use only provided context. Include sections: Overview, Important Files, "
+                        "Risks, and Recommended Next Steps."
                     ),
                 },
-            )
-
-    return IngestionResolution(
-        intent=intent,
-        save_event=save_event,
-        review_items=review_items,
-        review_evidence_cards=review_evidence_cards,
-    )
-
-
-async def _resolve_assist(
-    *,
-    session: ChatSession,
-    prompt: str,
-    request_id: str,
-    websocket: WebSocket,
-    knowledge: KnowledgeAssistService,
-) -> AssistResolution:
-    query_plan: QueryPlan | None = None
-    memory_query = prompt
-    web_query = prompt
-    memory_results: list[MemoryResult] = []
-
-    if not session.knowledge_assist_enabled:
-        return AssistResolution(
-            query_plan=None,
-            memory_query=memory_query,
-            web_query=web_query,
-            memory_results=memory_results,
-            exact_required=False,
+                {
+                    "role": "user",
+                    "content": context,
+                },
+            ],
+            temperature=settings.default_temperature,
+            num_ctx=settings.default_num_ctx,
         )
+        return summary.strip() or "No summary generated."
 
-    query_plan = await knowledge.build_query_plan(
-        prompt=prompt,
-        history=session.messages,
-        model=session.model,
-    )
-    memory_query = query_plan.db_query.strip() or prompt
-    web_query = query_plan.web_query.strip() or prompt
-    exact_required = knowledge.is_exact_concrete_request(prompt, query_plan)
-
-    await _send_json(
-        websocket,
-        {
-            "type": "query_plan",
-            "request_id": request_id,
-            "exact_required": exact_required,
-            **_serialize_query_plan(query_plan),
-        },
-    )
-
-    memory_results = await knowledge.search_memory(
-        query=memory_query,
-        actor_id=session.actor_id,
-        current_session_id=session.session_id,
-        query_plan=query_plan,
-    )
-    await _send_json(
-        websocket,
-        {
-            "type": "memory_results",
-            "request_id": request_id,
-            "query": memory_query,
-            "results": _serialize_memory_results(memory_results, session=session),
-        },
-    )
-
-    return AssistResolution(
-        query_plan=query_plan,
-        memory_query=memory_query,
-        web_query=web_query,
-        memory_results=memory_results,
-        exact_required=exact_required,
-    )
+    raise WorkspaceToolError("Unknown tool command. Type /tools for available commands.")
 
 
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(static_dir / "index.html")
+
+
+@app.get("/api/v1/profile/preferences")
+async def get_profile_preferences(
+    actor_id: str = Query(default=settings.default_actor_id),
+) -> dict[str, Any]:
+    snapshot = admin_profile_store.get_preferences(_safe_actor_id(actor_id))
+    return {
+        "actor_id": snapshot.actor_id,
+        "version": snapshot.version,
+        "preferences": snapshot.preferences,
+        "updated_at": snapshot.updated_at,
+    }
+
+
+@app.patch("/api/v1/profile/preferences")
+async def patch_profile_preferences(payload: ProfilePatchRequest) -> dict[str, Any]:
+    actor_id = _safe_actor_id(payload.actor_id)
+    try:
+        snapshot, changed_keys = admin_profile_store.patch_preferences(
+            actor_id=actor_id,
+            base_version=payload.base_version,
+            patch=payload.patch,
+        )
+    except PreferenceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "actor_id": snapshot.actor_id,
+        "version": snapshot.version,
+        "preferences": snapshot.preferences,
+        "updated_at": snapshot.updated_at,
+        "updated_keys": changed_keys,
+    }
+
+
+@app.post("/api/v1/profile/preferences/reset")
+async def reset_profile_preferences(payload: ProfileResetRequest) -> dict[str, Any]:
+    actor_id = _safe_actor_id(payload.actor_id)
+    try:
+        snapshot, changed_keys = admin_profile_store.reset_preferences(
+            actor_id=actor_id,
+            scope=payload.scope,
+        )
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "actor_id": snapshot.actor_id,
+        "version": snapshot.version,
+        "preferences": snapshot.preferences,
+        "updated_at": snapshot.updated_at,
+        "updated_keys": changed_keys,
+    }
+
+
+@app.get("/api/v1/admin/platform")
+async def get_admin_platform(
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    return {"platform": admin_profile_store.get_platform()}
+
+
+@app.patch("/api/v1/admin/platform")
+async def patch_admin_platform(
+    payload: AdminPlatformPatchRequest,
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    actor_id = _safe_actor_id(payload.actor_id)
+    try:
+        platform = admin_profile_store.update_platform(patch=payload.patch, actor_id=actor_id)
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"platform": platform}
+
+
+@app.get("/api/v1/admin/users")
+async def list_admin_users(
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    return {"users": admin_profile_store.list_users()}
+
+
+@app.post("/api/v1/admin/users")
+async def create_admin_user(
+    payload: AdminUserCreateRequest,
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    actor_id = _safe_actor_id(payload.actor_id)
+    try:
+        record = admin_profile_store.create_user(
+            actor_id=actor_id,
+            username=payload.username,
+            role=payload.role,
+        )
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"user": record}
+
+
+@app.patch("/api/v1/admin/users/{user_id}")
+async def patch_admin_user(
+    user_id: str,
+    payload: AdminUserUpdateRequest,
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    actor_id = _safe_actor_id(payload.actor_id)
+    patch = {
+        key: value
+        for key, value in {
+            "role": payload.role,
+            "status": payload.status,
+            "disabled_reason": payload.disabled_reason,
+        }.items()
+        if value is not None
+    }
+    if not patch:
+        raise HTTPException(status_code=422, detail="No update fields supplied.")
+    try:
+        record = admin_profile_store.update_user(actor_id=actor_id, user_id=user_id, patch=patch)
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"user": record}
+
+
+@app.delete("/api/v1/admin/users/{user_id}")
+async def delete_admin_user(
+    user_id: str,
+    actor_id: str = Query(default=settings.default_actor_id),
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    try:
+        admin_profile_store.disable_user(actor_id=_safe_actor_id(actor_id), user_id=user_id)
+    except PreferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status": "disabled"}
+
+
+@app.get("/api/v1/admin/events")
+async def list_admin_events(
+    limit: int = Query(default=100, ge=1, le=300),
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin_token(x_admin_token)
+    return {"events": admin_profile_store.list_events(limit=limit)}
 
 
 @app.get("/api/service")
@@ -864,37 +619,36 @@ async def service_info() -> dict[str, Any]:
             "health": "/health",
             "docs": "/docs",
             "models": "/api/models",
-            "web_search": "/api/web/search?q=<query>",
+            "pull_model": "/api/models/pull",
+            "pull_status": "/api/models/pull/{job_id}",
+            "delete_model": "/api/models/delete",
+            "model_stores": "/api/model-stores",
+            "model_store_search": "/api/model-stores/search?store_id=...&q=...",
+            "profile_preferences": "/api/v1/profile/preferences",
+            "profile_preferences_reset": "/api/v1/profile/preferences/reset",
+            "admin_users": "/api/v1/admin/users",
+            "admin_platform": "/api/v1/admin/platform",
+            "admin_events": "/api/v1/admin/events",
         },
         "websocket": {
             "chat": "/ws/chat",
         },
         "default_model": runtime_default_model,
-        "web_assist_default": settings.web_assist_default,
-        "knowledge_assist_default": settings.knowledge_assist_default,
-        "grounded_mode_default": settings.grounded_mode_default,
-        "grounded_profile_default": settings.grounded_profile_default,
-        "memory": {
-            "backend": "sqlite+qdrant",
-            "db_path": settings.sqlite_db_path,
-            "export_dir": settings.memory_export_dir,
-            "qdrant_url": settings.qdrant_url,
-            "qdrant_collection": settings.qdrant_collection,
-            "shared_default": True,
-        },
         "capabilities": {
-            "knowledge_assist": True,
-            "grounded_mode": True,
-            "grounded_profiles": ["strict", "balanced"],
-            "reasoning_modes": ["hidden", "summary", "verbose", "debug"],
-            "reasoning_default": settings.reasoning_mode_default,
-            "web_assist": True,
-            "evidence_panel_events": True,
-            "direct_save": settings.direct_save_enabled,
-            "url_review": settings.url_review_enabled,
-            "web_assist_page_review": settings.web_assist_page_review_enabled,
-            "web_trusted_only": settings.web_trusted_only,
-            "web_research_max_queries": settings.web_research_max_queries,
+            "chat": True,
+            "model_switching": True,
+            "local_tools": True,
+            "model_admin": True,
+            "reasoning_view": {
+                "supported": True,
+                "modes": ["hidden", "summary", "full"],
+            },
+            "profile_settings": True,
+            "admin_settings": True,
+            "filesystem_tools_enabled": settings.filesystem_tools_enabled,
+            "terminal_tools_enabled": settings.terminal_tools_enabled,
+            "workspace_root": settings.workspace_root,
+            "admin_token_required": bool(settings.admin_api_token.strip()),
         },
     }
 
@@ -918,24 +672,147 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@app.get("/api/web/search")
-async def web_search_http(q: str, max_results: int | None = None) -> dict[str, Any]:
+@app.post("/api/models/pull")
+async def pull_model(request: ModelMutationRequest) -> dict[str, Any]:
+    if not _feature_enabled("allow_model_pull"):
+        raise HTTPException(status_code=403, detail="Model pull is disabled by admin policy.")
+    model = _safe_text(request.model, field_name="model")
+    job_id = str(uuid.uuid4())
+    job = PullJob(
+        job_id=job_id,
+        model=model,
+        status="queued",
+        detail="Queued pull request.",
+        started_at=_utc_now_iso(),
+    )
+    async with pull_jobs_lock:
+        pull_jobs[job_id] = job
+        # Keep memory bounded.
+        if len(pull_jobs) > 80:
+            oldest_key = sorted(
+                pull_jobs.keys(),
+                key=lambda key: pull_jobs[key].started_at,
+            )[0]
+            if oldest_key != job_id:
+                pull_jobs.pop(oldest_key, None)
+    _start_pull_model_job(job_id=job_id, model=model)
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "detail": job.detail,
+        "model": model,
+    }
+
+
+@app.get("/api/models/pull/{job_id}")
+async def pull_model_status(job_id: str) -> dict[str, Any]:
+    async with pull_jobs_lock:
+        job = pull_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Pull job not found.")
+    return {
+        "job_id": job.job_id,
+        "model": job.model,
+        "status": job.status,
+        "detail": job.detail,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "total": job.total,
+        "completed": job.completed,
+        "error": job.error,
+    }
+
+
+@app.post("/api/models/delete")
+async def delete_model(request: ModelMutationRequest) -> dict[str, Any]:
+    if not _feature_enabled("allow_model_delete"):
+        raise HTTPException(status_code=403, detail="Model delete is disabled by admin policy.")
+    model = _safe_text(request.model, field_name="model")
+    payload = await _delete_model_on_ollama(model)
+    return {"model": model, "result": payload}
+
+
+@app.get("/api/model-stores")
+async def model_stores() -> dict[str, Any]:
+    return {"stores": DEFAULT_MODEL_STORES}
+
+
+@app.get("/api/model-stores/search")
+async def model_store_search(store_id: str, q: str) -> dict[str, Any]:
+    if not _feature_enabled("allow_model_store_search"):
+        raise HTTPException(status_code=403, detail="Model store search is disabled by admin policy.")
+    store = _get_store_by_id(store_id.strip())
+    if store is None:
+        raise HTTPException(status_code=404, detail="Unknown store_id.")
+
     query = q.strip()
     if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+        raise HTTPException(status_code=400, detail="q cannot be empty.")
+    if len(query) > 200:
+        raise HTTPException(status_code=400, detail="q is too long.")
 
-    limit = settings.web_search_max_results if max_results is None else max_results
-    limit = max(1, min(limit, 10))
-    web_search = WebSearchClient()
+    if not store.get("supports_api_search"):
+        raise HTTPException(status_code=400, detail="Selected store does not support API search.")
+
+    api_template = str(store.get("api_url_template", "")).strip()
+    if not api_template:
+        raise HTTPException(status_code=400, detail="Store has no API search URL configured.")
+    target_url = api_template.replace("{query}", quote_plus(query))
+
+    timeout = httpx.Timeout(timeout=20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(target_url)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Store API error {response.status_code}: {response.text[:300]}",
+        )
+
     try:
-        results = await _run_web_search(web_search, query=query, max_results=limit)
-    except WebSearchError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Store API did not return valid JSON.") from exc
+
+    results: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload[:10]:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id", "")).strip()
+            if not model_id:
+                continue
+            results.append(
+                {
+                    "id": model_id,
+                    "name": model_id,
+                    "downloads": item.get("downloads"),
+                    "likes": item.get("likes"),
+                    "updated_at": item.get("lastModified"),
+                    "url": f"https://huggingface.co/{model_id}",
+                }
+            )
+    elif isinstance(payload, dict):
+        nested = payload.get("items", [])
+        if isinstance(nested, list):
+            for item in nested[:10]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("id") or "").strip()
+                if not name:
+                    continue
+                results.append(
+                    {
+                        "id": name,
+                        "name": name,
+                        "url": item.get("url"),
+                    }
+                )
 
     return {
+        "store_id": store_id,
         "query": query,
-        "retrieved_at": datetime.now(timezone.utc).isoformat(),
-        "results": _serialize_web_results(results),
+        "count": len(results),
+        "results": results,
     }
 
 
@@ -945,43 +822,10 @@ async def chat_ws_http_hint() -> dict[str, Any]:
         "detail": "This path expects a WebSocket upgrade.",
         "how_to_connect": "Use a WebSocket client to ws://127.0.0.1:8765/ws/chat",
         "cli_client": "local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b",
-        "message_types": [
-            "hello",
-            "chat",
-            "set_model",
-            "status",
-            "reset",
-            "set_web_mode",
-            "set_knowledge_mode",
-            "set_grounded_mode",
-            "set_grounded_profile",
-            "set_reasoning_mode",
-            "web_search",
-        ],
-        "event_types": [
-            "ready",
-            "status",
-            "start",
-            "token",
-            "done",
-            "web_mode",
-            "knowledge_mode",
-            "grounded_mode",
-            "grounded_profile",
-            "grounding_status",
-            "evidence_used",
-            "clarify_needed",
-            "reasoning",
-            "debug",
-            "memory_saved",
-            "url_review_saved",
-            "web_review_context",
-            "query_plan",
-            "memory_results",
-            "web_results",
-            "info",
-            "error",
-        ],
+        "message_types": ["hello", "chat", "set_model", "status", "reset"],
+        "event_types": ["ready", "status", "start", "token", "done", "info", "error"],
+        "local_tool_commands": ["/tools", "/ls", "/tree", "/find", "/read", "/summary", "/run", "/run!"],
+        "chat_reasoning_mode": ["hidden", "summary", "full"],
     }
 
 
@@ -992,29 +836,19 @@ async def chat_ws(websocket: WebSocket) -> None:
         session_id=str(uuid.uuid4()),
         model=runtime_default_model,
     )
-    if session.grounded_profile not in {"strict", "balanced"}:
-        session.grounded_profile = "balanced"
-    if session.grounded_mode_enabled:
-        session.knowledge_assist_enabled = True
-
     ollama = OllamaClient(base_url=runtime_ollama_base_url)
-    web_search = WebSearchClient()
-    knowledge = KnowledgeAssistService(
-        settings=settings,
-        ollama=ollama,
-        store=conversation_store,
-        memory_index=QdrantMemoryIndex(
-            base_url=settings.qdrant_url,
-            collection=settings.qdrant_collection,
-        ),
-    )
-
-    await knowledge.save_session(
-        session_id=session.session_id,
-        model=session.model,
-        system_prompt=session.system_prompt,
-        actor_id=session.actor_id,
-    )
+    tools: LocalWorkspaceTools | None = None
+    try:
+        tools = LocalWorkspaceTools(
+            workspace_root=settings.workspace_root,
+            read_max_bytes=settings.fs_read_max_bytes,
+            list_max_entries=settings.fs_list_max_entries,
+            find_max_results=settings.fs_find_max_results,
+            summary_max_files=settings.fs_summary_max_files,
+            summary_file_chars=settings.fs_summary_file_chars,
+        )
+    except WorkspaceToolError:
+        tools = None
 
     await _send_json(
         websocket,
@@ -1026,15 +860,34 @@ async def chat_ws(websocket: WebSocket) -> None:
     await _send_json(
         websocket,
         {
+            "type": "info",
+            "message": (
+                "Local tools are available. Type /tools for filesystem and terminal commands. "
+                f"Workspace root: {settings.workspace_root}"
+                if tools is not None
+                else "Local tools are unavailable due to workspace configuration."
+            ),
+        },
+    )
+    if tools is not None:
+        platform = admin_profile_store.get_platform()
+        if not bool(platform.get("allow_filesystem_tools", True)):
+            await _send_json(
+                websocket,
+                {"type": "info", "message": "Filesystem tools are disabled by admin policy."},
+            )
+        if not bool(platform.get("allow_terminal_tools", True)):
+            await _send_json(
+                websocket,
+                {"type": "info", "message": "Terminal tools are disabled by admin policy."},
+            )
+    await _send_json(
+        websocket,
+        {
             "type": "ready",
             "session_id": session.session_id,
             "actor_id": session.actor_id,
             "model": session.model,
-            "web_assist_enabled": session.web_assist_enabled,
-            "knowledge_assist_enabled": session.knowledge_assist_enabled,
-            "grounded_mode_enabled": session.grounded_mode_enabled,
-            "grounded_profile": session.grounded_profile,
-            "reasoning_mode": session.reasoning_mode,
         },
     )
 
@@ -1048,6 +901,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                 continue
 
             msg_type = incoming.get("type")
+
             if msg_type == "hello":
                 model = incoming.get("model")
                 if isinstance(model, str) and model.strip():
@@ -1055,54 +909,18 @@ async def chat_ws(websocket: WebSocket) -> None:
                 actor_id = incoming.get("actor_id")
                 if isinstance(actor_id, str) and actor_id.strip():
                     session.actor_id = actor_id.strip()
+                profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
                 system_prompt = incoming.get("system_prompt")
                 if isinstance(system_prompt, str) and system_prompt.strip():
                     session.system_prompt = system_prompt.strip()
                     session.reset()
-                if "web_assist_enabled" in incoming:
-                    try:
-                        session.web_assist_enabled = _safe_bool(incoming.get("web_assist_enabled"))
-                    except ValueError as exc:
-                        await _send_json(websocket, {"type": "error", "message": str(exc)})
-                        continue
-                if "knowledge_assist_enabled" in incoming:
-                    try:
-                        session.knowledge_assist_enabled = _safe_bool(
-                            incoming.get("knowledge_assist_enabled")
-                        )
-                    except ValueError as exc:
-                        await _send_json(websocket, {"type": "error", "message": str(exc)})
-                        continue
-                if "grounded_mode_enabled" in incoming:
-                    try:
-                        session.grounded_mode_enabled = _safe_bool(incoming.get("grounded_mode_enabled"))
-                    except ValueError as exc:
-                        await _send_json(websocket, {"type": "error", "message": str(exc)})
-                        continue
-                if "grounded_profile" in incoming:
-                    try:
-                        session.grounded_profile = _safe_profile(incoming.get("grounded_profile"))
-                    except ValueError as exc:
-                        await _send_json(websocket, {"type": "error", "message": str(exc)})
-                        continue
-                if "reasoning_mode" in incoming:
-                    try:
-                        session.reasoning_mode = _safe_reasoning_mode(
-                            incoming.get("reasoning_mode"),
-                            default=session.reasoning_mode,
-                        )
-                    except ValueError as exc:
-                        await _send_json(websocket, {"type": "error", "message": str(exc)})
-                        continue
-                if session.grounded_mode_enabled:
-                    session.knowledge_assist_enabled = True
-
-                await knowledge.save_session(
-                    session_id=session.session_id,
-                    model=session.model,
-                    system_prompt=session.system_prompt,
-                    actor_id=session.actor_id,
-                )
+                elif not session.system_prompt:
+                    default_system_prompt = str(
+                        profile_snapshot.preferences.get("chat", {}).get("system_prompt", "")
+                    ).strip()
+                    if default_system_prompt:
+                        session.system_prompt = default_system_prompt
+                        session.reset()
                 await _send_json(
                     websocket,
                     {
@@ -1110,16 +928,12 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "session_id": session.session_id,
                         "actor_id": session.actor_id,
                         "model": session.model,
-                        "web_assist_enabled": session.web_assist_enabled,
-                        "knowledge_assist_enabled": session.knowledge_assist_enabled,
-                        "grounded_mode_enabled": session.grounded_mode_enabled,
-                        "grounded_profile": session.grounded_profile,
-                        "reasoning_mode": session.reasoning_mode,
                     },
                 )
                 continue
 
             if msg_type == "status":
+                profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
                 await _send_json(
                     websocket,
                     {
@@ -1127,229 +941,20 @@ async def chat_ws(websocket: WebSocket) -> None:
                         "actor_id": session.actor_id,
                         "model": session.model,
                         "message_count": len(session.messages),
-                        "web_assist_enabled": session.web_assist_enabled,
-                        "knowledge_assist_enabled": session.knowledge_assist_enabled,
-                        "grounded_mode_enabled": session.grounded_mode_enabled,
-                        "grounded_profile": session.grounded_profile,
-                        "reasoning_mode": session.reasoning_mode,
+                        "reasoning_mode_default": profile_snapshot.preferences.get("chat", {}).get(
+                            "reasoning_mode_default", "summary"
+                        ),
                     },
                 )
                 continue
 
             if msg_type == "set_model":
                 try:
-                    session.model = _safe_text(incoming.get("model"))
+                    session.model = _safe_text(incoming.get("model"), field_name="model")
                 except ValueError as exc:
                     await _send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
-                await knowledge.save_session(
-                    session_id=session.session_id,
-                    model=session.model,
-                    system_prompt=session.system_prompt,
-                    actor_id=session.actor_id,
-                )
                 await _send_json(websocket, {"type": "info", "message": f"Model set to {session.model}"})
-                continue
-
-            if msg_type == "set_web_mode":
-                try:
-                    session.web_assist_enabled = _safe_bool(incoming.get("enabled"))
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                await _send_json(websocket, {"type": "web_mode", "enabled": session.web_assist_enabled})
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "info",
-                        "message": (
-                            "Web assist enabled for prompts."
-                            if session.web_assist_enabled
-                            else "Web assist disabled."
-                        ),
-                    },
-                )
-                continue
-
-            if msg_type == "set_knowledge_mode":
-                try:
-                    desired = _safe_bool(incoming.get("enabled"))
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                if session.grounded_mode_enabled and not desired:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "message": "Grounded mode forces Knowledge Assist on.",
-                        },
-                    )
-                    await _send_json(websocket, {"type": "knowledge_mode", "enabled": True})
-                    continue
-                session.knowledge_assist_enabled = desired
-                await _send_json(websocket, {"type": "knowledge_mode", "enabled": session.knowledge_assist_enabled})
-                continue
-
-            if msg_type == "set_grounded_mode":
-                try:
-                    session.grounded_mode_enabled = _safe_bool(incoming.get("enabled"))
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                if session.grounded_mode_enabled:
-                    session.knowledge_assist_enabled = True
-                    await _send_json(websocket, {"type": "knowledge_mode", "enabled": True})
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "grounded_mode",
-                        "enabled": session.grounded_mode_enabled,
-                    },
-                )
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "info",
-                        "message": (
-                            "Grounded mode enabled."
-                            if session.grounded_mode_enabled
-                            else "Grounded mode disabled."
-                        ),
-                    },
-                )
-                continue
-
-            if msg_type == "set_grounded_profile":
-                try:
-                    session.grounded_profile = _safe_profile(incoming.get("profile"))
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "grounded_profile",
-                        "profile": session.grounded_profile,
-                    },
-                )
-                continue
-
-            if msg_type == "set_reasoning_mode":
-                try:
-                    session.reasoning_mode = _safe_reasoning_mode(
-                        incoming.get("mode"),
-                        default=session.reasoning_mode,
-                    )
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "info",
-                        "message": f"Reasoning mode set to {session.reasoning_mode}.",
-                    },
-                )
-                continue
-
-            if msg_type == "web_search":
-                try:
-                    query = _safe_text(incoming.get("query"))
-                except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-                raw_limit = incoming.get("max_results")
-                if raw_limit is None:
-                    max_results = settings.web_search_max_results
-                elif isinstance(raw_limit, int):
-                    max_results = raw_limit
-                else:
-                    await _send_json(websocket, {"type": "error", "message": "max_results must be an integer."})
-                    continue
-                max_results = max(1, min(max_results, 10))
-
-                request_id = str(uuid.uuid4())
-                assist = await _resolve_assist(
-                    session=session,
-                    prompt=query,
-                    request_id=request_id,
-                    websocket=websocket,
-                    knowledge=knowledge,
-                )
-
-                try:
-                    results = await _run_web_search(
-                        web_search,
-                        query=assist.web_query,
-                        max_results=max_results,
-                    )
-                except WebSearchError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
-                    continue
-
-                serialized_web = _serialize_web_results(results)
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "web_results",
-                        "query": assist.web_query,
-                        "original_query": query,
-                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                        "results": serialized_web,
-                    },
-                )
-
-                if session.grounded_mode_enabled:
-                    run_id = str(uuid.uuid4())
-                    await knowledge.log_grounded_run_start(
-                        run_id=run_id,
-                        session_id=session.session_id,
-                        actor_id=session.actor_id,
-                        mode="grounded_web",
-                        profile=session.grounded_profile,
-                        prompt=query,
-                    )
-                    memory_cards = knowledge.memory_to_evidence_cards(
-                        memory_results=assist.memory_results,
-                        actor_id=session.actor_id,
-                        current_session_id=session.session_id,
-                        start_index=1,
-                    )
-                    web_cards = knowledge.web_to_evidence_cards(
-                        web_results=serialized_web,
-                        start_index=1 + len(memory_cards),
-                    )
-                    cards = [*memory_cards, *web_cards]
-                    await knowledge.log_grounded_evidence(run_id=run_id, cards=cards)
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "evidence_used",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "results": _serialize_evidence_cards(cards),
-                        },
-                    )
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "grounding_status",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "action": "web_search",
-                            "status": "full",
-                            "profile": session.grounded_profile,
-                            "exact_required": assist.exact_required,
-                            "overall_confidence": sum(item.confidence for item in cards) / max(1, len(cards)),
-                            "note": "Web results are annotated with source tags and confidence.",
-                        },
-                    )
-                    await knowledge.log_grounded_run_finish(
-                        run_id=run_id,
-                        status="full",
-                        note="Web evidence emitted.",
-                    )
                 continue
 
             if msg_type == "reset":
@@ -1365,589 +970,77 @@ async def chat_ws(websocket: WebSocket) -> None:
                 continue
 
             try:
-                prompt = _safe_text(incoming.get("prompt"))
+                prompt = _safe_text(incoming.get("prompt"), field_name="prompt")
             except ValueError as exc:
                 await _send_json(websocket, {"type": "error", "message": str(exc)})
                 continue
-            try:
-                request_reasoning_mode = _safe_reasoning_mode(
-                    incoming.get("reasoning_mode"),
-                    default=session.reasoning_mode,
-                )
-            except ValueError as exc:
-                await _send_json(websocket, {"type": "error", "message": str(exc)})
-                continue
-            session.reasoning_mode = request_reasoning_mode
+            profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
+            default_reasoning_mode = str(
+                profile_snapshot.preferences.get("chat", {}).get("reasoning_mode_default", "summary")
+            )
+            reasoning_mode = _safe_reasoning_mode(incoming.get("reasoning_mode") or default_reasoning_mode)
+            terminal_require_confirm = bool(settings.terminal_require_confirm) or bool(
+                profile_snapshot.preferences.get("tools", {}).get("terminal_require_confirm", True)
+            )
 
             request_id = str(uuid.uuid4())
-            await knowledge.save_turn(
-                session_id=session.session_id,
-                speaker="me",
-                content=prompt,
-                request_id=request_id,
-                model=session.model,
-                actor_id=session.actor_id,
-            )
-
-            ingestion = await _run_pre_assist_ingestion(
-                session=session,
-                prompt=prompt,
-                request_id=request_id,
-                websocket=websocket,
-                knowledge=knowledge,
-            )
-
             session.messages.append({"role": "user", "content": prompt})
-            model_messages = list(session.messages)
 
-            assist = await _resolve_assist(
-                session=session,
-                prompt=prompt,
-                request_id=request_id,
-                websocket=websocket,
-                knowledge=knowledge,
-            )
+            await _send_json(websocket, {"type": "start", "request_id": request_id})
 
-            use_web_for_chat = (
-                session.web_assist_enabled
-                and (
-                    not session.grounded_mode_enabled
-                    or session.grounded_profile == "balanced"
-                )
-            )
-            web_results: list[WebSearchResult] = []
-            snippet_only_web_results: list[WebSearchResult] = []
-            serialized_web_results: list[dict[str, Any]] = []
-            snippet_only_serialized_web_results: list[dict[str, Any]] = []
-            search_review_items: list[URLReviewSavedItem] = []
-            search_review_evidence_cards: list[EvidenceCard] = []
-            web_research_stats: dict[str, Any] = {
-                "web_research_query_count": 0,
-                "web_raw_result_count": 0,
-                "web_deduped_result_count": 0,
-                "web_trusted_kept_count": 0,
-                "web_trusted_dropped_count": 0,
-                "web_search_error_count": 0,
-            }
-            if use_web_for_chat:
-                research = await _run_web_research(
-                    web_search=web_search,
-                    assist=assist,
-                    prompt=prompt,
-                    max_results=settings.web_search_max_results,
-                )
-                web_results = research.trusted_results
-                dropped_untrusted = max(0, len(research.deduped_results) - len(research.trusted_results))
-                web_research_stats = {
-                    "web_research_query_count": len(research.queries),
-                    "web_raw_result_count": len(research.raw_results),
-                    "web_deduped_result_count": len(research.deduped_results),
-                    "web_trusted_kept_count": len(research.trusted_results),
-                    "web_trusted_dropped_count": dropped_untrusted,
-                    "web_search_error_count": len(research.errors),
-                }
-                serialized_web_results = _serialize_web_results(web_results)
-                snippet_only_serialized_web_results = list(serialized_web_results)
-                snippet_only_web_results = list(web_results)
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "web_results",
-                        "query": assist.web_query,
-                        "research_queries": research.queries,
-                        "original_query": prompt,
-                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                        "results": serialized_web_results,
-                        "request_id": request_id,
-                        "trusted_only": settings.web_trusted_only,
-                        "trusted_kept_count": len(research.trusted_results),
-                        "trusted_dropped_count": dropped_untrusted,
-                    },
-                )
-
-                if research.errors:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "request_id": request_id,
-                            "message": (
-                                "Some web research queries failed, continuing with successful results "
-                                f"(failed={len(research.errors)})."
-                            ),
-                        },
-                    )
-                if settings.web_trusted_only and dropped_untrusted:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "request_id": request_id,
-                            "message": (
-                                "Filtered untrusted web sources before synthesis "
-                                f"(kept={len(research.trusted_results)}, dropped={dropped_untrusted})."
-                            ),
-                        },
-                    )
-
-                if settings.url_review_enabled and settings.web_assist_page_review_enabled:
-                    review_limit = min(
-                        max(1, settings.web_assist_page_review_max_urls),
-                        max(1, len(serialized_web_results)),
-                    )
-                    if serialized_web_results:
-                        try:
-                            search_review_items, search_review_evidence_cards = (
-                                await knowledge.review_web_results_for_context(
-                                    model=session.model,
-                                    web_results=serialized_web_results,
-                                    max_urls=review_limit,
-                                    start_index=1,
-                                )
-                            )
-                        except Exception as exc:
-                            err_text = str(exc).strip() or exc.__class__.__name__
-                            # Latency guardrail: retry with a smaller reviewed set before giving up.
-                            if review_limit > 1:
-                                try:
-                                    search_review_items, search_review_evidence_cards = (
-                                        await knowledge.review_web_results_for_context(
-                                            model=session.model,
-                                            web_results=serialized_web_results,
-                                            max_urls=1,
-                                            start_index=1,
-                                        )
-                                    )
-                                except Exception as retry_exc:
-                                    retry_text = str(retry_exc).strip() or retry_exc.__class__.__name__
-                                    search_review_items = [
-                                        URLReviewSavedItem(
-                                            url=str(serialized_web_results[0].get("url", "")).strip(),
-                                            status="failed",
-                                            raw_file=None,
-                                            meaning_file=None,
-                                            artifact_id=None,
-                                            indexed_count=0,
-                                            error=retry_text,
-                                        )
-                                    ]
-                                    await _send_json(
-                                        websocket,
-                                        {
-                                            "type": "info",
-                                            "request_id": request_id,
-                                            "message": (
-                                                "Web page review failed after fallback, continuing with snippets: "
-                                                f"{retry_text}"
-                                            ),
-                                        },
-                                    )
-                                else:
-                                    await _send_json(
-                                        websocket,
-                                        {
-                                            "type": "info",
-                                            "request_id": request_id,
-                                            "message": (
-                                                "Web page review slowed down; retried with a smaller set "
-                                                "(max_urls=1)."
-                                            ),
-                                        },
-                                    )
-                            else:
-                                search_review_items = [
-                                    URLReviewSavedItem(
-                                        url=str(serialized_web_results[0].get("url", "")).strip(),
-                                        status="failed",
-                                        raw_file=None,
-                                        meaning_file=None,
-                                        artifact_id=None,
-                                        indexed_count=0,
-                                        error=err_text,
-                                    )
-                                ]
-                                await _send_json(
-                                    websocket,
-                                    {
-                                        "request_id": request_id,
-                                        "type": "info",
-                                        "message": (
-                                            "Web page review failed, continuing with search snippets: "
-                                            f"{err_text}"
-                                        ),
-                                    },
-                                )
-
-                    saved_count = sum(1 for item in search_review_items if item.status == "saved")
-                    failed_count = max(0, len(search_review_items) - saved_count)
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "web_review_context",
-                            "request_id": request_id,
-                            "items": _serialize_url_review_items(search_review_items),
-                        },
-                    )
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "request_id": request_id,
-                            "message": (
-                                "Reviewed top web pages for context "
-                                f"(saved={saved_count}, failed={failed_count})."
-                            ),
-                        },
-                    )
-
-                snippet_only_serialized_web_results, dropped_duplicate_snippets = (
-                    _filter_snippet_rows_for_reviewed_urls(
-                        web_rows=serialized_web_results,
-                        review_items=search_review_items,
-                    )
-                )
-                snippet_only_web_results = [
-                    WebSearchResult(
-                        title=str(row.get("title", "")).strip() or str(row.get("url", "")).strip(),
-                        url=str(row.get("url", "")).strip(),
-                        snippet=str(row.get("snippet", "")).strip(),
-                    )
-                    for row in snippet_only_serialized_web_results
-                    if str(row.get("url", "")).strip()
-                ]
-                if dropped_duplicate_snippets:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "request_id": request_id,
-                            "message": (
-                                "Using reviewed page evidence instead of duplicate search snippets "
-                                f"(dropped_snippets={dropped_duplicate_snippets})."
-                            ),
-                        },
-                    )
-
-            if session.grounded_mode_enabled:
-                if not session.knowledge_assist_enabled:
-                    session.knowledge_assist_enabled = True
-
-                run_id = str(uuid.uuid4())
-                await knowledge.log_grounded_run_start(
-                    run_id=run_id,
-                    session_id=session.session_id,
-                    actor_id=session.actor_id,
-                    mode="grounded",
-                    profile=session.grounded_profile,
-                    prompt=prompt,
-                )
-
-                memory_results_for_grounded, excluded_memory_count = _filter_memory_for_web_synthesis(
-                    memory_results=assist.memory_results,
-                    session=session,
-                    exact_required=assist.exact_required,
-                    has_web_results=bool(web_results),
-                )
-                memory_cards = knowledge.memory_to_evidence_cards(
-                    memory_results=memory_results_for_grounded,
-                    actor_id=session.actor_id,
-                    current_session_id=session.session_id,
-                    start_index=1,
-                )
-                review_cards = _relabel_evidence_cards(
-                    ingestion.review_evidence_cards,
-                    start_index=1 + len(memory_cards),
-                )
-                search_review_cards = _relabel_evidence_cards(
-                    search_review_evidence_cards,
-                    start_index=1 + len(memory_cards) + len(review_cards),
-                )
-                web_cards = knowledge.web_to_evidence_cards(
-                    web_results=snippet_only_serialized_web_results,
-                    start_index=1 + len(memory_cards) + len(review_cards) + len(search_review_cards),
-                )
-                evidence_cards = [
-                    *memory_cards,
-                    *review_cards,
-                    *search_review_cards,
-                    *web_cards,
-                ]
-
-                if excluded_memory_count:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "info",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "message": (
-                                "Excluded actor-owned memory evidence for exact query with web results "
-                                f"(excluded={excluded_memory_count})."
-                            ),
-                        },
-                    )
-
-                await knowledge.log_grounded_evidence(run_id=run_id, cards=evidence_cards)
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "evidence_used",
-                        "request_id": request_id,
-                        "run_id": run_id,
-                        "results": _serialize_evidence_cards(evidence_cards),
-                    },
-                )
-
+            assistant_chunks: list[str] = []
+            if prompt.strip().startswith("/"):
                 try:
-                    grounded: GroundedResponse = await asyncio.wait_for(
-                        knowledge.generate_grounded_response(
-                            prompt=prompt,
-                            model=session.model,
-                            grounded_profile=session.grounded_profile,
-                            exact_required=assist.exact_required,
-                            evidence_cards=evidence_cards,
-                            reasoning_mode=session.reasoning_mode,
-                        ),
-                        timeout=max(5, settings.grounded_timeout_seconds),
+                    if tools is None:
+                        raise WorkspaceToolError("Local tools are unavailable in this session.")
+                    tool_output = await _handle_local_tool_command(
+                        prompt=prompt,
+                        tools=tools,
+                        model=session.model,
+                        ollama=ollama,
+                        terminal_require_confirm=terminal_require_confirm,
                     )
-                except asyncio.TimeoutError:
-                    grounded = GroundedResponse(
-                        status="insufficient",
-                        answer_text="",
-                        claims=[],
-                        overall_confidence=0.0,
-                        clarify_question="Grounded mode timed out. What exact field or fact should I verify first?",
-                        note="Timed out while grounding.",
-                    )
+                except (WorkspaceToolError, WorkspaceSecurityError) as exc:
+                    tool_output = f"Tool error: {exc}"
+                except OllamaStreamError as exc:
+                    tool_output = f"Summary generation failed: {exc}"
+                except Exception as exc:  # pragma: no cover - safety net
+                    tool_output = f"Unexpected tool failure: {exc}"
 
-                grounded_debug_meta = _build_debug_metadata(
-                    assist=assist,
-                    web_results=web_results,
-                    web_review_items=search_review_items,
-                    reasoning_mode=session.reasoning_mode,
-                    grounded=grounded,
-                    evidence_cards=evidence_cards,
-                    web_research_stats=web_research_stats,
-                    excluded_memory_count=excluded_memory_count,
-                )
-
-                if session.reasoning_mode in {"summary", "verbose", "debug"} and grounded.reasoning_text:
+                for chunk in _chunks(tool_output):
+                    assistant_chunks.append(chunk)
                     await _send_json(
                         websocket,
-                        {
-                            "type": "reasoning",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "mode": session.reasoning_mode,
-                            "text": grounded.reasoning_text,
-                        },
-                    )
-                if session.reasoning_mode == "debug":
-                    debug_segments = []
-                    if grounded.debug_text:
-                        debug_segments.append(grounded.debug_text)
-                    debug_segments.append(_debug_metadata_to_text(grounded_debug_meta))
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "debug",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "mode": session.reasoning_mode,
-                            "text": "\n\n".join(segment for segment in debug_segments if segment.strip()),
-                            "meta": grounded_debug_meta,
-                        },
+                        {"type": "token", "request_id": request_id, "text": chunk},
                     )
 
-                await knowledge.log_grounded_claims(
-                    run_id=run_id,
-                    claims=grounded.claims,
-                    cards=evidence_cards,
-                    is_exact_required=assist.exact_required,
-                )
-                await knowledge.log_grounded_run_finish(
-                    run_id=run_id,
-                    status=grounded.status,
-                    note=grounded.note,
-                )
-
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "grounding_status",
-                        "request_id": request_id,
-                        "run_id": run_id,
-                        "status": grounded.status,
-                        "profile": session.grounded_profile,
-                        "exact_required": assist.exact_required,
-                        "overall_confidence": grounded.overall_confidence,
-                        "note": grounded.note,
-                    },
-                )
-
-                if grounded.status == "insufficient":
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "clarify_needed",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "question": grounded.clarify_question,
-                        },
-                    )
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "done",
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "model": session.model,
-                            "web_assist_enabled": session.web_assist_enabled,
-                            "knowledge_assist_enabled": session.knowledge_assist_enabled,
-                            "grounded_mode_enabled": session.grounded_mode_enabled,
-                            "grounded_profile": session.grounded_profile,
-                            "reasoning_mode": session.reasoning_mode,
-                        },
-                    )
-                    continue
-
-                await _send_json(websocket, {"type": "start", "request_id": request_id, "run_id": run_id})
-                for chunk in _chunks(grounded.answer_text):
-                    await _send_json(
-                        websocket,
-                        {"type": "token", "request_id": request_id, "run_id": run_id, "text": chunk},
-                    )
-
-                assistant_text = grounded.answer_text.strip()
+                assistant_text = "".join(assistant_chunks).strip()
                 if assistant_text:
                     session.messages.append({"role": "assistant", "content": assistant_text})
-                    await knowledge.save_turn(
-                        session_id=session.session_id,
-                        speaker="you",
-                        content=assistant_text,
-                        request_id=request_id,
-                        model=session.model,
-                        actor_id=session.actor_id,
-                    )
-
-                _schedule_background(
-                    knowledge.index_turn_insights(
-                        session_id=session.session_id,
-                        speaker="me",
-                        content=prompt,
-                        model=session.model,
-                        actor_id=session.actor_id,
-                    )
-                )
-                if assistant_text:
-                    _schedule_background(
-                        knowledge.index_turn_insights(
-                            session_id=session.session_id,
-                            speaker="you",
-                            content=assistant_text,
-                            model=session.model,
-                            actor_id=session.actor_id,
-                        )
-                    )
 
                 await _send_json(
                     websocket,
                     {
                         "type": "done",
                         "request_id": request_id,
-                        "run_id": run_id,
                         "model": session.model,
-                        "web_assist_enabled": session.web_assist_enabled,
-                        "knowledge_assist_enabled": session.knowledge_assist_enabled,
-                        "grounded_mode_enabled": session.grounded_mode_enabled,
-                        "grounded_profile": session.grounded_profile,
-                        "reasoning_mode": session.reasoning_mode,
                     },
                 )
                 continue
 
-            memory_results_for_chat, excluded_memory_non_grounded = _filter_memory_for_web_synthesis(
-                memory_results=assist.memory_results,
-                session=session,
-                exact_required=assist.exact_required,
-                has_web_results=bool(web_results),
-            )
-            if excluded_memory_non_grounded:
-                await _send_json(
-                    websocket,
-                    {
-                        "type": "info",
-                        "request_id": request_id,
-                        "message": (
-                            "Excluded actor-owned memory evidence for exact query with web results "
-                            f"(excluded={excluded_memory_non_grounded})."
-                        ),
-                    },
-                )
-
-            all_review_items = [*ingestion.review_items, *search_review_items]
-            has_review_context = any(item.status == "saved" and item.meaning for item in all_review_items)
-            if memory_results_for_chat or snippet_only_web_results or has_review_context:
-                history_without_latest = session.messages[:-1]
-                latest_user_message = session.messages[-1]
-                context_messages: list[dict[str, str]] = []
-                if memory_results_for_chat:
-                    context_messages.append(
-                        {
-                            "role": "system",
-                            "content": _build_memory_context(
-                                query=assist.memory_query,
-                                results=memory_results_for_chat,
-                                session=session,
-                            ),
-                        }
-                    )
-                if snippet_only_web_results:
-                    context_messages.append(
-                        {
-                            "role": "system",
-                            "content": _build_web_context(query=assist.web_query, results=snippet_only_web_results),
-                        }
-                    )
-                review_context = _build_review_context(all_review_items)
-                if has_review_context:
-                    context_messages.append(
-                        {
-                            "role": "system",
-                            "content": review_context,
-                        }
-                    )
-                model_messages = [
-                    *history_without_latest,
-                    *context_messages,
-                    latest_user_message,
-                ]
-
-            if session.reasoning_mode != "hidden":
-                model_messages = [
-                    *model_messages,
-                    {
-                        "role": "system",
-                        "content": _build_reasoning_instruction(session.reasoning_mode),
-                    },
-                ]
-
-            await _send_json(websocket, {"type": "start", "request_id": request_id})
-
-            assistant_chunks: list[str] = []
             try:
                 async for chunk in ollama.stream_chat(
                     model=session.model,
-                    messages=model_messages,
+                    messages=list(session.messages),
                     temperature=settings.default_temperature,
                     num_ctx=settings.default_num_ctx,
+                    think=_resolve_think_setting(model=session.model, reasoning_mode=reasoning_mode),
                 ):
                     assistant_chunks.append(chunk)
-                    if session.reasoning_mode == "hidden":
-                        await _send_json(
-                            websocket,
-                            {"type": "token", "request_id": request_id, "text": chunk},
-                        )
+                    await _send_json(
+                        websocket,
+                        {"type": "token", "request_id": request_id, "text": chunk},
+                    )
             except OllamaStreamError as exc:
                 await _send_json(websocket, {"type": "error", "message": str(exc)})
                 if session.messages and session.messages[-1]["role"] == "user":
@@ -1959,88 +1052,9 @@ async def chat_ws(websocket: WebSocket) -> None:
                     session.messages.pop()
                 continue
 
-            raw_assistant_text = "".join(assistant_chunks).strip()
-            assistant_text = raw_assistant_text
-            if session.reasoning_mode != "hidden":
-                reasoning_text, parsed_answer, model_debug_text = _parse_reasoning_output(
-                    raw_assistant_text,
-                    session.reasoning_mode,
-                )
-                assistant_text = parsed_answer.strip()
-                if not assistant_text:
-                    assistant_text = raw_assistant_text
-
-                if reasoning_text:
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "reasoning",
-                            "request_id": request_id,
-                            "mode": session.reasoning_mode,
-                            "text": reasoning_text,
-                        },
-                    )
-
-                if session.reasoning_mode == "debug":
-                    debug_meta = _build_debug_metadata(
-                        assist=assist,
-                        web_results=web_results,
-                        web_review_items=search_review_items,
-                        reasoning_mode=session.reasoning_mode,
-                        web_research_stats=web_research_stats,
-                        excluded_memory_count=excluded_memory_non_grounded,
-                    )
-                    debug_segments = []
-                    if model_debug_text:
-                        debug_segments.append(model_debug_text.strip())
-                    debug_segments.append(_debug_metadata_to_text(debug_meta))
-                    await _send_json(
-                        websocket,
-                        {
-                            "type": "debug",
-                            "request_id": request_id,
-                            "mode": session.reasoning_mode,
-                            "text": "\n\n".join(segment for segment in debug_segments if segment.strip()),
-                            "meta": debug_meta,
-                        },
-                    )
-
-                for chunk in _chunks(assistant_text):
-                    await _send_json(
-                        websocket,
-                        {"type": "token", "request_id": request_id, "text": chunk},
-                    )
+            assistant_text = "".join(assistant_chunks).strip()
             if assistant_text:
                 session.messages.append({"role": "assistant", "content": assistant_text})
-                await knowledge.save_turn(
-                    session_id=session.session_id,
-                    speaker="you",
-                    content=assistant_text,
-                    request_id=request_id,
-                    model=session.model,
-                    actor_id=session.actor_id,
-                )
-
-            if session.knowledge_assist_enabled:
-                _schedule_background(
-                    knowledge.index_turn_insights(
-                        session_id=session.session_id,
-                        speaker="me",
-                        content=prompt,
-                        model=session.model,
-                        actor_id=session.actor_id,
-                    )
-                )
-                if assistant_text:
-                    _schedule_background(
-                        knowledge.index_turn_insights(
-                            session_id=session.session_id,
-                            speaker="you",
-                            content=assistant_text,
-                            model=session.model,
-                            actor_id=session.actor_id,
-                        )
-                    )
 
             await _send_json(
                 websocket,
@@ -2048,11 +1062,6 @@ async def chat_ws(websocket: WebSocket) -> None:
                     "type": "done",
                     "request_id": request_id,
                     "model": session.model,
-                    "web_assist_enabled": session.web_assist_enabled,
-                    "knowledge_assist_enabled": session.knowledge_assist_enabled,
-                    "grounded_mode_enabled": session.grounded_mode_enabled,
-                    "grounded_profile": session.grounded_profile,
-                    "reasoning_mode": session.reasoning_mode,
                 },
             )
     except WebSocketDisconnect:

@@ -9,50 +9,23 @@ services:
       DEFAULT_MODEL: qwen2.5:7b
       DEFAULT_TEMPERATURE: "0.2"
       DEFAULT_NUM_CTX: "4096"
-      WEB_ASSIST_DEFAULT: "false"
-      KNOWLEDGE_ASSIST_DEFAULT: "true"
-      KNOWLEDGE_RECURSION_PASSES: "3"
-      GROUNDED_MODE_DEFAULT: "true"
-      GROUNDED_PROFILE_DEFAULT: "balanced"
-      REASONING_MODE_DEFAULT: "summary"
-      GROUNDED_TIMEOUT_SECONDS: "25"
       DEFAULT_ACTOR_ID: "anonymous"
-      DIRECT_SAVE_ENABLED: "true"
-      MEMORY_EXPORT_DIR: /data/memory_exports
-      DIRECT_SAVE_MAX_TURNS: "5000"
-      URL_REVIEW_ENABLED: "true"
-      URL_REVIEW_MAX_URLS: "3"
-      URL_REVIEW_TIMEOUT_SECONDS: "20"
-      URL_REVIEW_MAX_BYTES: "2000000"
-      WEB_REVIEW_MEANING_MAX_CHARS: "650"
-      WEB_ASSIST_PAGE_REVIEW_ENABLED: "true"
-      WEB_ASSIST_PAGE_REVIEW_MAX_URLS: "2"
-      WEB_RESEARCH_MAX_QUERIES: "3"
-      WEB_TRUSTED_ONLY: "true"
-      WEB_TRUSTED_DOMAINS: "whitehouse.gov,state.gov,defense.gov,congress.gov,cia.gov,dni.gov,reuters.com,apnews.com,bbc.com,nytimes.com,washingtonpost.com,wsj.com,bloomberg.com,wikipedia.org,britannica.com,cfr.org"
-      SQLITE_DB_PATH: /data/local_model_pro.db
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: local_model_pro_insights
-      EMBEDDING_MODEL: nomic-embed-text
+      WORKSPACE_ROOT: /workspace
+      FILESYSTEM_TOOLS_ENABLED: "true"
+      TERMINAL_TOOLS_ENABLED: "true"
+      TERMINAL_REQUIRE_CONFIRM: "true"
+      TERMINAL_TIMEOUT_SECONDS: "25"
+      TERMINAL_MAX_OUTPUT_BYTES: "60000"
+      FS_READ_MAX_BYTES: "120000"
+      FS_LIST_MAX_ENTRIES: "400"
+      FS_FIND_MAX_RESULTS: "60"
+      FS_SUMMARY_MAX_FILES: "8"
+      FS_SUMMARY_FILE_CHARS: "2400"
+      ADMIN_STATE_PATH: /workspace/data/admin_profile_state.json
     ports:
       - "8765:8765"
     restart: unless-stopped
-    depends_on:
-      - qdrant
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - local_model_pro_data:/data
-
-  qdrant:
-    image: qdrant/qdrant:v1.13.6
-    container_name: local-model-pro-qdrant
-    ports:
-      - "6333:6333"
-    restart: unless-stopped
-    volumes:
-      - qdrant_storage:/qdrant/storage
-
-volumes:
-  local_model_pro_data:
-  qdrant_storage:
+      - ./:/workspace

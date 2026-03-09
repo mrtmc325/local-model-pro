@@ -4,48 +4,374 @@ const modelListMeta = document.getElementById("modelListMeta");
 const customModelInput = document.getElementById("customModelInput");
 const refreshModelsBtn = document.getElementById("refreshModelsBtn");
 const applyModelBtn = document.getElementById("applyModelBtn");
-const knowledgeAssistToggle = document.getElementById("knowledgeAssistToggle");
-const knowledgeModeMeta = document.getElementById("knowledgeModeMeta");
-const groundedModeToggle = document.getElementById("groundedModeToggle");
-const groundedProfileSelect = document.getElementById("groundedProfileSelect");
-const groundedModeMeta = document.getElementById("groundedModeMeta");
-const reasoningModeSelect = document.getElementById("reasoningModeSelect");
-const reasoningModeMeta = document.getElementById("reasoningModeMeta");
-const webAssistToggle = document.getElementById("webAssistToggle");
-const webQueryInput = document.getElementById("webQueryInput");
-const webSearchBtn = document.getElementById("webSearchBtn");
-const webModeMeta = document.getElementById("webModeMeta");
+const pullModelInput = document.getElementById("pullModelInput");
+const pullModelBtn = document.getElementById("pullModelBtn");
+const refreshPullJobBtn = document.getElementById("refreshPullJobBtn");
+const deleteModelBtn = document.getElementById("deleteModelBtn");
+const modelAdminMeta = document.getElementById("modelAdminMeta");
+const storeSelect = document.getElementById("storeSelect");
+const storeQueryInput = document.getElementById("storeQueryInput");
+const storeSearchBtn = document.getElementById("storeSearchBtn");
+const storeOpenBtn = document.getElementById("storeOpenBtn");
+const storeResultMeta = document.getElementById("storeResultMeta");
+const storeResults = document.getElementById("storeResults");
 const connectBtn = document.getElementById("connectBtn");
 const resetBtn = document.getElementById("resetBtn");
+const reasoningViewSelect = document.getElementById("reasoningViewSelect");
 const activeModelLabel = document.getElementById("activeModelLabel");
 const statusBadge = document.getElementById("statusBadge");
 const chatLog = document.getElementById("chatLog");
-const evidenceLog = document.getElementById("evidenceLog");
-const reasoningPanel = document.getElementById("reasoningPanel");
-const reasoningLog = document.getElementById("reasoningLog");
-const debugPanel = document.getElementById("debugPanel");
-const debugLog = document.getElementById("debugLog");
 const chatForm = document.getElementById("chatForm");
 const promptInput = document.getElementById("promptInput");
 const sendBtn = document.getElementById("sendBtn");
+const menuToggleBtn = document.getElementById("menuToggleBtn");
+const menuCloseBtn = document.getElementById("menuCloseBtn");
+const drawerOverlay = document.getElementById("drawerOverlay");
+const controlDrawer = document.getElementById("controlDrawer");
+const toolHelpBtn = document.getElementById("toolHelpBtn");
+const toolListBtn = document.getElementById("toolListBtn");
+const toolTreeBtn = document.getElementById("toolTreeBtn");
+const toolFindQueryInput = document.getElementById("toolFindQueryInput");
+const toolFindPathInput = document.getElementById("toolFindPathInput");
+const toolFindBtn = document.getElementById("toolFindBtn");
+const toolReadPathInput = document.getElementById("toolReadPathInput");
+const toolReadBtn = document.getElementById("toolReadBtn");
+const toolSummaryPathInput = document.getElementById("toolSummaryPathInput");
+const toolSummaryBtn = document.getElementById("toolSummaryBtn");
+const toolRunCommandInput = document.getElementById("toolRunCommandInput");
+const toolRunPreviewBtn = document.getElementById("toolRunPreviewBtn");
+const toolRunExecBtn = document.getElementById("toolRunExecBtn");
+const profileActorInput = document.getElementById("profileActorInput");
+const profileLoadBtn = document.getElementById("profileLoadBtn");
+const profileSaveBtn = document.getElementById("profileSaveBtn");
+const profileResetBtn = document.getElementById("profileResetBtn");
+const profileMeta = document.getElementById("profileMeta");
+const profileThemeSelect = document.getElementById("profileThemeSelect");
+const profileDensitySelect = document.getElementById("profileDensitySelect");
+const profileFontScaleInput = document.getElementById("profileFontScaleInput");
+const profileReasoningSelect = document.getElementById("profileReasoningSelect");
+const profileSendShortcutSelect = document.getElementById("profileSendShortcutSelect");
+const profileTerminalConfirmInput = document.getElementById("profileTerminalConfirmInput");
+const profileSystemMessagesInput = document.getElementById("profileSystemMessagesInput");
+const profileVerboseErrorsInput = document.getElementById("profileVerboseErrorsInput");
+const profileSystemPromptInput = document.getElementById("profileSystemPromptInput");
+const adminTokenInput = document.getElementById("adminTokenInput");
+const adminLoadBtn = document.getElementById("adminLoadBtn");
+const adminRefreshEventsBtn = document.getElementById("adminRefreshEventsBtn");
+const adminSavePlatformBtn = document.getElementById("adminSavePlatformBtn");
+const adminCreateUsernameInput = document.getElementById("adminCreateUsernameInput");
+const adminCreateRoleSelect = document.getElementById("adminCreateRoleSelect");
+const adminCreateUserBtn = document.getElementById("adminCreateUserBtn");
+const adminUsersList = document.getElementById("adminUsersList");
+const adminEventsList = document.getElementById("adminEventsList");
+const adminMeta = document.getElementById("adminMeta");
+const platformAllowPull = document.getElementById("platformAllowPull");
+const platformAllowDelete = document.getElementById("platformAllowDelete");
+const platformAllowStoreSearch = document.getElementById("platformAllowStoreSearch");
+const platformAllowFilesystem = document.getElementById("platformAllowFilesystem");
+const platformAllowTerminal = document.getElementById("platformAllowTerminal");
+const platformAllowShellExecute = document.getElementById("platformAllowShellExecute");
+const platformReadonlyMode = document.getElementById("platformReadonlyMode");
+const toolActionElements = [
+  toolHelpBtn,
+  toolListBtn,
+  toolTreeBtn,
+  toolFindBtn,
+  toolReadBtn,
+  toolSummaryBtn,
+  toolRunPreviewBtn,
+  toolRunExecBtn,
+].filter(Boolean);
+const toolInputElements = [
+  toolFindQueryInput,
+  toolFindPathInput,
+  toolReadPathInput,
+  toolSummaryPathInput,
+  toolRunCommandInput,
+].filter(Boolean);
 
 const state = {
   ws: null,
   connected: false,
   inflight: false,
   assistantEl: null,
+  assistantRaw: "",
   currentModel: null,
   availableModels: [],
-  webAssistEnabled: false,
-  knowledgeAssistEnabled: true,
-  groundedModeEnabled: true,
-  groundedProfile: "balanced",
-  reasoningMode: "summary",
+  modelStores: [],
+  activePullJobId: null,
+  pullPollTimer: null,
+  profileVersion: null,
+  profileLoadedActor: "anonymous",
+  profilePreferences: null,
+  adminPlatform: null,
 };
+
+function setDrawerOpen(open) {
+  const isOpen = Boolean(open);
+  document.body.classList.toggle("drawer-open", isOpen);
+  if (menuToggleBtn) {
+    menuToggleBtn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+  }
+  if (drawerOverlay) {
+    drawerOverlay.setAttribute("aria-hidden", isOpen ? "false" : "true");
+  }
+  if (controlDrawer) {
+    controlDrawer.setAttribute("aria-hidden", isOpen ? "false" : "true");
+  }
+}
+
+function closeDrawer() {
+  setDrawerOpen(false);
+}
+
+function toggleDrawer() {
+  setDrawerOpen(!document.body.classList.contains("drawer-open"));
+}
 
 function wsUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/ws/chat`;
+}
+
+function currentActorId() {
+  const value = String(profileActorInput?.value || "").trim();
+  return value || "anonymous";
+}
+
+function adminHeaders(baseHeaders = {}) {
+  const headers = { ...baseHeaders };
+  const token = String(adminTokenInput?.value || "").trim();
+  if (token) {
+    headers["X-Admin-Token"] = token;
+  }
+  return headers;
+}
+
+async function apiJson(path, options = {}) {
+  const response = await fetch(path, options);
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch (_err) {
+    payload = {};
+  }
+  if (!response.ok) {
+    const detail = payload?.detail;
+    if (typeof detail === "string" && detail) {
+      throw new Error(detail);
+    }
+    throw new Error(`Request failed (${response.status})`);
+  }
+  return payload;
+}
+
+function setProfileMeta(text) {
+  if (profileMeta) {
+    profileMeta.textContent = text;
+  }
+}
+
+function setAdminMeta(text) {
+  if (adminMeta) {
+    adminMeta.textContent = text;
+  }
+}
+
+function profilePayloadFromForm() {
+  return {
+    appearance: {
+      theme_id: String(profileThemeSelect?.value || "aurora-dusk"),
+      density: String(profileDensitySelect?.value || "comfortable"),
+      font_scale: Number(profileFontScaleInput?.value || 1),
+    },
+    chat: {
+      reasoning_mode_default: String(profileReasoningSelect?.value || "summary"),
+      system_prompt: String(profileSystemPromptInput?.value || ""),
+      send_shortcut: String(profileSendShortcutSelect?.value || "enter"),
+    },
+    tools: {
+      terminal_require_confirm: Boolean(profileTerminalConfirmInput?.checked),
+      show_tool_tips: true,
+    },
+    notifications: {
+      show_system_messages: Boolean(profileSystemMessagesInput?.checked),
+      verbose_errors: Boolean(profileVerboseErrorsInput?.checked),
+    },
+  };
+}
+
+function applyProfilePreferences(preferences, { updateControls = true } = {}) {
+  const payload = preferences || {};
+  const appearance = payload.appearance || {};
+  const chat = payload.chat || {};
+  const tools = payload.tools || {};
+  const notifications = payload.notifications || {};
+
+  const theme = String(appearance.theme_id || "aurora-dusk");
+  document.body.dataset.theme = theme;
+
+  const fontScale = Number(appearance.font_scale || 1);
+  if (Number.isFinite(fontScale)) {
+    document.documentElement.style.setProperty("--ui-font-scale", String(fontScale));
+  }
+
+  document.body.classList.toggle("density-compact", String(appearance.density || "comfortable") === "compact");
+
+  if (updateControls) {
+    if (profileThemeSelect) {
+      profileThemeSelect.value = theme;
+    }
+    if (profileDensitySelect) {
+      profileDensitySelect.value = String(appearance.density || "comfortable");
+    }
+    if (profileFontScaleInput) {
+      profileFontScaleInput.value = String(fontScale || 1);
+    }
+    if (profileReasoningSelect) {
+      profileReasoningSelect.value = String(chat.reasoning_mode_default || "summary");
+    }
+    if (profileSendShortcutSelect) {
+      profileSendShortcutSelect.value = String(chat.send_shortcut || "enter");
+    }
+    if (profileTerminalConfirmInput) {
+      profileTerminalConfirmInput.checked = Boolean(tools.terminal_require_confirm);
+    }
+    if (profileSystemMessagesInput) {
+      profileSystemMessagesInput.checked = Boolean(notifications.show_system_messages);
+    }
+    if (profileVerboseErrorsInput) {
+      profileVerboseErrorsInput.checked = Boolean(notifications.verbose_errors);
+    }
+    if (profileSystemPromptInput) {
+      profileSystemPromptInput.value = String(chat.system_prompt || "");
+    }
+  }
+
+  if (reasoningViewSelect && !reasoningViewSelect.dataset.userChanged) {
+    reasoningViewSelect.value = String(chat.reasoning_mode_default || "summary");
+  }
+}
+
+function platformPatchFromForm() {
+  return {
+    allow_model_pull: Boolean(platformAllowPull?.checked),
+    allow_model_delete: Boolean(platformAllowDelete?.checked),
+    allow_model_store_search: Boolean(platformAllowStoreSearch?.checked),
+    allow_filesystem_tools: Boolean(platformAllowFilesystem?.checked),
+    allow_terminal_tools: Boolean(platformAllowTerminal?.checked),
+    allow_shell_execute: Boolean(platformAllowShellExecute?.checked),
+    readonly_mode: Boolean(platformReadonlyMode?.checked),
+  };
+}
+
+function applyPlatformToControls(platform) {
+  const payload = platform || {};
+  if (platformAllowPull) {
+    platformAllowPull.checked = Boolean(payload.allow_model_pull);
+  }
+  if (platformAllowDelete) {
+    platformAllowDelete.checked = Boolean(payload.allow_model_delete);
+  }
+  if (platformAllowStoreSearch) {
+    platformAllowStoreSearch.checked = Boolean(payload.allow_model_store_search);
+  }
+  if (platformAllowFilesystem) {
+    platformAllowFilesystem.checked = Boolean(payload.allow_filesystem_tools);
+  }
+  if (platformAllowTerminal) {
+    platformAllowTerminal.checked = Boolean(payload.allow_terminal_tools);
+  }
+  if (platformAllowShellExecute) {
+    platformAllowShellExecute.checked = Boolean(payload.allow_shell_execute);
+  }
+  if (platformReadonlyMode) {
+    platformReadonlyMode.checked = Boolean(payload.readonly_mode);
+  }
+}
+
+function renderAdminUsers(users) {
+  if (!adminUsersList) {
+    return;
+  }
+  adminUsersList.innerHTML = "";
+  if (!Array.isArray(users) || users.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "field-help";
+    empty.textContent = "No users configured.";
+    adminUsersList.appendChild(empty);
+    return;
+  }
+
+  users.forEach((user) => {
+    const row = document.createElement("div");
+    row.className = "admin-user-row";
+    row.dataset.userId = String(user.id || "");
+
+    const meta = document.createElement("div");
+    meta.className = "admin-user-meta";
+    meta.textContent = `${String(user.username || "unknown")} (${String(user.role || "operator")})`;
+    row.appendChild(meta);
+
+    const controls = document.createElement("div");
+    controls.className = "admin-user-controls";
+
+    const roleSelect = document.createElement("select");
+    roleSelect.innerHTML = '<option value="operator">operator</option><option value="sysadmin">sysadmin</option>';
+    roleSelect.value = String(user.role || "operator");
+    controls.appendChild(roleSelect);
+
+    const statusSelect = document.createElement("select");
+    statusSelect.innerHTML = '<option value="active">active</option><option value="disabled">disabled</option>';
+    statusSelect.value = String(user.status || "active");
+    controls.appendChild(statusSelect);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "tool-action";
+    saveBtn.textContent = "Save";
+    saveBtn.addEventListener("click", () => {
+      void updateAdminUser(String(user.id || ""), {
+        role: roleSelect.value,
+        status: statusSelect.value,
+      });
+    });
+    controls.appendChild(saveBtn);
+
+    const disableBtn = document.createElement("button");
+    disableBtn.type = "button";
+    disableBtn.className = "tool-action danger";
+    disableBtn.textContent = "Disable";
+    disableBtn.disabled = Boolean(user.is_bootstrap_root);
+    disableBtn.addEventListener("click", () => {
+      void disableAdminUser(String(user.id || ""));
+    });
+    controls.appendChild(disableBtn);
+
+    row.appendChild(controls);
+    adminUsersList.appendChild(row);
+  });
+}
+
+function renderAdminEvents(events) {
+  if (!adminEventsList) {
+    return;
+  }
+  adminEventsList.innerHTML = "";
+  if (!Array.isArray(events) || !events.length) {
+    const empty = document.createElement("div");
+    empty.className = "field-help";
+    empty.textContent = "No events.";
+    adminEventsList.appendChild(empty);
+    return;
+  }
+  events.slice(0, 60).forEach((event) => {
+    const row = document.createElement("div");
+    row.className = "admin-event-row";
+    const at = String(event.at || "");
+    row.textContent = `${at} · ${String(event.event_type || "event")} · ${String(event.detail || "")}`;
+    adminEventsList.appendChild(row);
+  });
 }
 
 function bytesToHuman(value) {
@@ -60,278 +386,6 @@ function bytesToHuman(value) {
     unit += 1;
   }
   return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
-function queryPlanToText(msg) {
-  const lines = ["Recursive query plan:"];
-  const exactRequired = Boolean(msg.exact_required);
-  lines.push(`exact_required: ${exactRequired}`);
-  lines.push(`reason: ${String(msg.reason || "").trim()}`);
-  lines.push(`meaning: ${String(msg.meaning || "").trim()}`);
-  lines.push(`purpose: ${String(msg.purpose || "").trim()}`);
-  lines.push(`db_query: ${String(msg.db_query || "").trim()}`);
-  lines.push(`web_query: ${String(msg.web_query || "").trim()}`);
-  return lines.join("\n");
-}
-
-function memoryResultsToText(msg) {
-  const query = String(msg.query || "").trim();
-  const lines = [];
-  if (query) {
-    lines.push(`Memory results for: ${query}`);
-  }
-  const results = Array.isArray(msg.results) ? msg.results : [];
-  if (results.length === 0) {
-    lines.push("No memory results returned.");
-  } else {
-    results.forEach((item, idx) => {
-      if (!item || typeof item !== "object") {
-        return;
-      }
-      const insight = String(item.insight || "").trim() || "(empty insight)";
-      const score = Number(item.score || 0).toFixed(3);
-      const source = String(item.source_session || "").trim() || "unknown";
-      const scope = String(item.actor_scope || "").trim();
-      lines.push(`${idx + 1}. ${insight}`);
-      lines.push(`score=${score} session=${source}${scope ? ` scope=${scope}` : ""}`);
-    });
-  }
-  return lines.join("\n");
-}
-
-function webResultsToText(msg) {
-  const query = String(msg.query || "").trim();
-  const retrievedAt = String(msg.retrieved_at || "").trim();
-  const researchQueries = Array.isArray(msg.research_queries) ? msg.research_queries : [];
-  const trustedKept = Number(msg.trusted_kept_count || 0);
-  const trustedDropped = Number(msg.trusted_dropped_count || 0);
-  const lines = [];
-  if (query) {
-    lines.push(`Web results for: ${query}`);
-  }
-  if (researchQueries.length > 0) {
-    lines.push(`Research queries: ${researchQueries.join(" | ")}`);
-  }
-  if (retrievedAt) {
-    lines.push(`Retrieved: ${retrievedAt}`);
-  }
-  if (msg.trusted_kept_count !== undefined || msg.trusted_dropped_count !== undefined) {
-    lines.push(`trusted_kept=${trustedKept} trusted_dropped=${trustedDropped}`);
-  }
-  const results = Array.isArray(msg.results) ? msg.results : [];
-  if (results.length === 0) {
-    lines.push("No results returned.");
-  } else {
-    results.forEach((item, idx) => {
-      if (!item || typeof item !== "object") {
-        return;
-      }
-      const title = String(item.title || "").trim() || "(untitled)";
-      const url = String(item.url || "").trim();
-      const snippet = String(item.snippet || "").trim();
-      const sourceTag = String(item.source_tag || "").trim();
-      const confidence = Number(item.confidence || 0).toFixed(2);
-      lines.push(`${idx + 1}. ${title}`);
-      if (url) {
-        lines.push(url);
-      }
-      if (sourceTag) {
-        lines.push(`source=${sourceTag} confidence=${confidence}`);
-      }
-      if (snippet) {
-        lines.push(snippet);
-      }
-    });
-  }
-  return lines.join("\n");
-}
-
-function evidenceUsedToText(msg) {
-  const results = Array.isArray(msg.results) ? msg.results : [];
-  if (results.length === 0) {
-    return "Evidence used: none";
-  }
-  const lines = ["Evidence used:"];
-  results.forEach((item) => {
-    if (!item || typeof item !== "object") {
-      return;
-    }
-    const label = String(item.label || "").trim() || "E?";
-    const sourceType = String(item.source_type || "").trim() || "unknown";
-    const confidence = Number(item.confidence || 0).toFixed(2);
-    const scope = String(item.actor_scope || "").trim();
-    lines.push(`${label} ${sourceType} conf=${confidence}${scope ? ` scope=${scope}` : ""}`);
-  });
-  return lines.join("\n");
-}
-
-function groundingStatusToText(msg) {
-  const profile = String(msg.profile || state.groundedProfile);
-  const status = String(msg.status || "unknown");
-  const confidence = Number(msg.overall_confidence || 0).toFixed(2);
-  const exactRequired = Boolean(msg.exact_required);
-  const note = String(msg.note || "").trim();
-  const lines = [
-    `Grounding status: ${status} (profile=${profile}, exact_required=${exactRequired}, confidence=${confidence})`,
-  ];
-  if (note) {
-    lines.push(`note: ${note}`);
-  }
-  return lines.join("\n");
-}
-
-function clarifyToText(msg) {
-  const question = String(msg.question || "").trim();
-  return question ? `Clarify needed: ${question}` : "Clarify needed: specify the exact fact to verify.";
-}
-
-function memorySavedToText(msg) {
-  const artifactId = String(msg.artifact_id || "").trim() || "(none)";
-  const filePath = String(msg.file_path || "").trim() || "(none)";
-  const indexedCount = Number(msg.indexed_count || 0);
-  const note = String(msg.note || "").trim();
-  const lines = [`Memory saved: artifact=${artifactId} indexed=${indexedCount} file=${filePath}`];
-  if (note) {
-    lines.push(`note: ${note}`);
-  }
-  return lines.join("\n");
-}
-
-function urlReviewSavedToText(msg) {
-  const items = Array.isArray(msg.items) ? msg.items : [];
-  if (items.length === 0) {
-    return "URL review save: no items";
-  }
-  const lines = ["URL review save results:"];
-  items.forEach((item, idx) => {
-    if (!item || typeof item !== "object") {
-      return;
-    }
-    const url = String(item.url || "").trim() || "(unknown url)";
-    const status = String(item.status || "").trim() || "unknown";
-    const indexed = Number(item.indexed_count || 0);
-    const error = String(item.error || "").trim();
-    lines.push(`${idx + 1}. ${url} status=${status} indexed=${indexed}`);
-    if (error) {
-      lines.push(`error: ${error}`);
-    }
-  });
-  return lines.join("\n");
-}
-
-function webReviewContextToText(msg) {
-  const items = Array.isArray(msg.items) ? msg.items : [];
-  if (items.length === 0) {
-    return "Web page review context: no items";
-  }
-  const lines = ["Web page review context:"];
-  items.forEach((item, idx) => {
-    if (!item || typeof item !== "object") {
-      return;
-    }
-    const title = String(item.title || "").trim();
-    const url = String(item.final_url || item.url || "").trim() || "(unknown url)";
-    const status = String(item.status || "").trim() || "unknown";
-    const meaning = String(item.meaning || "").trim();
-    const error = String(item.error || "").trim();
-    const domain = String(item.domain || "").trim();
-    const sourceType = String(item.source_type || "").trim();
-    const reviewedChars = Number(item.reviewed_chars || 0);
-    lines.push(`${idx + 1}. ${title || url} status=${status}`);
-    lines.push(url);
-    if (domain || sourceType) {
-      lines.push(`domain=${domain} source_type=${sourceType}`);
-    }
-    if (reviewedChars > 0) {
-      lines.push(`reviewed_chars=${reviewedChars}`);
-    }
-    if (meaning) {
-      lines.push(`meaning: ${meaning}`);
-    }
-    if (error) {
-      lines.push(`error: ${error}`);
-    }
-  });
-  return lines.join("\n");
-}
-
-function updateWebModeMeta() {
-  if (state.groundedModeEnabled && state.groundedProfile === "strict") {
-    webModeMeta.textContent =
-      "Web assist is available for direct web search. Strict grounded chat does not inject web evidence automatically.";
-    return;
-  }
-  webModeMeta.textContent = state.webAssistEnabled
-    ? "Web assist is on. Each chat prompt can include fresh web context."
-    : "Web assist is off.";
-}
-
-function updateKnowledgeModeMeta() {
-  if (state.groundedModeEnabled) {
-    knowledgeModeMeta.textContent =
-      "Knowledge assist is forced on by Grounded mode for recursion + memory-first retrieval.";
-    return;
-  }
-  knowledgeModeMeta.textContent = state.knowledgeAssistEnabled
-    ? "Knowledge assist is on. Prompts are recursively broken down before memory/web lookup."
-    : "Knowledge assist is off.";
-}
-
-function updateGroundedModeMeta() {
-  if (!state.groundedModeEnabled) {
-    groundedModeMeta.textContent = "Grounded mode is off. Responses may use normal best-effort generation.";
-    return;
-  }
-  if (state.groundedProfile === "strict") {
-    groundedModeMeta.textContent =
-      "Grounded mode is on (strict). Knowledge Assist is forced on. Chat responses rely on memory evidence first without automatic web injection.";
-    return;
-  }
-  groundedModeMeta.textContent =
-    "Grounded mode is on (balanced). Knowledge Assist is forced on. Web evidence can be included when Web Assist is enabled.";
-}
-
-function setReasoningPanelText(value) {
-  const text = String(value || "").trim();
-  reasoningLog.textContent = text || "No reasoning emitted for this response.";
-}
-
-function setDebugPanelText(value) {
-  const text = String(value || "").trim();
-  debugLog.textContent = text || "No debug metadata emitted for this response.";
-}
-
-function renderReasoningPanels() {
-  const mode = state.reasoningMode;
-  const reasoningHidden = mode === "hidden";
-  const debugHidden = mode !== "debug";
-  reasoningPanel.classList.toggle("is-hidden", reasoningHidden);
-  debugPanel.classList.toggle("is-hidden", debugHidden);
-  if (reasoningHidden) {
-    setReasoningPanelText("Reasoning hidden.");
-    setDebugPanelText("Debug hidden.");
-  }
-}
-
-function updateReasoningModeMeta() {
-  if (state.reasoningMode === "hidden") {
-    reasoningModeMeta.textContent = "Reasoning is hidden. Chat shows answer text only.";
-    return;
-  }
-  if (state.reasoningMode === "summary") {
-    reasoningModeMeta.textContent = "Reasoning summary is shown in a separate panel.";
-    return;
-  }
-  if (state.reasoningMode === "verbose") {
-    reasoningModeMeta.textContent = "Verbose reasoning notes are shown separately from the answer.";
-    return;
-  }
-  reasoningModeMeta.textContent = "Debug view includes reasoning plus retrieval metadata.";
-}
-
-function syncKnowledgeToggleState() {
-  knowledgeAssistToggle.checked = state.knowledgeAssistEnabled;
-  knowledgeAssistToggle.disabled = state.groundedModeEnabled;
 }
 
 function normalizeModelEntry(entry) {
@@ -427,6 +481,13 @@ function setStatus(online, labelText) {
 }
 
 function addMessage(role, text) {
+  if (
+    role === "system" &&
+    state.profilePreferences?.notifications &&
+    state.profilePreferences.notifications.show_system_messages === false
+  ) {
+    return null;
+  }
   const el = document.createElement("div");
   el.className = `msg msg-${role}`;
   el.textContent = text;
@@ -435,61 +496,149 @@ function addMessage(role, text) {
   return el;
 }
 
-function renderEvidence(results) {
-  evidenceLog.innerHTML = "";
-  if (!Array.isArray(results) || results.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "evidence-empty";
-    empty.textContent = "No evidence yet.";
-    evidenceLog.appendChild(empty);
+function extractReasoningTag(text, tagName) {
+  const pattern = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "gi");
+  const reasoningParts = [];
+  let remaining = String(text || "").replace(pattern, (_match, content) => {
+    const cleaned = String(content || "").trim();
+    if (cleaned) {
+      reasoningParts.push(cleaned);
+    }
+    return "";
+  });
+
+  const openTag = `<${tagName}>`;
+  const closeTag = `</${tagName}>`;
+  const lower = remaining.toLowerCase();
+  const openIndex = lower.lastIndexOf(openTag);
+  if (openIndex >= 0) {
+    const closeIndex = lower.indexOf(closeTag, openIndex);
+    if (closeIndex === -1) {
+      const partial = remaining.slice(openIndex + openTag.length).trim();
+      if (partial) {
+        reasoningParts.push(partial);
+      }
+      remaining = remaining.slice(0, openIndex);
+    }
+  }
+
+  return {
+    remaining,
+    reasoningParts,
+  };
+}
+
+function splitReasoningAndAnswer(rawText) {
+  let working = String(rawText || "");
+  const reasoningParts = [];
+
+  ["think", "reasoning"].forEach((tagName) => {
+    const extracted = extractReasoningTag(working, tagName);
+    working = extracted.remaining;
+    if (extracted.reasoningParts.length) {
+      reasoningParts.push(...extracted.reasoningParts);
+    }
+  });
+
+  return {
+    reasoning: reasoningParts.join("\n\n").trim(),
+    answer: working.replace(/\n{3,}/g, "\n\n").trim(),
+  };
+}
+
+function summarizeReasoning(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  const maxChars = 460;
+  const maxLines = 8;
+  const lines = normalized.split("\n");
+  const limitedLines = lines.slice(0, maxLines).join("\n");
+  const truncated = limitedLines.length > maxChars ? `${limitedLines.slice(0, maxChars - 1)}…` : limitedLines;
+  if (lines.length > maxLines || normalized.length > maxChars) {
+    return `${truncated}\n…`;
+  }
+  return truncated;
+}
+
+function createAssistantShell() {
+  const container = document.createElement("div");
+  container.className = "msg msg-ai msg-ai-structured";
+  container.dataset.raw = "";
+
+  const reasoningBlock = document.createElement("details");
+  reasoningBlock.className = "reasoning-block";
+  reasoningBlock.setAttribute("data-role", "reasoning-block");
+  reasoningBlock.hidden = true;
+
+  const reasoningSummary = document.createElement("summary");
+  reasoningSummary.className = "reasoning-summary";
+  reasoningSummary.setAttribute("data-role", "reasoning-summary");
+  reasoningSummary.textContent = "Reasoning";
+  reasoningBlock.appendChild(reasoningSummary);
+
+  const reasoningBody = document.createElement("div");
+  reasoningBody.className = "reasoning-body";
+  reasoningBody.setAttribute("data-role", "reasoning-body");
+  reasoningBlock.appendChild(reasoningBody);
+
+  const answerBody = document.createElement("div");
+  answerBody.className = "answer-body";
+  answerBody.setAttribute("data-role", "answer-body");
+
+  container.appendChild(reasoningBlock);
+  container.appendChild(answerBody);
+  chatLog.appendChild(container);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return container;
+}
+
+function renderStructuredAssistant(container, rawText) {
+  if (!container) {
+    return;
+  }
+  container.dataset.raw = String(rawText || "");
+  const reasoningBlock = container.querySelector('[data-role="reasoning-block"]');
+  const reasoningSummary = container.querySelector('[data-role="reasoning-summary"]');
+  const reasoningBody = container.querySelector('[data-role="reasoning-body"]');
+  const answerBody = container.querySelector('[data-role="answer-body"]');
+  if (!reasoningBlock || !reasoningSummary || !reasoningBody || !answerBody) {
     return;
   }
 
-  results.forEach((item) => {
-    if (!item || typeof item !== "object") {
-      return;
-    }
-    const card = document.createElement("div");
-    card.className = "evidence-item";
+  const parsed = splitReasoningAndAnswer(rawText);
+  const mode = String(reasoningViewSelect?.value || "summary");
 
-    const label = String(item.label || "").trim() || "E?";
-    const sourceType = String(item.source_type || "").trim() || "unknown";
-    const confidence = Number(item.confidence || 0).toFixed(2);
-    const actorScope = String(item.actor_scope || "").trim();
-    const evidenceId = String(item.evidence_id || "").trim();
+  if (parsed.reasoning && mode !== "hidden") {
+    reasoningBlock.hidden = false;
+    const displayText = mode === "summary" ? summarizeReasoning(parsed.reasoning) : parsed.reasoning;
+    reasoningBody.textContent = displayText;
+    reasoningSummary.textContent =
+      mode === "summary"
+        ? `Reasoning summary (${parsed.reasoning.length} chars)`
+        : `Reasoning (${parsed.reasoning.length} chars)`;
+    reasoningBlock.open = mode === "full";
+  } else if (mode !== "hidden") {
+    reasoningBlock.hidden = false;
+    reasoningSummary.textContent = "Reasoning";
+    reasoningBody.textContent = state.inflight
+      ? "Waiting for reasoning trace..."
+      : "No reasoning trace emitted by this model. Try a thinking-capable model.";
+    reasoningBlock.open = false;
+  } else {
+    reasoningBlock.hidden = true;
+  }
 
-    const meta = document.createElement("div");
-    meta.className = "evidence-meta";
-    meta.textContent = `${label} ${sourceType} conf=${confidence}${actorScope ? ` scope=${actorScope}` : ""}`;
-    card.appendChild(meta);
+  answerBody.textContent = parsed.answer || (state.inflight ? "(generating...)" : "");
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
 
-    if (evidenceId) {
-      const evidenceMeta = document.createElement("div");
-      evidenceMeta.className = "evidence-meta";
-      evidenceMeta.textContent = `id=${evidenceId}`;
-      card.appendChild(evidenceMeta);
-    }
-
-    const content = String(item.content || "").trim();
-    if (content) {
-      const contentEl = document.createElement("div");
-      contentEl.className = "evidence-content";
-      contentEl.textContent = content;
-      card.appendChild(contentEl);
-    }
-
-    const url = String(item.url || "").trim();
-    if (url) {
-      const link = document.createElement("a");
-      link.className = "evidence-link";
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noreferrer noopener";
-      link.textContent = url;
-      card.appendChild(link);
-    }
-
-    evidenceLog.appendChild(card);
+function rerenderReasoningMessages() {
+  const messages = document.querySelectorAll(".msg-ai.msg-ai-structured");
+  messages.forEach((container) => {
+    const raw = String(container.dataset.raw || "");
+    renderStructuredAssistant(container, raw);
   });
 }
 
@@ -497,7 +646,12 @@ function setBusy(busy) {
   state.inflight = busy;
   sendBtn.disabled = busy || !state.connected;
   promptInput.disabled = !state.connected;
-  webSearchBtn.disabled = busy || !state.connected;
+  toolActionElements.forEach((el) => {
+    el.disabled = busy || !state.connected;
+  });
+  toolInputElements.forEach((el) => {
+    el.disabled = busy || !state.connected;
+  });
 }
 
 function selectedModel() {
@@ -510,6 +664,318 @@ function selectedModel() {
 
 function updateActiveModelLabel(modelName) {
   activeModelLabel.textContent = modelName ? `model: ${modelName}` : "model: n/a";
+}
+
+function setModelAdminMeta(text) {
+  if (modelAdminMeta) {
+    modelAdminMeta.textContent = text;
+  }
+}
+
+function selectedStore() {
+  const id = String(storeSelect?.value || "").trim();
+  return state.modelStores.find((store) => String(store.id) === id) || null;
+}
+
+function storeSearchUrl(store, query) {
+  const template = String(store?.search_url_template || "").trim();
+  if (!template) {
+    return "";
+  }
+  return template.replace("{query}", encodeURIComponent(query));
+}
+
+function renderStoreOptions() {
+  if (!storeSelect) {
+    return;
+  }
+  storeSelect.innerHTML = "";
+  if (!state.modelStores.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No stores available";
+    option.disabled = true;
+    option.selected = true;
+    storeSelect.appendChild(option);
+    return;
+  }
+  state.modelStores.forEach((store) => {
+    const option = document.createElement("option");
+    option.value = String(store.id || "");
+    option.textContent = String(store.name || store.id || "store");
+    storeSelect.appendChild(option);
+  });
+}
+
+function renderStoreResults(items) {
+  if (!storeResults) {
+    return;
+  }
+  storeResults.innerHTML = "";
+  if (!Array.isArray(items) || !items.length) {
+    const empty = document.createElement("div");
+    empty.className = "field-help";
+    empty.textContent = "No results.";
+    storeResults.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "store-result-item";
+
+    const name = document.createElement("div");
+    name.className = "store-result-name";
+    name.textContent = String(item.name || item.id || "unnamed model");
+    row.appendChild(name);
+
+    const metaParts = [];
+    if (item.downloads != null) {
+      metaParts.push(`downloads=${item.downloads}`);
+    }
+    if (item.likes != null) {
+      metaParts.push(`likes=${item.likes}`);
+    }
+    if (item.updated_at) {
+      metaParts.push(`updated=${item.updated_at}`);
+    }
+    if (metaParts.length) {
+      const meta = document.createElement("div");
+      meta.className = "store-result-meta";
+      meta.textContent = metaParts.join("  ");
+      row.appendChild(meta);
+    }
+
+    if (item.url) {
+      const link = document.createElement("a");
+      link.className = "store-result-link";
+      link.href = String(item.url);
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Open";
+      row.appendChild(link);
+    }
+
+    storeResults.appendChild(row);
+  });
+}
+
+async function loadProfilePreferences() {
+  const actorId = currentActorId();
+  if (profileLoadBtn) {
+    profileLoadBtn.disabled = true;
+  }
+  try {
+    const payload = await apiJson(
+      `/api/v1/profile/preferences?actor_id=${encodeURIComponent(actorId)}`
+    );
+    state.profileVersion = Number(payload.version || 1);
+    state.profileLoadedActor = String(payload.actor_id || actorId);
+    state.profilePreferences = payload.preferences || {};
+    if (profileActorInput) {
+      profileActorInput.value = state.profileLoadedActor;
+    }
+    applyProfilePreferences(state.profilePreferences);
+    setProfileMeta(
+      `Loaded actor=${state.profileLoadedActor} version=${state.profileVersion}`
+    );
+  } catch (error) {
+    setProfileMeta(`Profile load error: ${error.message}`);
+  } finally {
+    if (profileLoadBtn) {
+      profileLoadBtn.disabled = false;
+    }
+  }
+}
+
+async function saveProfilePreferences() {
+  const actorId = currentActorId();
+  if (profileSaveBtn) {
+    profileSaveBtn.disabled = true;
+  }
+  try {
+    const payload = await apiJson("/api/v1/profile/preferences", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actor_id: actorId,
+        base_version: state.profileVersion,
+        patch: profilePayloadFromForm(),
+      }),
+    });
+    state.profileVersion = Number(payload.version || state.profileVersion || 1);
+    state.profileLoadedActor = String(payload.actor_id || actorId);
+    state.profilePreferences = payload.preferences || {};
+    applyProfilePreferences(state.profilePreferences);
+    setProfileMeta(
+      `Saved profile. version=${state.profileVersion} keys=${(payload.updated_keys || []).length}`
+    );
+  } catch (error) {
+    setProfileMeta(`Profile save error: ${error.message}`);
+  } finally {
+    if (profileSaveBtn) {
+      profileSaveBtn.disabled = false;
+    }
+  }
+}
+
+async function resetProfilePreferences() {
+  const actorId = currentActorId();
+  if (profileResetBtn) {
+    profileResetBtn.disabled = true;
+  }
+  try {
+    const payload = await apiJson("/api/v1/profile/preferences/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actor_id: actorId, scope: "all" }),
+    });
+    state.profileVersion = Number(payload.version || 1);
+    state.profileLoadedActor = String(payload.actor_id || actorId);
+    state.profilePreferences = payload.preferences || {};
+    applyProfilePreferences(state.profilePreferences);
+    setProfileMeta(`Profile reset for ${state.profileLoadedActor}.`);
+  } catch (error) {
+    setProfileMeta(`Profile reset error: ${error.message}`);
+  } finally {
+    if (profileResetBtn) {
+      profileResetBtn.disabled = false;
+    }
+  }
+}
+
+async function loadAdminPlatform() {
+  const payload = await apiJson("/api/v1/admin/platform", {
+    headers: adminHeaders(),
+  });
+  state.adminPlatform = payload.platform || {};
+  applyPlatformToControls(state.adminPlatform);
+}
+
+async function saveAdminPlatform() {
+  if (adminSavePlatformBtn) {
+    adminSavePlatformBtn.disabled = true;
+  }
+  try {
+    const actorId = currentActorId();
+    const payload = await apiJson("/api/v1/admin/platform", {
+      method: "PATCH",
+      headers: adminHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        actor_id: actorId,
+        patch: platformPatchFromForm(),
+      }),
+    });
+    state.adminPlatform = payload.platform || {};
+    applyPlatformToControls(state.adminPlatform);
+    setAdminMeta("Platform policy saved.");
+  } catch (error) {
+    setAdminMeta(`Platform save error: ${error.message}`);
+  } finally {
+    if (adminSavePlatformBtn) {
+      adminSavePlatformBtn.disabled = false;
+    }
+  }
+}
+
+async function loadAdminUsers() {
+  const payload = await apiJson("/api/v1/admin/users", {
+    headers: adminHeaders(),
+  });
+  renderAdminUsers(payload.users || []);
+}
+
+async function createAdminUser() {
+  const username = String(adminCreateUsernameInput?.value || "").trim();
+  if (!username) {
+    setAdminMeta("Enter a username for new user.");
+    return;
+  }
+  if (adminCreateUserBtn) {
+    adminCreateUserBtn.disabled = true;
+  }
+  try {
+    await apiJson("/api/v1/admin/users", {
+      method: "POST",
+      headers: adminHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        actor_id: currentActorId(),
+        username,
+        role: String(adminCreateRoleSelect?.value || "operator"),
+      }),
+    });
+    if (adminCreateUsernameInput) {
+      adminCreateUsernameInput.value = "";
+    }
+    await loadAdminUsers();
+    await loadAdminEvents();
+    setAdminMeta(`Created user ${username}.`);
+  } catch (error) {
+    setAdminMeta(`Create user error: ${error.message}`);
+  } finally {
+    if (adminCreateUserBtn) {
+      adminCreateUserBtn.disabled = false;
+    }
+  }
+}
+
+async function updateAdminUser(userId, patch) {
+  try {
+    await apiJson(`/api/v1/admin/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      headers: adminHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        actor_id: currentActorId(),
+        ...patch,
+      }),
+    });
+    await loadAdminUsers();
+    await loadAdminEvents();
+    setAdminMeta(`Updated user ${userId}.`);
+  } catch (error) {
+    setAdminMeta(`Update user error: ${error.message}`);
+  }
+}
+
+async function disableAdminUser(userId) {
+  try {
+    await apiJson(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}?actor_id=${encodeURIComponent(
+        currentActorId()
+      )}`,
+      {
+        method: "DELETE",
+        headers: adminHeaders(),
+      }
+    );
+    await loadAdminUsers();
+    await loadAdminEvents();
+    setAdminMeta(`Disabled user ${userId}.`);
+  } catch (error) {
+    setAdminMeta(`Disable user error: ${error.message}`);
+  }
+}
+
+async function loadAdminEvents() {
+  const payload = await apiJson("/api/v1/admin/events?limit=60", {
+    headers: adminHeaders(),
+  });
+  renderAdminEvents(payload.events || []);
+}
+
+async function loadAdminData() {
+  if (adminLoadBtn) {
+    adminLoadBtn.disabled = true;
+  }
+  try {
+    await Promise.all([loadAdminPlatform(), loadAdminUsers(), loadAdminEvents()]);
+    setAdminMeta("Admin data loaded.");
+  } catch (error) {
+    setAdminMeta(`Admin load error: ${error.message}`);
+  } finally {
+    if (adminLoadBtn) {
+      adminLoadBtn.disabled = false;
+    }
+  }
 }
 
 async function loadModels() {
@@ -536,11 +1002,212 @@ async function loadModels() {
     const defaultModel = String(payload.default_model || state.availableModels[0].name);
     renderModelOptions(defaultModel);
     customModelInput.value = "";
+    if (pullModelInput && !pullModelInput.value.trim()) {
+      pullModelInput.value = defaultModel;
+    }
   } catch (error) {
     addMessage("system", `Model list error: ${error.message}`);
   } finally {
     refreshModelsBtn.disabled = false;
   }
+}
+
+async function loadModelStores() {
+  if (!storeSelect) {
+    return;
+  }
+  try {
+    const response = await fetch("/api/model-stores");
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Failed to load model stores");
+    }
+    state.modelStores = Array.isArray(payload.stores) ? payload.stores : [];
+    renderStoreOptions();
+  } catch (error) {
+    setModelAdminMeta(`Store load error: ${error.message}`);
+  }
+}
+
+function stopPullPolling() {
+  if (state.pullPollTimer) {
+    window.clearInterval(state.pullPollTimer);
+    state.pullPollTimer = null;
+  }
+}
+
+function startPullPolling(jobId) {
+  stopPullPolling();
+  state.pullPollTimer = window.setInterval(() => {
+    void refreshPullJobStatus(jobId);
+  }, 1500);
+}
+
+async function refreshPullJobStatus(jobId = state.activePullJobId) {
+  if (!jobId) {
+    setModelAdminMeta("No pull job in progress.");
+    return;
+  }
+  try {
+    const response = await fetch(`/api/models/pull/${encodeURIComponent(jobId)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Unable to fetch pull status");
+    }
+
+    const status = String(payload.status || "unknown");
+    const detail = String(payload.detail || "");
+    const progress =
+      typeof payload.completed === "number" && typeof payload.total === "number" && payload.total > 0
+        ? ` (${bytesToHuman(payload.completed)}/${bytesToHuman(payload.total)})`
+        : "";
+
+    if (status === "failed") {
+      setModelAdminMeta(`Pull failed for ${payload.model}: ${payload.error || detail}`);
+      stopPullPolling();
+      state.activePullJobId = null;
+      return;
+    }
+
+    if (status === "done") {
+      setModelAdminMeta(`Pull complete for ${payload.model}.`);
+      stopPullPolling();
+      state.activePullJobId = null;
+      await loadModels();
+      return;
+    }
+
+    setModelAdminMeta(`Pull ${status}: ${detail}${progress}`);
+  } catch (error) {
+    setModelAdminMeta(`Pull status error: ${error.message}`);
+  }
+}
+
+async function startPullModel() {
+  const modelName = String(pullModelInput?.value || "").trim();
+  if (!modelName) {
+    setModelAdminMeta("Enter a model tag to pull.");
+    return;
+  }
+  pullModelBtn.disabled = true;
+  try {
+    const response = await fetch("/api/models/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelName }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Pull request failed");
+    }
+    state.activePullJobId = String(payload.job_id || "");
+    setModelAdminMeta(`Pull queued for ${payload.model}.`);
+    startPullPolling(state.activePullJobId);
+    if (!modelExists(modelName)) {
+      upsertModel(modelName);
+      renderModelOptions(modelName);
+    }
+  } catch (error) {
+    setModelAdminMeta(`Pull request error: ${error.message}`);
+  } finally {
+    pullModelBtn.disabled = false;
+  }
+}
+
+async function deleteSelectedModel() {
+  const modelName = selectedModel();
+  if (!modelName) {
+    setModelAdminMeta("Select a model to delete.");
+    return;
+  }
+  const confirmed = window.confirm(`Delete model '${modelName}' from Ollama?`);
+  if (!confirmed) {
+    return;
+  }
+  deleteModelBtn.disabled = true;
+  try {
+    const response = await fetch("/api/models/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelName }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Delete failed");
+    }
+    setModelAdminMeta(`Deleted model ${modelName}.`);
+    state.availableModels = state.availableModels.filter((item) => item.name !== modelName);
+    renderModelOptions();
+    customModelInput.value = "";
+    if (state.currentModel === modelName) {
+      state.currentModel = null;
+      updateActiveModelLabel("");
+    }
+  } catch (error) {
+    setModelAdminMeta(`Delete error: ${error.message}`);
+  } finally {
+    deleteModelBtn.disabled = false;
+  }
+}
+
+async function searchStoreApi() {
+  const store = selectedStore();
+  if (!store) {
+    setModelAdminMeta("No store selected.");
+    return;
+  }
+  const query = String(storeQueryInput?.value || "").trim();
+  if (!query) {
+    if (storeResultMeta) {
+      storeResultMeta.textContent = "Enter a search term.";
+    }
+    return;
+  }
+  if (!store.supports_api_search) {
+    if (storeResultMeta) {
+      storeResultMeta.textContent = `${store.name} does not expose API search. Use Open Site.`;
+    }
+    renderStoreResults([]);
+    return;
+  }
+  storeSearchBtn.disabled = true;
+  try {
+    const url = `/api/model-stores/search?store_id=${encodeURIComponent(
+      String(store.id || "")
+    )}&q=${encodeURIComponent(query)}`;
+    const response = await fetch(url);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Store search failed");
+    }
+    if (storeResultMeta) {
+      storeResultMeta.textContent = `Found ${Number(payload.count || 0)} results.`;
+    }
+    renderStoreResults(payload.results);
+  } catch (error) {
+    if (storeResultMeta) {
+      storeResultMeta.textContent = `Store search error: ${error.message}`;
+    }
+    renderStoreResults([]);
+  } finally {
+    storeSearchBtn.disabled = false;
+  }
+}
+
+function openStoreSearch() {
+  const store = selectedStore();
+  if (!store) {
+    return;
+  }
+  const query = String(storeQueryInput?.value || "").trim();
+  const target = storeSearchUrl(store, query || "llm");
+  if (!target) {
+    if (storeResultMeta) {
+      storeResultMeta.textContent = "No search URL configured for this store.";
+    }
+    return;
+  }
+  window.open(target, "_blank", "noopener,noreferrer");
 }
 
 function closeWs() {
@@ -561,6 +1228,7 @@ function sendWs(payload) {
 }
 
 function connectWs() {
+  closeDrawer();
   if (state.connected) {
     closeWs();
     addMessage("system", "Disconnected.");
@@ -581,16 +1249,17 @@ function connectWs() {
   ws.onopen = () => {
     setStatus(true, "connected");
     state.connected = true;
+    const actorId = currentActorId();
+    const systemPrompt = String(
+      state.profilePreferences?.chat?.system_prompt || profileSystemPromptInput?.value || ""
+    ).trim();
     sendWs({
       type: "hello",
       model,
-      web_assist_enabled: state.webAssistEnabled,
-      knowledge_assist_enabled: state.knowledgeAssistEnabled,
-      grounded_mode_enabled: state.groundedModeEnabled,
-      grounded_profile: state.groundedProfile,
-      reasoning_mode: state.reasoningMode,
+      actor_id: actorId,
+      system_prompt: systemPrompt || undefined,
     });
-    addMessage("system", `Connected. Requested model: ${model}`);
+    addMessage("system", `Connected. Requested model: ${model} (actor=${actorId})`);
   };
 
   ws.onclose = () => {
@@ -626,190 +1295,55 @@ function connectWs() {
         }
         renderModelOptions(modelName);
       }
-      if (typeof message.web_assist_enabled === "boolean") {
-        state.webAssistEnabled = message.web_assist_enabled;
-        webAssistToggle.checked = state.webAssistEnabled;
-        updateWebModeMeta();
-      }
-      if (typeof message.knowledge_assist_enabled === "boolean") {
-        state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
-      }
-      if (typeof message.grounded_mode_enabled === "boolean") {
-        state.groundedModeEnabled = message.grounded_mode_enabled;
-        groundedModeToggle.checked = state.groundedModeEnabled;
-      }
-      if (typeof message.grounded_profile === "string" && message.grounded_profile) {
-        state.groundedProfile = message.grounded_profile;
-        groundedProfileSelect.value = state.groundedProfile;
-      }
-      if (typeof message.reasoning_mode === "string" && message.reasoning_mode) {
-        state.reasoningMode = message.reasoning_mode;
-        reasoningModeSelect.value = state.reasoningMode;
-      }
-      syncKnowledgeToggleState();
-      updateKnowledgeModeMeta();
-      updateGroundedModeMeta();
-      updateReasoningModeMeta();
-      renderReasoningPanels();
       updateActiveModelLabel(modelName);
       setBusy(false);
       return;
     }
 
-    if (msgType === "web_mode") {
-      state.webAssistEnabled = Boolean(message.enabled);
-      webAssistToggle.checked = state.webAssistEnabled;
-      updateWebModeMeta();
-      return;
-    }
-
-    if (msgType === "knowledge_mode") {
-      state.knowledgeAssistEnabled = Boolean(message.enabled);
-      syncKnowledgeToggleState();
-      updateKnowledgeModeMeta();
-      return;
-    }
-
-    if (msgType === "grounded_mode") {
-      state.groundedModeEnabled = Boolean(message.enabled);
-      groundedModeToggle.checked = state.groundedModeEnabled;
-      if (state.groundedModeEnabled) {
-        state.knowledgeAssistEnabled = true;
-      }
-      syncKnowledgeToggleState();
-      updateKnowledgeModeMeta();
-      updateGroundedModeMeta();
-      updateWebModeMeta();
-      return;
-    }
-
-    if (msgType === "grounded_profile") {
-      const profile = String(message.profile || "").trim();
-      if (profile === "strict" || profile === "balanced") {
-        state.groundedProfile = profile;
-        groundedProfileSelect.value = profile;
-      }
-      updateGroundedModeMeta();
-      updateWebModeMeta();
-      return;
-    }
-
-    if (msgType === "query_plan") {
-      addMessage("system", queryPlanToText(message));
-      return;
-    }
-
-    if (msgType === "memory_results") {
-      addMessage("system", memoryResultsToText(message));
-      return;
-    }
-
-    if (msgType === "web_results") {
-      addMessage("system", webResultsToText(message));
-      return;
-    }
-
-    if (msgType === "evidence_used") {
-      addMessage("system", evidenceUsedToText(message));
-      renderEvidence(message.results);
-      return;
-    }
-
-    if (msgType === "grounding_status") {
-      addMessage("system", groundingStatusToText(message));
-      return;
-    }
-
-    if (msgType === "clarify_needed") {
-      addMessage("system", clarifyToText(message));
-      return;
-    }
-
-    if (msgType === "reasoning") {
-      setReasoningPanelText(String(message.text || ""));
-      return;
-    }
-
-    if (msgType === "debug") {
-      setDebugPanelText(String(message.text || ""));
-      return;
-    }
-
-    if (msgType === "memory_saved") {
-      addMessage("system", memorySavedToText(message));
-      return;
-    }
-
-    if (msgType === "url_review_saved") {
-      addMessage("system", urlReviewSavedToText(message));
-      return;
-    }
-
-    if (msgType === "web_review_context") {
-      addMessage("system", webReviewContextToText(message));
+    if (msgType === "status") {
+      addMessage(
+        "system",
+        `status: model=${String(message.model || "")} messages=${Number(message.message_count || 0)}`
+      );
       return;
     }
 
     if (msgType === "start") {
-      state.assistantEl = addMessage("ai", "");
-      if (state.reasoningMode !== "hidden") {
-        setReasoningPanelText("Waiting for reasoning output...");
-      }
-      if (state.reasoningMode === "debug") {
-        setDebugPanelText("Waiting for debug output...");
-      }
+      state.assistantRaw = "";
+      state.assistantEl = createAssistantShell();
+      renderStructuredAssistant(state.assistantEl, state.assistantRaw);
       setBusy(true);
       return;
     }
 
     if (msgType === "token") {
       if (!state.assistantEl) {
-        state.assistantEl = addMessage("ai", "");
+        state.assistantRaw = "";
+        state.assistantEl = createAssistantShell();
       }
-      state.assistantEl.textContent += String(message.text || "");
-      chatLog.scrollTop = chatLog.scrollHeight;
+      state.assistantRaw += String(message.text || "");
+      renderStructuredAssistant(state.assistantEl, state.assistantRaw);
       return;
     }
 
     if (msgType === "done") {
+      if (state.assistantEl) {
+        renderStructuredAssistant(state.assistantEl, state.assistantRaw);
+      }
       state.assistantEl = null;
+      state.assistantRaw = "";
       setBusy(false);
       if (message.model) {
         state.currentModel = String(message.model);
         updateActiveModelLabel(state.currentModel);
       }
-      if (typeof message.web_assist_enabled === "boolean") {
-        state.webAssistEnabled = message.web_assist_enabled;
-        webAssistToggle.checked = state.webAssistEnabled;
-        updateWebModeMeta();
-      }
-      if (typeof message.knowledge_assist_enabled === "boolean") {
-        state.knowledgeAssistEnabled = message.knowledge_assist_enabled;
-      }
-      if (typeof message.grounded_mode_enabled === "boolean") {
-        state.groundedModeEnabled = message.grounded_mode_enabled;
-        groundedModeToggle.checked = state.groundedModeEnabled;
-      }
-      if (typeof message.grounded_profile === "string" && message.grounded_profile) {
-        state.groundedProfile = message.grounded_profile;
-        groundedProfileSelect.value = state.groundedProfile;
-      }
-      if (typeof message.reasoning_mode === "string" && message.reasoning_mode) {
-        state.reasoningMode = message.reasoning_mode;
-        reasoningModeSelect.value = state.reasoningMode;
-      }
-      syncKnowledgeToggleState();
-      updateKnowledgeModeMeta();
-      updateGroundedModeMeta();
-      updateWebModeMeta();
-      updateReasoningModeMeta();
-      renderReasoningPanels();
       return;
     }
 
     if (msgType === "error") {
       addMessage("system", `Error: ${String(message.message || "unknown error")}`);
       state.assistantEl = null;
+      state.assistantRaw = "";
       setBusy(false);
     }
   };
@@ -839,105 +1373,10 @@ function applyModel() {
   }
 }
 
-function sendWebSearch() {
-  if (!state.connected) {
-    addMessage("system", "Connect first.");
-    return;
-  }
-  const query = webQueryInput.value.trim();
-  if (!query) {
-    addMessage("system", "Enter a web search query.");
-    return;
-  }
-  try {
-    sendWs({ type: "web_search", query });
-  } catch (error) {
-    addMessage("system", `Web search failed: ${error.message}`);
-  }
-}
-
-function toggleWebAssist() {
-  state.webAssistEnabled = webAssistToggle.checked;
-  updateWebModeMeta();
-  if (!state.connected) {
-    return;
-  }
-  try {
-    sendWs({ type: "set_web_mode", enabled: state.webAssistEnabled });
-  } catch (error) {
-    addMessage("system", `Web assist update failed: ${error.message}`);
-  }
-}
-
-function toggleKnowledgeAssist() {
-  state.knowledgeAssistEnabled = knowledgeAssistToggle.checked;
-  updateKnowledgeModeMeta();
-  if (!state.connected) {
-    return;
-  }
-  try {
-    sendWs({ type: "set_knowledge_mode", enabled: state.knowledgeAssistEnabled });
-  } catch (error) {
-    addMessage("system", `Knowledge assist update failed: ${error.message}`);
-  }
-}
-
-function toggleGroundedMode() {
-  state.groundedModeEnabled = groundedModeToggle.checked;
-  if (state.groundedModeEnabled) {
-    state.knowledgeAssistEnabled = true;
-  }
-  syncKnowledgeToggleState();
-  updateKnowledgeModeMeta();
-  updateGroundedModeMeta();
-  updateWebModeMeta();
-  if (!state.connected) {
-    return;
-  }
-  try {
-    sendWs({ type: "set_grounded_mode", enabled: state.groundedModeEnabled });
-  } catch (error) {
-    addMessage("system", `Grounded mode update failed: ${error.message}`);
-  }
-}
-
-function setGroundedProfile() {
-  const profile = groundedProfileSelect.value === "strict" ? "strict" : "balanced";
-  state.groundedProfile = profile;
-  updateGroundedModeMeta();
-  updateWebModeMeta();
-  if (!state.connected) {
-    return;
-  }
-  try {
-    sendWs({ type: "set_grounded_profile", profile });
-  } catch (error) {
-    addMessage("system", `Grounded profile update failed: ${error.message}`);
-  }
-}
-
-function setReasoningMode() {
-  const mode = String(reasoningModeSelect.value || "hidden").trim().toLowerCase();
-  state.reasoningMode = ["summary", "verbose", "debug"].includes(mode) ? mode : "hidden";
-  reasoningModeSelect.value = state.reasoningMode;
-  updateReasoningModeMeta();
-  renderReasoningPanels();
-  if (!state.connected) {
-    return;
-  }
-  try {
-    sendWs({ type: "set_reasoning_mode", mode: state.reasoningMode });
-  } catch (error) {
-    addMessage("system", `Reasoning mode update failed: ${error.message}`);
-  }
-}
-
 function resetConversation() {
   chatLog.innerHTML = "";
-  renderEvidence([]);
   state.assistantEl = null;
-  setReasoningPanelText(state.reasoningMode === "hidden" ? "Reasoning hidden." : "No reasoning yet.");
-  setDebugPanelText(state.reasoningMode === "debug" ? "No debug metadata yet." : "Debug hidden.");
+  state.assistantRaw = "";
   if (!state.connected) {
     addMessage("system", "Local chat view cleared.");
     return;
@@ -952,39 +1391,220 @@ function resetConversation() {
 
 function sendPrompt(event) {
   event.preventDefault();
+  sendChatPrompt(promptInput.value);
+  promptInput.value = "";
+}
+
+function sendChatPrompt(rawPrompt) {
   if (!state.connected) {
     addMessage("system", "Connect first.");
     return;
   }
-  const prompt = promptInput.value.trim();
+  const prompt = String(rawPrompt || "").trim();
   if (!prompt) {
     return;
   }
 
+  if (document.body.classList.contains("drawer-open")) {
+    closeDrawer();
+  }
   addMessage("user", prompt);
-  promptInput.value = "";
   try {
-    sendWs({ type: "chat", prompt, reasoning_mode: state.reasoningMode });
+    const reasoning_mode = String(reasoningViewSelect?.value || "summary");
+    sendWs({ type: "chat", prompt, reasoning_mode });
   } catch (error) {
     addMessage("system", `Send failed: ${error.message}`);
     setBusy(false);
   }
 }
 
+function quoteToolArg(raw) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return "";
+  }
+  if (!/[\s"'\\]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/["\\]/g, "\\$&")}"`;
+}
+
+function runToolCommand(command) {
+  sendChatPrompt(command);
+}
+
+function runFindTool() {
+  const query = String(toolFindQueryInput.value || "").trim();
+  if (!query) {
+    addMessage("system", "Enter a file search query.");
+    return;
+  }
+  const path = String(toolFindPathInput.value || ".").trim() || ".";
+  runToolCommand(`/find ${quoteToolArg(query)} ${quoteToolArg(path)}`);
+}
+
+function runReadTool() {
+  const path = String(toolReadPathInput.value || "").trim();
+  if (!path) {
+    addMessage("system", "Enter a file path to read.");
+    return;
+  }
+  runToolCommand(`/read ${quoteToolArg(path)}`);
+}
+
+function runSummaryTool() {
+  const path = String(toolSummaryPathInput.value || ".").trim() || ".";
+  runToolCommand(`/summary ${quoteToolArg(path)}`);
+}
+
+function runCommandPreview() {
+  const command = String(toolRunCommandInput.value || "").trim();
+  if (!command) {
+    addMessage("system", "Enter a terminal command to preview.");
+    return;
+  }
+  runToolCommand(`/run ${command}`);
+}
+
+function runCommandExecute() {
+  const command = String(toolRunCommandInput.value || "").trim();
+  if (!command) {
+    addMessage("system", "Enter a terminal command to execute.");
+    return;
+  }
+  runToolCommand(`/run! ${command}`);
+}
+
 connectBtn.addEventListener("click", connectWs);
 refreshModelsBtn.addEventListener("click", loadModels);
 applyModelBtn.addEventListener("click", applyModel);
-webSearchBtn.addEventListener("click", sendWebSearch);
-webAssistToggle.addEventListener("change", toggleWebAssist);
-knowledgeAssistToggle.addEventListener("change", toggleKnowledgeAssist);
-groundedModeToggle.addEventListener("change", toggleGroundedMode);
-groundedProfileSelect.addEventListener("change", setGroundedProfile);
-reasoningModeSelect.addEventListener("change", setReasoningMode);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
+if (menuToggleBtn) {
+  menuToggleBtn.addEventListener("click", toggleDrawer);
+}
+if (menuCloseBtn) {
+  menuCloseBtn.addEventListener("click", closeDrawer);
+}
+if (drawerOverlay) {
+  drawerOverlay.addEventListener("click", closeDrawer);
+}
+if (toolHelpBtn) {
+  toolHelpBtn.addEventListener("click", () => runToolCommand("/tools"));
+}
+if (toolListBtn) {
+  toolListBtn.addEventListener("click", () => runToolCommand("/ls ."));
+}
+if (toolTreeBtn) {
+  toolTreeBtn.addEventListener("click", () => runToolCommand("/tree ."));
+}
+if (toolFindBtn) {
+  toolFindBtn.addEventListener("click", runFindTool);
+}
+if (toolReadBtn) {
+  toolReadBtn.addEventListener("click", runReadTool);
+}
+if (toolSummaryBtn) {
+  toolSummaryBtn.addEventListener("click", runSummaryTool);
+}
+if (toolRunPreviewBtn) {
+  toolRunPreviewBtn.addEventListener("click", runCommandPreview);
+}
+if (toolRunExecBtn) {
+  toolRunExecBtn.addEventListener("click", runCommandExecute);
+}
+if (pullModelBtn) {
+  pullModelBtn.addEventListener("click", () => {
+    void startPullModel();
+  });
+}
+if (refreshPullJobBtn) {
+  refreshPullJobBtn.addEventListener("click", () => {
+    void refreshPullJobStatus();
+  });
+}
+if (deleteModelBtn) {
+  deleteModelBtn.addEventListener("click", () => {
+    void deleteSelectedModel();
+  });
+}
+if (storeSearchBtn) {
+  storeSearchBtn.addEventListener("click", () => {
+    void searchStoreApi();
+  });
+}
+if (storeOpenBtn) {
+  storeOpenBtn.addEventListener("click", openStoreSearch);
+}
+if (profileLoadBtn) {
+  profileLoadBtn.addEventListener("click", () => {
+    void loadProfilePreferences();
+  });
+}
+if (profileSaveBtn) {
+  profileSaveBtn.addEventListener("click", () => {
+    void saveProfilePreferences();
+  });
+}
+if (profileResetBtn) {
+  profileResetBtn.addEventListener("click", () => {
+    void resetProfilePreferences();
+  });
+}
+if (profileThemeSelect) {
+  profileThemeSelect.addEventListener("change", () => {
+    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+  });
+}
+if (profileDensitySelect) {
+  profileDensitySelect.addEventListener("change", () => {
+    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+  });
+}
+if (profileFontScaleInput) {
+  profileFontScaleInput.addEventListener("input", () => {
+    applyProfilePreferences(profilePayloadFromForm(), { updateControls: false });
+  });
+}
+if (profileReasoningSelect) {
+  profileReasoningSelect.addEventListener("change", () => {
+    if (reasoningViewSelect && !reasoningViewSelect.dataset.userChanged) {
+      reasoningViewSelect.value = profileReasoningSelect.value;
+    }
+  });
+}
+if (adminLoadBtn) {
+  adminLoadBtn.addEventListener("click", () => {
+    void loadAdminData();
+  });
+}
+if (adminRefreshEventsBtn) {
+  adminRefreshEventsBtn.addEventListener("click", () => {
+    void loadAdminEvents();
+  });
+}
+if (adminSavePlatformBtn) {
+  adminSavePlatformBtn.addEventListener("click", () => {
+    void saveAdminPlatform();
+  });
+}
+if (adminCreateUserBtn) {
+  adminCreateUserBtn.addEventListener("click", () => {
+    void createAdminUser();
+  });
+}
+if (reasoningViewSelect) {
+  reasoningViewSelect.addEventListener("change", () => {
+    reasoningViewSelect.dataset.userChanged = "true";
+    rerenderReasoningMessages();
+  });
+}
 modelFilterInput.addEventListener("input", () => renderModelOptions());
 modelSelect.addEventListener("change", () => {
   customModelInput.value = "";
+  if (pullModelInput && !pullModelInput.value.trim()) {
+    pullModelInput.value = modelSelect.value;
+  }
   renderModelOptions(modelSelect.value);
 });
 
@@ -999,30 +1619,112 @@ modelSelect.addEventListener(
 );
 
 promptInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key !== "Enter") {
+    return;
+  }
+  const sendShortcut = String(
+    state.profilePreferences?.chat?.send_shortcut || profileSendShortcutSelect?.value || "enter"
+  );
+  if (sendShortcut === "ctrl_enter") {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      chatForm.requestSubmit();
+    }
+    return;
+  }
+  if (!event.shiftKey) {
     event.preventDefault();
     chatForm.requestSubmit();
   }
 });
 
-webQueryInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
+if (toolFindQueryInput) {
+  toolFindQueryInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      runFindTool();
+    }
+  });
+}
+if (toolReadPathInput) {
+  toolReadPathInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      runReadTool();
+    }
+  });
+}
+if (toolSummaryPathInput) {
+  toolSummaryPathInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      runSummaryTool();
+    }
+  });
+}
+if (toolRunCommandInput) {
+  toolRunCommandInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") {
+      return;
+    }
     event.preventDefault();
-    sendWebSearch();
-  }
-});
+    if (event.shiftKey) {
+      runCommandExecute();
+      return;
+    }
+    runCommandPreview();
+  });
+}
+if (pullModelInput) {
+  pullModelInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void startPullModel();
+    }
+  });
+}
+if (storeQueryInput) {
+  storeQueryInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void searchStoreApi();
+    }
+  });
+}
+if (profileActorInput) {
+  profileActorInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void loadProfilePreferences();
+    }
+  });
+}
+if (adminCreateUsernameInput) {
+  adminCreateUsernameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void createAdminUser();
+    }
+  });
+}
 
 window.addEventListener("beforeunload", () => {
+  stopPullPolling();
   closeWs();
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && document.body.classList.contains("drawer-open")) {
+    closeDrawer();
+  }
 });
 
 setStatus(false, "offline");
 setBusy(false);
-updateWebModeMeta();
-updateKnowledgeModeMeta();
-updateGroundedModeMeta();
-updateReasoningModeMeta();
-syncKnowledgeToggleState();
-renderEvidence([]);
-renderReasoningPanels();
+updateActiveModelLabel(state.currentModel);
+if (profileActorInput) {
+  profileActorInput.value = state.profileLoadedActor;
+}
 loadModels();
+loadModelStores();
+loadProfilePreferences();
+setDrawerOpen(false);
