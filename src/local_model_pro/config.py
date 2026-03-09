@@ -45,6 +45,24 @@ class Settings:
         .resolve()
     )
     admin_api_token: str = os.getenv("ADMIN_API_TOKEN", "").strip()
+    devflow_enabled: bool = _env_bool("DEVFLOW_ENABLED", "true")
+    devflow_max_concurrent_jobs: int = int(os.getenv("DEVFLOW_MAX_CONCURRENT_JOBS", "1"))
+    devflow_role_timeout_seconds: int = int(os.getenv("DEVFLOW_ROLE_TIMEOUT_SECONDS", "90"))
+    devflow_run_retention: int = int(os.getenv("DEVFLOW_RUN_RETENTION", "30"))
+    devflow_artifact_dir: str = str(
+        Path(
+            os.getenv(
+                "DEVFLOW_ARTIFACT_DIR",
+                str(
+                    Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).expanduser().resolve()
+                    / "data"
+                    / "devflow_runs"
+                ),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
 
 
 settings = Settings()

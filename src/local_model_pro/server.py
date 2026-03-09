@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote_plus
 
 import httpx
@@ -24,6 +24,20 @@ from local_model_pro.admin_profile_store import (
     PreferenceValidationError,
 )
 from local_model_pro.config import settings
+from local_model_pro.devflow import (
+    CODING_ROLES,
+    ROLE_ORDER,
+    DevflowError,
+    DevflowJob,
+    DevflowRuntimeConfig,
+    build_code_pack_markdown,
+    build_documentation_markdown,
+    cleanup_old_runs,
+    resolve_role_models,
+    run_with_retries,
+    trim_jobs,
+    write_devflow_artifacts,
+)
 from local_model_pro.local_tools import (
     CommandResult,
     LocalWorkspaceTools,
@@ -42,6 +56,16 @@ admin_profile_store = AdminProfileStore(
     state_path=Path(settings.admin_state_path),
     default_actor_id=settings.default_actor_id,
 )
+devflow_config = DevflowRuntimeConfig(
+    enabled=settings.devflow_enabled,
+    max_concurrent_jobs=max(1, settings.devflow_max_concurrent_jobs),
+    role_timeout_seconds=max(5, settings.devflow_role_timeout_seconds),
+    run_retention=max(5, settings.devflow_run_retention),
+    artifact_dir=Path(settings.devflow_artifact_dir),
+)
+devflow_jobs: dict[str, DevflowJob] = {}
+devflow_jobs_lock = asyncio.Lock()
+devflow_job_semaphore = asyncio.Semaphore(devflow_config.max_concurrent_jobs)
 
 
 def _utc_now_iso() -> str:
@@ -201,6 +225,57 @@ def _feature_enabled(feature_key: str) -> bool:
     }:
         return False
     return True
+
+
+def _devflow_enabled_or_403() -> None:
+    if not devflow_config.enabled:
+        raise HTTPException(status_code=403, detail="Programming development flow is disabled.")
+
+
+def _job_payload(job: DevflowJob) -> dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "actor_id": job.actor_id,
+        "prompt": job.prompt,
+        "selected_model": job.selected_model,
+        "role_models": job.role_models,
+        "status": job.status,
+        "stage": job.stage,
+        "percent": job.percent,
+        "message": job.message,
+        "started_at": job.started_at,
+        "updated_at": job.updated_at,
+        "finished_at": job.finished_at,
+        "error": job.error,
+        "cancel_requested": job.cancel_requested,
+        "artifacts": job.artifacts,
+        "stages": job.stages,
+        "retries_by_role": job.retries_by_role,
+    }
+
+
+async def _upsert_devflow_job(job: DevflowJob) -> None:
+    async with devflow_jobs_lock:
+        devflow_jobs[job.job_id] = job
+        trim_jobs(devflow_jobs, max_jobs=max(1, devflow_config.run_retention))
+        keep_ids = set(devflow_jobs.keys())
+    cleanup_old_runs(base_dir=devflow_config.artifact_dir, keep_job_ids=keep_ids)
+
+
+async def _get_devflow_job(job_id: str) -> DevflowJob | None:
+    async with devflow_jobs_lock:
+        return devflow_jobs.get(job_id)
+
+
+async def _request_devflow_cancel(job_id: str) -> DevflowJob | None:
+    async with devflow_jobs_lock:
+        job = devflow_jobs.get(job_id)
+        if job is None:
+            return None
+        job.cancel_requested = True
+        job.updated_at = _utc_now_iso()
+        job.message = "Cancellation requested."
+        return job
 
 
 def _get_store_by_id(store_id: str) -> dict[str, Any] | None:
@@ -456,6 +531,337 @@ async def _handle_local_tool_command(
     raise WorkspaceToolError("Unknown tool command. Type /tools for available commands.")
 
 
+async def _run_devflow_job(
+    *,
+    job: DevflowJob,
+    ollama: OllamaClient,
+    emit_event: Callable[[dict[str, Any]], Awaitable[None]],
+) -> None:
+    total_steps = 15
+    completed_steps = 0
+
+    async def push_progress(
+        *,
+        stage: str,
+        role: str | None,
+        status: str,
+        message: str,
+    ) -> None:
+        percent = int((completed_steps / total_steps) * 100)
+        job.stage = stage
+        job.percent = percent
+        job.status = status
+        job.message = message
+        job.updated_at = _utc_now_iso()
+        await _upsert_devflow_job(job)
+        await emit_event(
+            {
+                "type": "devflow_progress",
+                **_job_payload(job),
+                "role": role,
+            }
+        )
+
+    async def call_role(model_name: str, role_prompt: str) -> str:
+        return await asyncio.wait_for(
+            ollama.chat(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are part of a strict multi-model software development workflow. "
+                            "Return only role output content."
+                        ),
+                    },
+                    {"role": "user", "content": role_prompt},
+                ],
+                temperature=0.2,
+                num_ctx=8192,
+            ),
+            timeout=devflow_config.role_timeout_seconds,
+        )
+
+    async def run_role(
+        *,
+        stage: str,
+        role: str,
+        output_key: str,
+        role_prompt: str,
+        status_message: str,
+    ) -> str:
+        nonlocal completed_steps
+        if job.cancel_requested:
+            raise DevflowError("Cancelled by user.")
+        await push_progress(stage=stage, role=role, status="running", message=status_message)
+        model_name = job.role_models.get(role, job.selected_model)
+        output = await run_with_retries(
+            job=job,
+            role=role,
+            role_model=model_name,
+            role_prompt=role_prompt,
+            role_call=call_role,
+            retries=devflow_config.retry_count,
+        )
+        job.outputs[output_key] = output
+        completed_steps += 1
+        job.stages.append(
+            {
+                "stage": stage,
+                "role": role,
+                "output_key": output_key,
+                "model": model_name,
+                "at": _utc_now_iso(),
+            }
+        )
+        await emit_event(
+            {
+                "type": "devflow_stage_result",
+                "job_id": job.job_id,
+                "stage": stage,
+                "role": role,
+                "output_key": output_key,
+                "model": model_name,
+                "status": "completed",
+                "percent": int((completed_steps / total_steps) * 100),
+                "output": output,
+                "updated_at": _utc_now_iso(),
+            }
+        )
+        return output
+
+    def round_bundle(label: str, mapping: dict[str, str]) -> str:
+        lines = [f"{label}:"]
+        for key in sorted(mapping.keys()):
+            lines.append(f"- {key}:")
+            lines.append(mapping[key])
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    async with devflow_job_semaphore:
+        try:
+            job.status = "running"
+            job.stage = "intent"
+            job.percent = 0
+            job.message = "Running intent stage."
+            job.updated_at = _utc_now_iso()
+            await _upsert_devflow_job(job)
+            await push_progress(
+                stage="intent",
+                role=None,
+                status="running",
+                message="Running intent stage.",
+            )
+
+            intent_reasoner = await run_role(
+                stage="intent",
+                role="intent_reasoner",
+                output_key="intent_reasoner",
+                status_message="Analyzing request intent and logic.",
+                role_prompt=(
+                    "Explain in long form what the user is asking for and decompose required logic into subparts.\n\n"
+                    f"User request:\n{job.prompt}"
+                ),
+            )
+            intent_knowledge = await run_role(
+                stage="intent",
+                role="intent_knowledge",
+                output_key="intent_knowledge",
+                status_message="Building general knowledge framing.",
+                role_prompt=(
+                    "Describe in general-knowledge terms what this programming request is about.\n\n"
+                    f"User request:\n{job.prompt}"
+                ),
+            )
+            intent_feasibility = await run_role(
+                stage="intent",
+                role="intent_feasibility",
+                output_key="intent_feasibility",
+                status_message="Synthesizing feasibility prompt.",
+                role_prompt=(
+                    "Convert the user request and analysis into a natural-language-to-code feasibility prompt. "
+                    "Include constraints, architecture hints, and implementation goals.\n\n"
+                    f"Intent reasoner output:\n{intent_reasoner}\n\n"
+                    f"Intent knowledge output:\n{intent_knowledge}\n\n"
+                    f"Original request:\n{job.prompt}"
+                ),
+            )
+
+            round1: dict[str, str] = {}
+            for role in CODING_ROLES:
+                round1[role] = await run_role(
+                    stage="coding_round_1",
+                    role=role,
+                    output_key=f"round1.{role}",
+                    status_message=f"{role} generating first code attempt.",
+                    role_prompt=(
+                        "Generate code solution attempt #1 from this feasibility prompt. "
+                        "Return concrete code with brief notes if needed.\n\n"
+                        f"Feasibility prompt:\n{intent_feasibility}"
+                    ),
+                )
+
+            round2: dict[str, str] = {}
+            round1_bundle = round_bundle("Round 1 outputs", round1)
+            for role in CODING_ROLES:
+                round2[role] = await run_role(
+                    stage="coding_round_2",
+                    role=role,
+                    output_key=f"round2.{role}",
+                    status_message=f"{role} revising against all round-1 outputs.",
+                    role_prompt=(
+                        "Generate code solution attempt #2 by reviewing and comparing all round-1 attempts. "
+                        "Resolve conflicts and improve quality.\n\n"
+                        f"{round1_bundle}\n\nOriginal request:\n{job.prompt}"
+                    ),
+                )
+
+            round2_bundle = round_bundle("Round 2 outputs", round2)
+            round3_model1 = await run_role(
+                stage="coding_round_3",
+                role="code_model_1",
+                output_key="round3.code_model_1",
+                status_message="Round-3 chain: model 1 isolating canonical solution.",
+                role_prompt=(
+                    "Round 3 chain step 1: ingest all round-2 outputs and isolate the best canonical code.\n\n"
+                    f"{round2_bundle}\n\nOriginal request:\n{job.prompt}"
+                ),
+            )
+            round3_model2 = await run_role(
+                stage="coding_round_3",
+                role="code_model_2",
+                output_key="round3.code_model_2",
+                status_message="Round-3 chain: model 2 refining with model 1 output.",
+                role_prompt=(
+                    "Round 3 chain step 2: ingest all round-2 outputs plus model-1 round-3 output and produce improved code.\n\n"
+                    f"{round2_bundle}\n\nModel1 round3 output:\n{round3_model1}\n\nOriginal request:\n{job.prompt}"
+                ),
+            )
+            round3_model3 = await run_role(
+                stage="coding_round_3",
+                role="code_model_3",
+                output_key="round3.code_model_3",
+                status_message="Round-3 chain: model 3 producing final canonical code.",
+                role_prompt=(
+                    "Round 3 chain step 3: ingest all round-2 outputs plus model-1 and model-2 round-3 outputs. "
+                    "Produce the final canonical code.\n\n"
+                    f"{round2_bundle}\n\nModel1 round3 output:\n{round3_model1}\n\n"
+                    f"Model2 round3 output:\n{round3_model2}\n\nOriginal request:\n{job.prompt}"
+                ),
+            )
+            job.outputs["final_code"] = round3_model3
+
+            final_code_context = (
+                f"Final canonical code:\n{round3_model3}\n\nOriginal request:\n{job.prompt}"
+            )
+            doc_inline = await run_role(
+                stage="documentation",
+                role="doc_inline",
+                output_key="doc_inline",
+                status_message="Generating inline/functionality documentation guidance.",
+                role_prompt=(
+                    "Generate documentation focused on functionality and inline/in-code annotation guidance "
+                    "for the final code.\n\n"
+                    f"{final_code_context}"
+                ),
+            )
+            doc_git = await run_role(
+                stage="documentation",
+                role="doc_git",
+                output_key="doc_git",
+                status_message="Generating git notes.",
+                role_prompt=(
+                    "Generate concise git notes and commit summary for this generated code.\n\n"
+                    f"{final_code_context}"
+                ),
+            )
+            doc_release = await run_role(
+                stage="documentation",
+                role="doc_release",
+                output_key="doc_release",
+                status_message="Generating release notes.",
+                role_prompt=(
+                    "Generate release notes for this generated code including highlights, compatibility, and risk notes.\n\n"
+                    f"{final_code_context}"
+                ),
+            )
+
+            code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
+            documentation = build_documentation_markdown(
+                prompt=job.prompt,
+                outputs={
+                    **job.outputs,
+                    "doc_inline": doc_inline,
+                    "doc_git": doc_git,
+                    "doc_release": doc_release,
+                },
+            )
+            artifacts = write_devflow_artifacts(
+                base_dir=devflow_config.artifact_dir,
+                job=job,
+                code_pack=code_pack,
+                documentation=documentation,
+            )
+            metadata_path = Path(artifacts["run_dir"]) / "run_metadata.json"
+            metadata_path.write_text(
+                json.dumps(_job_payload(job), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            artifacts["metadata"] = str(metadata_path)
+            job.artifacts = artifacts
+            job.run_dir = artifacts.get("run_dir")
+            job.status = "completed"
+            job.stage = "completed"
+            job.percent = 100
+            job.message = "Programming development workflow completed."
+            job.updated_at = _utc_now_iso()
+            job.finished_at = _utc_now_iso()
+            await _upsert_devflow_job(job)
+            await emit_event(
+                {
+                    "type": "devflow_done",
+                    **_job_payload(job),
+                    "download_url": f"/api/devflow/jobs/{job.job_id}/download",
+                }
+            )
+        except Exception as exc:
+            if job.outputs:
+                code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
+                documentation = build_documentation_markdown(prompt=job.prompt, outputs=job.outputs)
+                artifacts = write_devflow_artifacts(
+                    base_dir=devflow_config.artifact_dir,
+                    job=job,
+                    code_pack=code_pack,
+                    documentation=documentation,
+                )
+                metadata_path = Path(artifacts["run_dir"]) / "run_metadata.json"
+                metadata_path.write_text(
+                    json.dumps(_job_payload(job), indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                artifacts["metadata"] = str(metadata_path)
+                job.artifacts = artifacts
+                job.run_dir = artifacts.get("run_dir")
+            job.status = "failed"
+            job.stage = "failed"
+            job.message = "Programming workflow failed."
+            job.error = str(exc)
+            job.updated_at = _utc_now_iso()
+            job.finished_at = _utc_now_iso()
+            await _upsert_devflow_job(job)
+            await emit_event(
+                {
+                    "type": "devflow_error",
+                    **_job_payload(job),
+                    "download_url": (
+                        f"/api/devflow/jobs/{job.job_id}/download"
+                        if job.artifacts.get("zip")
+                        else None
+                    ),
+                }
+            )
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(static_dir / "index.html")
@@ -612,6 +1018,35 @@ async def list_admin_events(
     return {"events": admin_profile_store.list_events(limit=limit)}
 
 
+@app.get("/api/devflow/jobs/{job_id}")
+async def devflow_job_status(job_id: str) -> dict[str, Any]:
+    _devflow_enabled_or_403()
+    job = await _get_devflow_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Devflow job not found.")
+    payload = _job_payload(job)
+    payload["download_url"] = (
+        f"/api/devflow/jobs/{job.job_id}/download" if job.artifacts.get("zip") else None
+    )
+    return payload
+
+
+@app.get("/api/devflow/jobs/{job_id}/download")
+async def devflow_job_download(job_id: str) -> FileResponse:
+    _devflow_enabled_or_403()
+    job = await _get_devflow_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Devflow job not found.")
+    zip_path = Path(job.artifacts.get("zip", ""))
+    if not zip_path.exists() or not zip_path.is_file():
+        raise HTTPException(status_code=404, detail="No downloadable artifact for this job.")
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"devflow_{job.job_id}.zip",
+        media_type="application/zip",
+    )
+
+
 @app.get("/api/service")
 async def service_info() -> dict[str, Any]:
     return {
@@ -631,6 +1066,8 @@ async def service_info() -> dict[str, Any]:
             "admin_users": "/api/v1/admin/users",
             "admin_platform": "/api/v1/admin/platform",
             "admin_events": "/api/v1/admin/events",
+            "devflow_job_status": "/api/devflow/jobs/{job_id}",
+            "devflow_job_download": "/api/devflow/jobs/{job_id}/download",
         },
         "websocket": {
             "chat": "/ws/chat",
@@ -647,6 +1084,7 @@ async def service_info() -> dict[str, Any]:
             },
             "profile_settings": True,
             "admin_settings": True,
+            "programming_development_flow": devflow_config.enabled,
             "filesystem_tools_enabled": settings.filesystem_tools_enabled,
             "terminal_tools_enabled": settings.terminal_tools_enabled,
             "workspace_root": settings.workspace_root,
@@ -824,8 +1262,30 @@ async def chat_ws_http_hint() -> dict[str, Any]:
         "detail": "This path expects a WebSocket upgrade.",
         "how_to_connect": "Use a WebSocket client to ws://127.0.0.1:8765/ws/chat",
         "cli_client": "local-model-pro-cli --url ws://127.0.0.1:8765/ws/chat --model qwen2.5:7b",
-        "message_types": ["hello", "chat", "set_model", "status", "reset"],
-        "event_types": ["ready", "status", "start", "token", "done", "info", "error"],
+        "message_types": [
+            "hello",
+            "chat",
+            "set_model",
+            "status",
+            "reset",
+            "devflow_start",
+            "devflow_status",
+            "devflow_cancel",
+        ],
+        "event_types": [
+            "ready",
+            "status",
+            "start",
+            "token",
+            "done",
+            "info",
+            "error",
+            "devflow_started",
+            "devflow_progress",
+            "devflow_stage_result",
+            "devflow_done",
+            "devflow_error",
+        ],
         "local_tool_commands": ["/tools", "/ls", "/tree", "/find", "/read", "/summary", "/run", "/run!"],
         "chat_reasoning_mode": ["hidden", "summary", "full"],
     }
@@ -834,11 +1294,20 @@ async def chat_ws_http_hint() -> dict[str, Any]:
 @app.websocket("/ws/chat")
 async def chat_ws(websocket: WebSocket) -> None:
     await websocket.accept()
+    ws_send_lock = asyncio.Lock()
+    websocket_open = True
+
+    async def ws_send(payload: dict[str, Any]) -> None:
+        async with ws_send_lock:
+            await _send_json(websocket, payload)
+
     session = ChatSession(
         session_id=str(uuid.uuid4()),
         model=runtime_default_model,
     )
     ollama = OllamaClient(base_url=runtime_ollama_base_url)
+    active_devflow_job_id: str | None = None
+    devflow_background_tasks: set[asyncio.Task[Any]] = set()
     tools: LocalWorkspaceTools | None = None
     try:
         tools = LocalWorkspaceTools(
@@ -852,15 +1321,13 @@ async def chat_ws(websocket: WebSocket) -> None:
     except WorkspaceToolError:
         tools = None
 
-    await _send_json(
-        websocket,
+    await ws_send(
         {
             "type": "info",
             "message": "Connected. Send a hello payload to set model/system prompt.",
         },
     )
-    await _send_json(
-        websocket,
+    await ws_send(
         {
             "type": "info",
             "message": (
@@ -874,17 +1341,14 @@ async def chat_ws(websocket: WebSocket) -> None:
     if tools is not None:
         platform = admin_profile_store.get_platform()
         if not bool(platform.get("allow_filesystem_tools", True)):
-            await _send_json(
-                websocket,
+            await ws_send(
                 {"type": "info", "message": "Filesystem tools are disabled by admin policy."},
             )
         if not bool(platform.get("allow_terminal_tools", True)):
-            await _send_json(
-                websocket,
+            await ws_send(
                 {"type": "info", "message": "Terminal tools are disabled by admin policy."},
             )
-    await _send_json(
-        websocket,
+    await ws_send(
         {
             "type": "ready",
             "session_id": session.session_id,
@@ -899,10 +1363,167 @@ async def chat_ws(websocket: WebSocket) -> None:
             try:
                 incoming = json.loads(raw)
             except json.JSONDecodeError:
-                await _send_json(websocket, {"type": "error", "message": "Invalid JSON payload."})
+                await ws_send({"type": "error", "message": "Invalid JSON payload."})
                 continue
 
             msg_type = incoming.get("type")
+
+            if msg_type == "devflow_start":
+                try:
+                    _devflow_enabled_or_403()
+                except HTTPException as exc:
+                    await ws_send({"type": "error", "message": str(exc.detail)})
+                    continue
+                try:
+                    prompt = _safe_text(incoming.get("prompt"), field_name="prompt")
+                except ValueError as exc:
+                    await ws_send({"type": "error", "message": str(exc)})
+                    continue
+                actor_id = _safe_actor_id(incoming.get("actor_id") or session.actor_id)
+                session.actor_id = actor_id
+                selected_model = (
+                    _safe_text(incoming.get("selected_model"), field_name="selected_model")
+                    if isinstance(incoming.get("selected_model"), str) and str(incoming.get("selected_model")).strip()
+                    else session.model
+                )
+                if active_devflow_job_id:
+                    active_job = await _get_devflow_job(active_devflow_job_id)
+                    if active_job and active_job.status in {"queued", "running"}:
+                        await ws_send(
+                            {
+                                "type": "error",
+                                "message": f"Devflow job {active_devflow_job_id} is still running.",
+                            }
+                        )
+                        continue
+                role_models_raw = incoming.get("role_models")
+                role_models = role_models_raw if isinstance(role_models_raw, dict) else {}
+                fallback_models_raw = incoming.get("fallback_models")
+                fallback_models = (
+                    [str(item).strip() for item in fallback_models_raw if str(item).strip()]
+                    if isinstance(fallback_models_raw, list)
+                    else []
+                )
+                try:
+                    resolved_role_models = resolve_role_models(
+                        role_models=role_models,
+                        fallback_pool=fallback_models,
+                        fallback_selected_model=selected_model,
+                    )
+                except DevflowError as exc:
+                    await ws_send({"type": "error", "message": str(exc)})
+                    continue
+
+                job = DevflowJob(
+                    job_id=str(uuid.uuid4()),
+                    actor_id=actor_id,
+                    prompt=prompt,
+                    selected_model=selected_model,
+                    role_models=resolved_role_models,
+                )
+                await _upsert_devflow_job(job)
+                active_devflow_job_id = job.job_id
+                await ws_send(
+                    {
+                        "type": "devflow_started",
+                        **_job_payload(job),
+                    }
+                )
+
+                async def emit_devflow(payload: dict[str, Any]) -> None:
+                    if not websocket_open:
+                        return
+                    try:
+                        await ws_send(payload)
+                    except Exception:
+                        return
+
+                task = asyncio.create_task(
+                    _run_devflow_job(
+                        job=job,
+                        ollama=ollama,
+                        emit_event=emit_devflow,
+                    )
+                )
+                devflow_background_tasks.add(task)
+
+                def _on_task_done(done_task: asyncio.Task[Any]) -> None:
+                    nonlocal active_devflow_job_id
+                    devflow_background_tasks.discard(done_task)
+                    if active_devflow_job_id == job.job_id:
+                        active_devflow_job_id = None
+
+                task.add_done_callback(_on_task_done)
+                continue
+
+            if msg_type == "devflow_status":
+                try:
+                    _devflow_enabled_or_403()
+                except HTTPException as exc:
+                    await ws_send({"type": "error", "message": str(exc.detail)})
+                    continue
+                requested_job_id = incoming.get("job_id")
+                target_job_id = (
+                    str(requested_job_id).strip()
+                    if isinstance(requested_job_id, str) and requested_job_id.strip()
+                    else active_devflow_job_id
+                )
+                if not target_job_id:
+                    await ws_send({"type": "error", "message": "No devflow job id provided."})
+                    continue
+                job = await _get_devflow_job(target_job_id)
+                if job is None:
+                    await ws_send({"type": "error", "message": "Devflow job not found."})
+                    continue
+                event_type = "devflow_progress"
+                if job.status == "completed":
+                    event_type = "devflow_done"
+                elif job.status == "failed":
+                    event_type = "devflow_error"
+                await ws_send(
+                    {
+                        "type": event_type,
+                        **_job_payload(job),
+                        "download_url": (
+                            f"/api/devflow/jobs/{job.job_id}/download"
+                            if job.artifacts.get("zip")
+                            else None
+                        ),
+                    }
+                )
+                continue
+
+            if msg_type == "devflow_cancel":
+                try:
+                    _devflow_enabled_or_403()
+                except HTTPException as exc:
+                    await ws_send({"type": "error", "message": str(exc.detail)})
+                    continue
+                requested_job_id = incoming.get("job_id")
+                target_job_id = (
+                    str(requested_job_id).strip()
+                    if isinstance(requested_job_id, str) and requested_job_id.strip()
+                    else active_devflow_job_id
+                )
+                if not target_job_id:
+                    await ws_send({"type": "error", "message": "No devflow job id provided."})
+                    continue
+                job = await _request_devflow_cancel(target_job_id)
+                if job is None:
+                    await ws_send({"type": "error", "message": "Devflow job not found."})
+                    continue
+                await ws_send(
+                    {
+                        "type": "devflow_progress",
+                        **_job_payload(job),
+                        "download_url": (
+                            f"/api/devflow/jobs/{job.job_id}/download"
+                            if job.artifacts.get("zip")
+                            else None
+                        ),
+                    }
+                )
+                continue
 
             if msg_type == "hello":
                 model = incoming.get("model")
@@ -923,8 +1544,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                     if default_system_prompt:
                         session.system_prompt = default_system_prompt
                         session.reset()
-                await _send_json(
-                    websocket,
+                await ws_send(
                     {
                         "type": "ready",
                         "session_id": session.session_id,
@@ -936,8 +1556,7 @@ async def chat_ws(websocket: WebSocket) -> None:
 
             if msg_type == "status":
                 profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
-                await _send_json(
-                    websocket,
+                await ws_send(
                     {
                         "type": "status",
                         "actor_id": session.actor_id,
@@ -954,19 +1573,18 @@ async def chat_ws(websocket: WebSocket) -> None:
                 try:
                     session.model = _safe_text(incoming.get("model"), field_name="model")
                 except ValueError as exc:
-                    await _send_json(websocket, {"type": "error", "message": str(exc)})
+                    await ws_send({"type": "error", "message": str(exc)})
                     continue
-                await _send_json(websocket, {"type": "info", "message": f"Model set to {session.model}"})
+                await ws_send({"type": "info", "message": f"Model set to {session.model}"})
                 continue
 
             if msg_type == "reset":
                 session.reset()
-                await _send_json(websocket, {"type": "info", "message": "Conversation reset."})
+                await ws_send({"type": "info", "message": "Conversation reset."})
                 continue
 
             if msg_type != "chat":
-                await _send_json(
-                    websocket,
+                await ws_send(
                     {"type": "error", "message": f"Unsupported message type: {msg_type}"},
                 )
                 continue
@@ -974,7 +1592,7 @@ async def chat_ws(websocket: WebSocket) -> None:
             try:
                 prompt = _safe_text(incoming.get("prompt"), field_name="prompt")
             except ValueError as exc:
-                await _send_json(websocket, {"type": "error", "message": str(exc)})
+                await ws_send({"type": "error", "message": str(exc)})
                 continue
             profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
             default_reasoning_mode = str(
@@ -998,7 +1616,7 @@ async def chat_ws(websocket: WebSocket) -> None:
             request_id = str(uuid.uuid4())
             session.messages.append({"role": "user", "content": prompt})
 
-            await _send_json(websocket, {"type": "start", "request_id": request_id})
+            await ws_send({"type": "start", "request_id": request_id})
 
             assistant_chunks: list[str] = []
             if prompt.strip().startswith("/"):
@@ -1023,8 +1641,7 @@ async def chat_ws(websocket: WebSocket) -> None:
 
                 for chunk in _chunks(tool_output):
                     assistant_chunks.append(chunk)
-                    await _send_json(
-                        websocket,
+                    await ws_send(
                         {"type": "token", "request_id": request_id, "text": chunk},
                     )
 
@@ -1032,8 +1649,7 @@ async def chat_ws(websocket: WebSocket) -> None:
                 if assistant_text:
                     session.messages.append({"role": "assistant", "content": assistant_text})
 
-                await _send_json(
-                    websocket,
+                await ws_send(
                     {
                         "type": "done",
                         "request_id": request_id,
@@ -1051,17 +1667,16 @@ async def chat_ws(websocket: WebSocket) -> None:
                     think=_resolve_think_setting(model=session.model, reasoning_mode=reasoning_mode),
                 ):
                     assistant_chunks.append(chunk)
-                    await _send_json(
-                        websocket,
+                    await ws_send(
                         {"type": "token", "request_id": request_id, "text": chunk},
                     )
             except OllamaStreamError as exc:
-                await _send_json(websocket, {"type": "error", "message": str(exc)})
+                await ws_send({"type": "error", "message": str(exc)})
                 if session.messages and session.messages[-1]["role"] == "user":
                     session.messages.pop()
                 continue
             except Exception as exc:  # pragma: no cover - safety net
-                await _send_json(websocket, {"type": "error", "message": f"Unexpected error: {exc}"})
+                await ws_send({"type": "error", "message": f"Unexpected error: {exc}"})
                 if session.messages and session.messages[-1]["role"] == "user":
                     session.messages.pop()
                 continue
@@ -1070,8 +1685,7 @@ async def chat_ws(websocket: WebSocket) -> None:
             if assistant_text:
                 session.messages.append({"role": "assistant", "content": assistant_text})
 
-            await _send_json(
-                websocket,
+            await ws_send(
                 {
                     "type": "done",
                     "request_id": request_id,
@@ -1079,6 +1693,10 @@ async def chat_ws(websocket: WebSocket) -> None:
                 },
             )
     except WebSocketDisconnect:
+        websocket_open = False
+        for task in list(devflow_background_tasks):
+            if not task.done():
+                task.cancel()
         return
 
 

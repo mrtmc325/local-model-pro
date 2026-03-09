@@ -30,6 +30,12 @@ Local chat server and browser/terminal clients for Ollama models, with optional 
   - runtime platform policy toggles (pull/delete/tools/readonly)
   - lightweight local admin user registry
   - local admin event log
+- Programming Development workflow:
+  - async 9-role multi-model orchestration pipeline
+  - strict 3-pass coding flow with round-3 chain dependency
+  - live websocket progress/stage events
+  - artifacts written only under `data/devflow_runs/<job_id>/`
+  - single ZIP download containing exactly `code_pack.md` and `documentation.md`
 - Local workspace tools from chat:
   - list folders and tree views
   - find files
@@ -82,6 +88,11 @@ Environment variable overrides:
 - `FS_SUMMARY_FILE_CHARS` (default: `2400`)
 - `ADMIN_STATE_PATH` (default: `<workspace_root>/data/admin_profile_state.json`)
 - `ADMIN_API_TOKEN` (default: empty; if set, required as `X-Admin-Token` on `/api/v1/admin/*`)
+- `DEVFLOW_ENABLED` (default: `true`)
+- `DEVFLOW_MAX_CONCURRENT_JOBS` (default: `1`)
+- `DEVFLOW_ROLE_TIMEOUT_SECONDS` (default: `90`)
+- `DEVFLOW_RUN_RETENTION` (default: `30`)
+- `DEVFLOW_ARTIFACT_DIR` (default: `<workspace_root>/data/devflow_runs`)
 
 Reasoning behavior:
 
@@ -149,6 +160,9 @@ Client -> server:
 - `{"type":"set_model","model":"llama3.1:8b"}`
 - `{"type":"reset"}`
 - `{"type":"status"}`
+- `{"type":"devflow_start","prompt":"...","role_models":{"code_model_1":"qwen2.5:7b"}}`
+- `{"type":"devflow_status","job_id":"...optional..."}`
+- `{"type":"devflow_cancel","job_id":"...optional..."}`
 
 Server -> client:
 
@@ -159,6 +173,11 @@ Server -> client:
 - `{"type":"status","model":"...","message_count":N,"actor_id":"..."}`
 - `{"type":"info","message":"..."}`
 - `{"type":"error","message":"..."}`
+- `{"type":"devflow_started","job_id":"...","status":"queued","role_models":{...}}`
+- `{"type":"devflow_progress","job_id":"...","stage":"...","role":"...","percent":N}`
+- `{"type":"devflow_stage_result","job_id":"...","stage":"...","role":"...","output_key":"...","output":"..."}`
+- `{"type":"devflow_done","job_id":"...","download_url":"/api/devflow/jobs/{job_id}/download"}`
+- `{"type":"devflow_error","job_id":"...","error":"...","download_url":"...optional..."}`
 
 ## Endpoints
 
@@ -176,5 +195,7 @@ Server -> client:
 - `/api/v1/admin/users` (GET, POST)
 - `/api/v1/admin/users/{user_id}` (PATCH, DELETE)
 - `/api/v1/admin/events` (GET)
+- `/api/devflow/jobs/{job_id}` (GET)
+- `/api/devflow/jobs/{job_id}/download` (GET)
 - `/api/service`
 - `/ws/chat`

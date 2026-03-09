@@ -199,6 +199,94 @@
         </details>
 
         <details class="drawer-tab">
+          <summary>Programming Development</summary>
+          <div class="drawer-tab-body">
+            <div class="field-help">
+              Multi-model coding workflow: intent analysis, code rounds, and documentation pack.
+            </div>
+
+            <div class="field">
+              <span>Development Request</span>
+              <textarea
+                id="devflowPromptInput"
+                rows="5"
+                placeholder="Describe the software feature or coding task to build..."
+              ></textarea>
+            </div>
+
+            <details class="profile-group" open>
+              <summary class="profile-group-summary">
+                <span>Role Model Assignments</span>
+                <small>9 role slots with deterministic fallback</small>
+              </summary>
+              <div class="profile-group-body">
+                <div class="profile-grid">
+                  <label class="field">
+                    <span>intent_reasoner</span>
+                    <select id="devflowRoleIntentReasoner"></select>
+                  </label>
+                  <label class="field">
+                    <span>intent_knowledge</span>
+                    <select id="devflowRoleIntentKnowledge"></select>
+                  </label>
+                  <label class="field">
+                    <span>intent_feasibility</span>
+                    <select id="devflowRoleIntentFeasibility"></select>
+                  </label>
+                  <label class="field">
+                    <span>code_model_1</span>
+                    <select id="devflowRoleCodeModel1"></select>
+                  </label>
+                  <label class="field">
+                    <span>code_model_2</span>
+                    <select id="devflowRoleCodeModel2"></select>
+                  </label>
+                  <label class="field">
+                    <span>code_model_3</span>
+                    <select id="devflowRoleCodeModel3"></select>
+                  </label>
+                  <label class="field">
+                    <span>doc_inline</span>
+                    <select id="devflowRoleDocInline"></select>
+                  </label>
+                  <label class="field">
+                    <span>doc_git</span>
+                    <select id="devflowRoleDocGit"></select>
+                  </label>
+                  <label class="field">
+                    <span>doc_release</span>
+                    <select id="devflowRoleDocRelease"></select>
+                  </label>
+                </div>
+              </div>
+            </details>
+
+            <div class="row">
+              <button id="devflowStartBtn" class="tool-action" type="button">Start Workflow</button>
+              <button id="devflowStatusBtn" class="tool-action secondary" type="button">Refresh Status</button>
+              <button id="devflowCancelBtn" class="tool-action danger" type="button">Cancel</button>
+            </div>
+            <div id="devflowMeta" class="field-help">No programming workflow started.</div>
+            <progress id="devflowProgressBar" class="devflow-progress" max="100" value="0"></progress>
+            <div id="devflowTimeline" class="admin-events-list"></div>
+
+            <details class="profile-group">
+              <summary class="profile-group-summary">
+                <span>Stage Output Preview</span>
+                <small>Latest role outputs</small>
+              </summary>
+              <div id="devflowOutputs" class="profile-group-body"></div>
+            </details>
+
+            <div class="row">
+              <a id="devflowDownloadLink" class="tool-action disabled-link" href="#" download>
+                Download ZIP
+              </a>
+            </div>
+          </div>
+        </details>
+
+        <details class="drawer-tab">
           <summary>Profile Settings</summary>
           <div class="drawer-tab-body">
             <div class="field-help">

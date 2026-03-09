@@ -22,6 +22,11 @@ services:
       FS_SUMMARY_MAX_FILES: "8"
       FS_SUMMARY_FILE_CHARS: "2400"
       ADMIN_STATE_PATH: /workspace/data/admin_profile_state.json
+      DEVFLOW_ENABLED: "true"
+      DEVFLOW_MAX_CONCURRENT_JOBS: "1"
+      DEVFLOW_ROLE_TIMEOUT_SECONDS: "90"
+      DEVFLOW_RUN_RETENTION: "30"
+      DEVFLOW_ARTIFACT_DIR: /workspace/data/devflow_runs
     ports:
       - "8765:8765"
     restart: unless-stopped

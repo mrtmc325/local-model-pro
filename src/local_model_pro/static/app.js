@@ -41,6 +41,35 @@ const toolSummaryBtn = document.getElementById("toolSummaryBtn");
 const toolRunCommandInput = document.getElementById("toolRunCommandInput");
 const toolRunPreviewBtn = document.getElementById("toolRunPreviewBtn");
 const toolRunExecBtn = document.getElementById("toolRunExecBtn");
+const devflowPromptInput = document.getElementById("devflowPromptInput");
+const devflowStartBtn = document.getElementById("devflowStartBtn");
+const devflowStatusBtn = document.getElementById("devflowStatusBtn");
+const devflowCancelBtn = document.getElementById("devflowCancelBtn");
+const devflowMeta = document.getElementById("devflowMeta");
+const devflowProgressBar = document.getElementById("devflowProgressBar");
+const devflowTimeline = document.getElementById("devflowTimeline");
+const devflowOutputs = document.getElementById("devflowOutputs");
+const devflowDownloadLink = document.getElementById("devflowDownloadLink");
+const devflowRoleIntentReasoner = document.getElementById("devflowRoleIntentReasoner");
+const devflowRoleIntentKnowledge = document.getElementById("devflowRoleIntentKnowledge");
+const devflowRoleIntentFeasibility = document.getElementById("devflowRoleIntentFeasibility");
+const devflowRoleCodeModel1 = document.getElementById("devflowRoleCodeModel1");
+const devflowRoleCodeModel2 = document.getElementById("devflowRoleCodeModel2");
+const devflowRoleCodeModel3 = document.getElementById("devflowRoleCodeModel3");
+const devflowRoleDocInline = document.getElementById("devflowRoleDocInline");
+const devflowRoleDocGit = document.getElementById("devflowRoleDocGit");
+const devflowRoleDocRelease = document.getElementById("devflowRoleDocRelease");
+const devflowRoleSelectors = {
+  intent_reasoner: devflowRoleIntentReasoner,
+  intent_knowledge: devflowRoleIntentKnowledge,
+  intent_feasibility: devflowRoleIntentFeasibility,
+  code_model_1: devflowRoleCodeModel1,
+  code_model_2: devflowRoleCodeModel2,
+  code_model_3: devflowRoleCodeModel3,
+  doc_inline: devflowRoleDocInline,
+  doc_git: devflowRoleDocGit,
+  doc_release: devflowRoleDocRelease,
+};
 const profileActorInput = document.getElementById("profileActorInput");
 const profileLoadBtn = document.getElementById("profileLoadBtn");
 const profileApplyBtn = document.getElementById("profileApplyBtn");
@@ -144,6 +173,10 @@ const state = {
   profileLoadedActor: "anonymous",
   profilePreferences: null,
   adminPlatform: null,
+  devflowJobId: null,
+  devflowStatus: "idle",
+  devflowTimelineItems: [],
+  devflowOutputsByKey: {},
 };
 
 function setDrawerOpen(open) {
@@ -214,6 +247,255 @@ function setProfileMeta(text) {
 function setAdminMeta(text) {
   if (adminMeta) {
     adminMeta.textContent = text;
+  }
+}
+
+function setDevflowMeta(text) {
+  if (devflowMeta) {
+    devflowMeta.textContent = text;
+  }
+}
+
+function truncateText(text, maxChars = 1200) {
+  const normalized = String(text || "");
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxChars)}\n...`;
+}
+
+function renderDevflowTimeline() {
+  if (!devflowTimeline) {
+    return;
+  }
+  devflowTimeline.innerHTML = "";
+  if (!state.devflowTimelineItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "field-help";
+    empty.textContent = "No workflow events yet.";
+    devflowTimeline.appendChild(empty);
+    return;
+  }
+  state.devflowTimelineItems.slice(-40).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "admin-event-row";
+    row.textContent = `${item.at} · ${item.label}`;
+    devflowTimeline.appendChild(row);
+  });
+}
+
+function renderDevflowOutputs() {
+  if (!devflowOutputs) {
+    return;
+  }
+  devflowOutputs.innerHTML = "";
+  const keys = Object.keys(state.devflowOutputsByKey);
+  if (!keys.length) {
+    const empty = document.createElement("div");
+    empty.className = "field-help";
+    empty.textContent = "No stage outputs yet.";
+    devflowOutputs.appendChild(empty);
+    return;
+  }
+  keys.forEach((key) => {
+    const details = document.createElement("details");
+    details.className = "devflow-output-item";
+    const summary = document.createElement("summary");
+    summary.textContent = key;
+    const pre = document.createElement("pre");
+    pre.textContent = truncateText(state.devflowOutputsByKey[key], 3000);
+    details.appendChild(summary);
+    details.appendChild(pre);
+    devflowOutputs.appendChild(details);
+  });
+}
+
+function setDevflowDownload(downloadUrl) {
+  if (!devflowDownloadLink) {
+    return;
+  }
+  if (downloadUrl) {
+    devflowDownloadLink.href = String(downloadUrl);
+    devflowDownloadLink.classList.remove("disabled-link");
+  } else {
+    devflowDownloadLink.href = "#";
+    devflowDownloadLink.classList.add("disabled-link");
+  }
+}
+
+function renderDevflowStatus({ status, percent, message }) {
+  if (devflowProgressBar) {
+    devflowProgressBar.value = Number(percent || 0);
+  }
+  state.devflowStatus = String(status || state.devflowStatus || "idle");
+  setDevflowMeta(`${String(status || "idle")} · ${Math.round(Number(percent || 0))}% · ${String(message || "")}`);
+  syncDevflowControls();
+}
+
+function syncDevflowControls() {
+  const connected = Boolean(state.connected);
+  const active = state.devflowStatus === "running" || state.devflowStatus === "queued";
+  if (devflowStartBtn) {
+    devflowStartBtn.disabled = !connected || active;
+  }
+  if (devflowStatusBtn) {
+    devflowStatusBtn.disabled = !connected || !state.devflowJobId;
+  }
+  if (devflowCancelBtn) {
+    devflowCancelBtn.disabled = !connected || !active || !state.devflowJobId;
+  }
+}
+
+function roleSelectorOptions(selectedValue = "") {
+  const options = [{ value: "", label: "Auto / fallback (use selected model pool)" }];
+  state.availableModels.forEach((model) => {
+    options.push({ value: model.name, label: modelLabel(model) });
+  });
+  if (selectedValue && !options.some((item) => item.value === selectedValue)) {
+    options.push({ value: selectedValue, label: `${selectedValue} (manual)` });
+  }
+  return options;
+}
+
+function populateDevflowRoleSelectors(resolved = {}) {
+  Object.entries(devflowRoleSelectors).forEach(([role, selectElement]) => {
+    if (!selectElement) {
+      return;
+    }
+    const currentValue = String(resolved[role] || selectElement.value || "");
+    const options = roleSelectorOptions(currentValue);
+    selectElement.innerHTML = "";
+    options.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.label;
+      selectElement.appendChild(option);
+    });
+    selectElement.value = currentValue;
+  });
+}
+
+function collectDevflowRoleModels() {
+  const mapping = {};
+  Object.entries(devflowRoleSelectors).forEach(([role, selectElement]) => {
+    if (!selectElement) {
+      return;
+    }
+    const value = String(selectElement.value || "").trim();
+    if (value) {
+      mapping[role] = value;
+    }
+  });
+  return mapping;
+}
+
+function pushDevflowTimeline(label) {
+  state.devflowTimelineItems.push({
+    at: new Date().toLocaleTimeString(),
+    label: String(label || "").trim() || "event",
+  });
+  renderDevflowTimeline();
+}
+
+function applyDevflowEvent(message) {
+  const status = String(message.status || state.devflowStatus || "idle");
+  const percent = Number(message.percent || 0);
+  const infoMessage = String(message.message || "");
+  if (message.job_id) {
+    state.devflowJobId = String(message.job_id);
+  }
+  renderDevflowStatus({ status, percent, message: infoMessage });
+  const role = String(message.role || "");
+  const stage = String(message.stage || "");
+  if (message.type === "devflow_stage_result") {
+    const outputKey = String(message.output_key || `${stage}.${role}` || "output");
+    state.devflowOutputsByKey[outputKey] = String(message.output || "");
+    renderDevflowOutputs();
+    pushDevflowTimeline(`${stage}/${role} completed`);
+  } else {
+    pushDevflowTimeline(`${message.type}${role ? `/${role}` : ""}${infoMessage ? `: ${infoMessage}` : ""}`);
+  }
+  const downloadUrl = String(message.download_url || "");
+  if (downloadUrl) {
+    setDevflowDownload(downloadUrl);
+  }
+  syncDevflowControls();
+}
+
+function resetDevflowView() {
+  state.devflowJobId = null;
+  state.devflowStatus = "idle";
+  state.devflowTimelineItems = [];
+  state.devflowOutputsByKey = {};
+  renderDevflowTimeline();
+  renderDevflowOutputs();
+  setDevflowDownload("");
+  renderDevflowStatus({ status: "idle", percent: 0, message: "No programming workflow started." });
+}
+
+function startDevflowRun() {
+  if (!state.connected) {
+    addMessage("system", "Connect first.");
+    return;
+  }
+  const prompt = String(devflowPromptInput?.value || "").trim();
+  if (!prompt) {
+    setDevflowMeta("Enter a development request.");
+    return;
+  }
+  const role_models = collectDevflowRoleModels();
+  const fallback_models = state.availableModels.map((item) => item.name);
+  state.devflowTimelineItems = [];
+  state.devflowOutputsByKey = {};
+  renderDevflowTimeline();
+  renderDevflowOutputs();
+  setDevflowDownload("");
+  if (devflowStartBtn) {
+    devflowStartBtn.disabled = true;
+  }
+  try {
+    sendWs({
+      type: "devflow_start",
+      prompt,
+      actor_id: currentActorId(),
+      selected_model: selectedModel() || state.currentModel || "",
+      role_models,
+      fallback_models,
+    });
+    pushDevflowTimeline("Workflow start requested.");
+  } catch (error) {
+    setDevflowMeta(`Devflow start failed: ${error.message}`);
+    if (devflowStartBtn) {
+      devflowStartBtn.disabled = false;
+    }
+  }
+}
+
+function refreshDevflowStatus() {
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({
+      type: "devflow_status",
+      job_id: state.devflowJobId || undefined,
+    });
+  } catch (error) {
+    setDevflowMeta(`Status refresh failed: ${error.message}`);
+  }
+}
+
+function cancelDevflowRun() {
+  if (!state.connected) {
+    return;
+  }
+  try {
+    sendWs({
+      type: "devflow_cancel",
+      job_id: state.devflowJobId || undefined,
+    });
+  } catch (error) {
+    setDevflowMeta(`Cancel failed: ${error.message}`);
   }
 }
 
@@ -857,6 +1139,7 @@ function setBusy(busy) {
   toolInputElements.forEach((el) => {
     el.disabled = busy || !state.connected;
   });
+  syncDevflowControls();
 }
 
 function selectedModel() {
@@ -1289,6 +1572,7 @@ async function loadModels() {
 
     const defaultModel = String(payload.default_model || state.availableModels[0].name);
     renderModelOptions(defaultModel);
+    populateDevflowRoleSelectors();
     customModelInput.value = "";
     if (pullModelInput && !pullModelInput.value.trim()) {
       pullModelInput.value = defaultModel;
@@ -1537,6 +1821,7 @@ function connectWs() {
   ws.onopen = () => {
     setStatus(true, "connected");
     state.connected = true;
+    syncDevflowControls();
     const actorId = currentActorId();
     const systemPrompt = String(
       state.profilePreferences?.chat?.system_prompt || profileSystemPromptInput?.value || ""
@@ -1554,6 +1839,7 @@ function connectWs() {
     state.connected = false;
     setStatus(false, "offline");
     setBusy(false);
+    syncDevflowControls();
   };
 
   ws.onerror = () => {
@@ -1569,6 +1855,22 @@ function connectWs() {
     }
 
     const msgType = message.type;
+    if (
+      msgType === "devflow_started" ||
+      msgType === "devflow_progress" ||
+      msgType === "devflow_stage_result" ||
+      msgType === "devflow_done" ||
+      msgType === "devflow_error"
+    ) {
+      applyDevflowEvent(message);
+      if (msgType === "devflow_done" || msgType === "devflow_error") {
+        if (devflowStartBtn) {
+          devflowStartBtn.disabled = !state.connected;
+        }
+      }
+      return;
+    }
+
     if (msgType === "info") {
       addMessage("system", String(message.message || "info"));
       return;
@@ -1801,6 +2103,15 @@ if (toolRunPreviewBtn) {
 if (toolRunExecBtn) {
   toolRunExecBtn.addEventListener("click", runCommandExecute);
 }
+if (devflowStartBtn) {
+  devflowStartBtn.addEventListener("click", startDevflowRun);
+}
+if (devflowStatusBtn) {
+  devflowStatusBtn.addEventListener("click", refreshDevflowStatus);
+}
+if (devflowCancelBtn) {
+  devflowCancelBtn.addEventListener("click", cancelDevflowRun);
+}
 if (pullModelBtn) {
   pullModelBtn.addEventListener("click", () => {
     void startPullModel();
@@ -2003,6 +2314,14 @@ if (storeQueryInput) {
     }
   });
 }
+if (devflowPromptInput) {
+  devflowPromptInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      startDevflowRun();
+    }
+  });
+}
 if (profileActorInput) {
   profileActorInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -2033,6 +2352,8 @@ window.addEventListener("keydown", (event) => {
 setStatus(false, "offline");
 setBusy(false);
 updateActiveModelLabel(state.currentModel);
+populateDevflowRoleSelectors();
+resetDevflowView();
 if (profileActorInput) {
   profileActorInput.value = state.profileLoadedActor;
 }
