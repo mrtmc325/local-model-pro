@@ -45,6 +45,8 @@ const devflowPromptInput = document.getElementById("devflowPromptInput");
 const devflowStartBtn = document.getElementById("devflowStartBtn");
 const devflowStatusBtn = document.getElementById("devflowStatusBtn");
 const devflowCancelBtn = document.getElementById("devflowCancelBtn");
+const devflowApplySlotsBtn = document.getElementById("devflowApplySlotsBtn");
+const devflowSaveSlotsBtn = document.getElementById("devflowSaveSlotsBtn");
 const devflowMeta = document.getElementById("devflowMeta");
 const devflowProgressBar = document.getElementById("devflowProgressBar");
 const devflowTimeline = document.getElementById("devflowTimeline");
@@ -177,6 +179,7 @@ const state = {
   devflowStatus: "idle",
   devflowTimelineItems: [],
   devflowOutputsByKey: {},
+  devflowPendingStart: null,
 };
 
 function setDrawerOpen(open) {
@@ -335,14 +338,21 @@ function renderDevflowStatus({ status, percent, message }) {
 function syncDevflowControls() {
   const connected = Boolean(state.connected);
   const active = state.devflowStatus === "running" || state.devflowStatus === "queued";
+  const pendingConnect = Boolean(state.devflowPendingStart) && !connected;
   if (devflowStartBtn) {
-    devflowStartBtn.disabled = !connected || active;
+    devflowStartBtn.disabled = active || pendingConnect;
   }
   if (devflowStatusBtn) {
     devflowStatusBtn.disabled = !connected || !state.devflowJobId;
   }
   if (devflowCancelBtn) {
     devflowCancelBtn.disabled = !connected || !active || !state.devflowJobId;
+  }
+  if (devflowApplySlotsBtn) {
+    devflowApplySlotsBtn.disabled = active;
+  }
+  if (devflowSaveSlotsBtn) {
+    devflowSaveSlotsBtn.disabled = active;
   }
 }
 
@@ -389,6 +399,98 @@ function collectDevflowRoleModels() {
   return mapping;
 }
 
+function devflowRoleSlotsStorageKey(actorId = currentActorId()) {
+  const normalized = String(actorId || "anonymous")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "_");
+  return `local-model-pro.devflow.role-slots.${normalized || "anonymous"}`;
+}
+
+function saveDevflowRoleSlots({ showMessage = true } = {}) {
+  const roleModels = collectDevflowRoleModels();
+  try {
+    window.localStorage.setItem(devflowRoleSlotsStorageKey(), JSON.stringify(roleModels));
+    window.localStorage.setItem("local-model-pro.devflow.role-slots.default", JSON.stringify(roleModels));
+    if (showMessage) {
+      setDevflowMeta("Role slots saved.");
+    }
+  } catch (_error) {
+    if (showMessage) {
+      setDevflowMeta("Unable to save role slots in this browser.");
+    }
+  }
+}
+
+function loadDevflowRoleSlots() {
+  let parsed = null;
+  try {
+    const actorRaw = window.localStorage.getItem(devflowRoleSlotsStorageKey());
+    const fallbackRaw = window.localStorage.getItem("local-model-pro.devflow.role-slots.default");
+    const raw = actorRaw || fallbackRaw;
+    if (!raw) {
+      return;
+    }
+    const decoded = JSON.parse(raw);
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return;
+    }
+    parsed = decoded;
+  } catch (_error) {
+    return;
+  }
+  populateDevflowRoleSelectors(parsed || {});
+}
+
+function preferredDevflowModel(roleModels = collectDevflowRoleModels()) {
+  const priority = [
+    "code_model_3",
+    "code_model_2",
+    "code_model_1",
+    "intent_feasibility",
+    "intent_reasoner",
+    "intent_knowledge",
+    "doc_inline",
+    "doc_git",
+    "doc_release",
+  ];
+  for (const role of priority) {
+    const candidate = String(roleModels?.[role] || "").trim();
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return String(selectedModel() || state.currentModel || state.availableModels?.[0]?.name || "").trim();
+}
+
+function applyDevflowSlots() {
+  const roleModels = collectDevflowRoleModels();
+  const primaryModel = preferredDevflowModel(roleModels);
+  if (!primaryModel) {
+    setDevflowMeta("Select at least one role model to apply.");
+    return;
+  }
+  if (!modelExists(primaryModel)) {
+    upsertModel(primaryModel);
+  }
+  renderModelOptions(primaryModel);
+  customModelInput.value = "";
+  saveDevflowRoleSlots({ showMessage: false });
+  if (state.connected) {
+    try {
+      sendWs({ type: "set_model", model: primaryModel });
+      state.currentModel = primaryModel;
+      updateActiveModelLabel(primaryModel);
+      setDevflowMeta(`Applied slots. Active model set to ${primaryModel}.`);
+      return;
+    } catch (error) {
+      setDevflowMeta(`Applied slots locally, but model switch failed: ${error.message}`);
+      return;
+    }
+  }
+  setDevflowMeta(`Applied slots. Next connection will use ${primaryModel}.`);
+}
+
 function pushDevflowTimeline(label) {
   state.devflowTimelineItems.push({
     at: new Date().toLocaleTimeString(),
@@ -427,6 +529,7 @@ function resetDevflowView() {
   state.devflowStatus = "idle";
   state.devflowTimelineItems = [];
   state.devflowOutputsByKey = {};
+  state.devflowPendingStart = null;
   renderDevflowTimeline();
   renderDevflowOutputs();
   setDevflowDownload("");
@@ -434,17 +537,30 @@ function resetDevflowView() {
 }
 
 function startDevflowRun() {
-  if (!state.connected) {
-    addMessage("system", "Connect first.");
-    return;
-  }
   const prompt = String(devflowPromptInput?.value || "").trim();
   if (!prompt) {
     setDevflowMeta("Enter a development request.");
     return;
   }
   const role_models = collectDevflowRoleModels();
+  const primaryModel = preferredDevflowModel(role_models);
+  if (!primaryModel) {
+    setDevflowMeta("Select at least one role model before starting.");
+    return;
+  }
+  saveDevflowRoleSlots({ showMessage: false });
+  applyDevflowSlots();
+
   const fallback_models = state.availableModels.map((item) => item.name);
+  const payload = {
+    type: "devflow_start",
+    prompt,
+    actor_id: currentActorId(),
+    selected_model: primaryModel,
+    role_models,
+    fallback_models,
+  };
+
   state.devflowTimelineItems = [];
   state.devflowOutputsByKey = {};
   renderDevflowTimeline();
@@ -454,20 +570,23 @@ function startDevflowRun() {
     devflowStartBtn.disabled = true;
   }
   try {
-    sendWs({
-      type: "devflow_start",
-      prompt,
-      actor_id: currentActorId(),
-      selected_model: selectedModel() || state.currentModel || "",
-      role_models,
-      fallback_models,
-    });
+    if (!state.connected) {
+      state.devflowPendingStart = payload;
+      syncDevflowControls();
+      setDevflowMeta(`Connecting websocket with ${primaryModel} for workflow start...`);
+      connectWs({ disconnectIfConnected: false, preferredModel: primaryModel });
+      return;
+    }
+    sendWs(payload);
     pushDevflowTimeline("Workflow start requested.");
+    setDevflowMeta("Workflow start requested.");
   } catch (error) {
     setDevflowMeta(`Devflow start failed: ${error.message}`);
+    state.devflowPendingStart = null;
     if (devflowStartBtn) {
       devflowStartBtn.disabled = false;
     }
+    syncDevflowControls();
   }
 }
 
@@ -1263,6 +1382,7 @@ async function loadProfilePreferences() {
       profileActorInput.value = state.profileLoadedActor;
     }
     applyProfilePreferences(state.profilePreferences);
+    loadDevflowRoleSlots();
     setProfileMeta(
       `Loaded actor=${state.profileLoadedActor} version=${state.profileVersion}`
     );
@@ -1573,6 +1693,7 @@ async function loadModels() {
     const defaultModel = String(payload.default_model || state.availableModels[0].name);
     renderModelOptions(defaultModel);
     populateDevflowRoleSelectors();
+    loadDevflowRoleSlots();
     customModelInput.value = "";
     if (pullModelInput && !pullModelInput.value.trim()) {
       pullModelInput.value = defaultModel;
@@ -1799,17 +1920,27 @@ function sendWs(payload) {
   state.ws.send(JSON.stringify(payload));
 }
 
-function connectWs() {
+function connectWs(options = {}) {
+  const disconnectIfConnected = options?.disconnectIfConnected !== false;
+  const preferredModel = String(options?.preferredModel || "").trim();
   closeDrawer();
   if (state.connected) {
-    closeWs();
-    addMessage("system", "Disconnected.");
+    if (disconnectIfConnected) {
+      closeWs();
+      addMessage("system", "Disconnected.");
+    }
     return;
   }
 
-  const model = selectedModel();
+  if (state.ws && state.ws.readyState === WebSocket.CONNECTING) {
+    return;
+  }
+
+  const model = preferredModel || selectedModel() || preferredDevflowModel();
   if (!model) {
     addMessage("system", "Select or type a model before connecting.");
+    state.devflowPendingStart = null;
+    syncDevflowControls();
     return;
   }
 
@@ -1839,11 +1970,20 @@ function connectWs() {
     state.connected = false;
     setStatus(false, "offline");
     setBusy(false);
+    if (state.devflowPendingStart) {
+      setDevflowMeta("Workflow start failed because websocket disconnected.");
+      state.devflowPendingStart = null;
+    }
     syncDevflowControls();
   };
 
   ws.onerror = () => {
     addMessage("system", "WebSocket error.");
+    if (state.devflowPendingStart) {
+      setDevflowMeta("Workflow start failed due to websocket error.");
+      state.devflowPendingStart = null;
+      syncDevflowControls();
+    }
   };
 
   ws.onmessage = (event) => {
@@ -1887,6 +2027,18 @@ function connectWs() {
       }
       updateActiveModelLabel(modelName);
       setBusy(false);
+      if (state.devflowPendingStart && state.connected) {
+        const pendingPayload = state.devflowPendingStart;
+        state.devflowPendingStart = null;
+        try {
+          sendWs(pendingPayload);
+          pushDevflowTimeline("Workflow start requested.");
+          setDevflowMeta("Workflow start requested.");
+        } catch (error) {
+          setDevflowMeta(`Workflow start failed after connect: ${error.message}`);
+        }
+        syncDevflowControls();
+      }
       return;
     }
 
@@ -2111,6 +2263,12 @@ if (devflowStatusBtn) {
 }
 if (devflowCancelBtn) {
   devflowCancelBtn.addEventListener("click", cancelDevflowRun);
+}
+if (devflowApplySlotsBtn) {
+  devflowApplySlotsBtn.addEventListener("click", applyDevflowSlots);
+}
+if (devflowSaveSlotsBtn) {
+  devflowSaveSlotsBtn.addEventListener("click", () => saveDevflowRoleSlots({ showMessage: true }));
 }
 if (pullModelBtn) {
   pullModelBtn.addEventListener("click", () => {
