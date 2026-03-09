@@ -230,6 +230,7 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
                         "from fastapi import FastAPI\n\n"
                         "app = FastAPI()\n\n"
                         "@app.get('/')\n"
+                        "# root: inline documentation for behavior and intent.\n"
                         "def root():\n"
                         "    return {'ok': True}\n"
                         "```"
@@ -255,6 +256,8 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("```python", inline_code)
         self.assertIn("# root:", inline_code)
         self.assertIn("Inline documentation fallback", inline_code)
+        self.assertEqual(inline_code.count("# root: inline documentation for behavior and intent."), 1)
+        self.assertIn('"""Describe the purpose, inputs, and outputs for root."""', inline_code)
 
 
 class DevflowWebSocketTests(unittest.TestCase):

@@ -643,10 +643,10 @@ async def _run_devflow_job(
         status_message: str,
         fallback_builder: Callable[[Exception], str],
         retries: int | None = None,
-    ) -> str:
+    ) -> tuple[str, bool]:
         nonlocal completed_steps
         try:
-            return await run_role(
+            result = await run_role(
                 stage=stage,
                 role=role,
                 output_key=output_key,
@@ -654,6 +654,7 @@ async def _run_devflow_job(
                 status_message=status_message,
                 retries=retries,
             )
+            return result, False
         except Exception as exc:
             fallback_output = fallback_builder(exc).strip()
             if not fallback_output:
@@ -695,7 +696,7 @@ async def _run_devflow_job(
                 status="running",
                 message=f"{role} used fallback output after role failure.",
             )
-            return fallback_output
+            return fallback_output, True
 
     def _trim_text(value: str, *, max_chars: int) -> str:
         normalized = value.strip()
@@ -719,11 +720,44 @@ async def _run_devflow_job(
     def _annotate_python_code(code: str) -> str:
         lines = code.splitlines()
         out: list[str] = []
-        for line in lines:
-            match = re.match(r"^(\s*)(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
-            if match:
-                indent, symbol_name = match.groups()
-                out.append(f"{indent}# {symbol_name}: inline documentation for behavior and intent.")
+
+        def previous_nonempty() -> str:
+            for existing in reversed(out):
+                if existing.strip():
+                    return existing
+            return ""
+
+        def has_upcoming_docstring(start_index: int) -> bool:
+            for look_ahead in range(start_index + 1, len(lines)):
+                probe = lines[look_ahead].strip()
+                if not probe:
+                    continue
+                if probe.startswith("#"):
+                    continue
+                return probe.startswith('"""') or probe.startswith("'''")
+            return False
+
+        for idx, line in enumerate(lines):
+            symbol_match = re.match(
+                r"^(\s*)(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                line,
+            )
+            function_match = re.match(
+                r"^(\s*)(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                line,
+            )
+            if symbol_match:
+                indent, symbol_name = symbol_match.groups()
+                marker = f"{indent}# {symbol_name}: inline documentation for behavior and intent."
+                if previous_nonempty().strip() != marker.strip():
+                    out.append(marker)
+                out.append(line)
+                if function_match and not has_upcoming_docstring(idx):
+                    function_indent, function_name = function_match.groups()
+                    out.append(
+                        f'{function_indent}    """Describe the purpose, inputs, and outputs for {function_name}."""'
+                    )
+                continue
             out.append(line)
         return "\n".join(out).strip()
 
@@ -744,7 +778,7 @@ async def _run_devflow_job(
                 f"{normalized_code}"
             )
 
-        if error_note:
+        if error_note and "Inline documentation fallback after role error:" not in annotated_code:
             annotated_code = (
                 f"{comment_prefix} Inline documentation fallback after role error: {error_note[:220]}\n"
                 f"{annotated_code}"
@@ -879,7 +913,7 @@ async def _run_devflow_job(
             final_code_context = (
                 f"Final canonical code:\n{trimmed_final_code}\n\nOriginal request:\n{trimmed_request}"
             )
-            doc_inline = await run_role_with_fallback(
+            doc_inline, doc_inline_fallback = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_inline",
                 output_key="doc_inline",
@@ -897,7 +931,7 @@ async def _run_devflow_job(
                 ),
             )
             job.outputs["doc_inline_code"] = _build_inline_documented_code(doc_inline)
-            doc_git = await run_role_with_fallback(
+            doc_git, doc_git_fallback = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_git",
                 output_key="doc_git",
@@ -915,7 +949,7 @@ async def _run_devflow_job(
                     "- Validation notes: run local smoke test and endpoint checks before merge"
                 ),
             )
-            doc_release = await run_role_with_fallback(
+            doc_release, doc_release_fallback = await run_role_with_fallback(
                 stage="documentation",
                 role="doc_release",
                 output_key="doc_release",
@@ -933,6 +967,9 @@ async def _run_devflow_job(
                     "- Risks: generated code requires operator review before production rollout"
                 ),
             )
+            job.outputs["doc_inline_fallback_used"] = "true" if doc_inline_fallback else "false"
+            job.outputs["doc_git_fallback_used"] = "true" if doc_git_fallback else "false"
+            job.outputs["doc_release_fallback_used"] = "true" if doc_release_fallback else "false"
 
             job.status = "completed"
             job.stage = "completed"

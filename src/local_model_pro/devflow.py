@@ -147,6 +147,18 @@ def build_documentation_markdown(
     outputs: dict[str, str],
 ) -> str:
     inline_doc_code = outputs.get("doc_inline_code", "").strip() or outputs.get("doc_inline", "").strip()
+    fallback_notes: list[str] = []
+    if outputs.get("doc_inline_fallback_used") == "true":
+        fallback_notes.append("doc_inline used fallback annotator output due to role timeout/failure.")
+    if outputs.get("doc_git_fallback_used") == "true":
+        fallback_notes.append("doc_git used fallback notes due to role timeout/failure.")
+    if outputs.get("doc_release_fallback_used") == "true":
+        fallback_notes.append("doc_release used fallback notes due to role timeout/failure.")
+    inline_notes = (
+        "\n".join([f"- {note}" for note in fallback_notes])
+        if fallback_notes
+        else "Inline comments and function-level docstrings are embedded directly in the code block above."
+    )
     lines = [
         "# Documentation Pack",
         "",
@@ -160,7 +172,7 @@ def build_documentation_markdown(
         "",
         "## Inline Documentation Notes",
         "",
-        "Inline comments and function-level docstrings are embedded directly in the code block above.",
+        inline_notes,
         "",
         "## Git Notes",
         "",
@@ -249,4 +261,7 @@ async def run_with_retries(
             if attempt >= retries:
                 break
             await asyncio.sleep(0.05)
-    raise DevflowError(f"Role '{role}' failed: {last_error}")
+    error_text = ""
+    if last_error is not None:
+        error_text = str(last_error).strip() or type(last_error).__name__
+    raise DevflowError(f"Role '{role}' failed: {error_text or 'unknown error'}")
