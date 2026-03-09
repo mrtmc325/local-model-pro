@@ -580,11 +580,14 @@ function applyDevflowEvent(message) {
   renderDevflowStatus({ status, percent, message: composedMessage });
   const role = String(message.role || "");
   const stage = String(message.stage || "");
+  const stageModel = String(message.model || "").trim();
   if (message.type === "devflow_stage_result") {
     const outputKey = String(message.output_key || `${stage}.${role}` || "output");
     state.devflowOutputsByKey[outputKey] = String(message.output || "");
     renderDevflowOutputs();
-    pushDevflowTimeline(`${stage}/${role} completed`);
+    pushDevflowTimeline(
+      `${stage}/${role} completed${stageModel ? ` (model=${stageModel})` : ""}`
+    );
   } else {
     const timelineText = composedMessage || infoMessage;
     pushDevflowTimeline(

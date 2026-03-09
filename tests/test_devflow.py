@@ -130,6 +130,23 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         stage_results = [e for e in events if e.get("type") == "devflow_stage_result"]
         self.assertEqual(len(stage_results), 15)
+        expected_model_sequence = [
+            "intent-r",
+            "intent-k",
+            "intent-f",
+            "code-1",
+            "code-2",
+            "code-3",
+            "code-1",
+            "code-2",
+            "code-3",
+            "code-1",
+            "code-2",
+            "code-3",
+            "doc-i",
+            "doc-g",
+            "doc-r",
+        ]
         self.assertEqual(
             [str(e.get("role")) for e in stage_results],
             [
@@ -149,6 +166,20 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "doc_git",
                 "doc_release",
             ],
+        )
+        self.assertEqual(
+            [str(call.get("model")) for call in ollama.calls],
+            expected_model_sequence,
+        )
+        self.assertEqual(
+            [str(e.get("model")) for e in stage_results],
+            expected_model_sequence,
+        )
+        role_progress_events = [
+            e for e in events if e.get("type") == "devflow_progress" and e.get("role")
+        ]
+        self.assertTrue(
+            any("model=intent-r" in str(e.get("message", "")) for e in role_progress_events)
         )
 
         prompt_step1 = next(c for c in ollama.calls if "Round 3 chain step 1" in c["prompt"])

@@ -596,8 +596,13 @@ async def _run_devflow_job(
         nonlocal completed_steps
         if job.cancel_requested:
             raise DevflowError("Cancelled by user.")
-        await push_progress(stage=stage, role=role, status="running", message=status_message)
         model_name = job.role_models.get(role, job.selected_model)
+        await push_progress(
+            stage=stage,
+            role=role,
+            status="running",
+            message=f"{status_message} (model={model_name})",
+        )
         effective_retries = devflow_config.retry_count if retries is None else max(0, retries)
         output = await run_with_retries(
             job=job,
@@ -661,6 +666,7 @@ async def _run_devflow_job(
                 fallback_output = (
                     f"Role '{role}' fallback output generated after failure: {str(exc)[:300]}"
                 )
+            fallback_model = job.role_models.get(role, job.selected_model)
             job.outputs[output_key] = fallback_output
             completed_steps += 1
             stage_time = _utc_now_iso()
@@ -669,7 +675,7 @@ async def _run_devflow_job(
                     "stage": stage,
                     "role": role,
                     "output_key": output_key,
-                    "model": job.role_models.get(role, job.selected_model),
+                    "model": fallback_model,
                     "status": "fallback",
                     "error": str(exc)[:500],
                     "at": stage_time,
@@ -682,7 +688,7 @@ async def _run_devflow_job(
                     "stage": stage,
                     "role": role,
                     "output_key": output_key,
-                    "model": job.role_models.get(role, job.selected_model),
+                    "model": fallback_model,
                     "status": "fallback",
                     "percent": int((completed_steps / total_steps) * 100),
                     "output": fallback_output,
@@ -694,7 +700,7 @@ async def _run_devflow_job(
                 stage=stage,
                 role=role,
                 status="running",
-                message=f"{role} used fallback output after role failure.",
+                message=f"{role} used fallback output after role failure (model={fallback_model}).",
             )
             return fallback_output, True
 
