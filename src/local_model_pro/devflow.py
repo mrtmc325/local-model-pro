@@ -75,21 +75,22 @@ def resolve_role_models(
     fallback_selected_model: str,
 ) -> dict[str, str]:
     explicit = {k: str(v).strip() for k, v in (role_models or {}).items() if str(v).strip()}
+    selected = fallback_selected_model.strip()
     pool = [item.strip() for item in fallback_pool if item and item.strip()]
-    if fallback_selected_model.strip():
-        pool.append(fallback_selected_model.strip())
-    if not pool:
+    if not selected and pool:
+        selected = pool[0]
+    if not selected and explicit:
+        selected = next(iter(explicit.values()))
+    if not selected:
         raise DevflowError("No model available for devflow execution.")
 
     resolved: dict[str, str] = {}
-    pool_index = 0
     for role in ROLE_ORDER:
         picked = explicit.get(role, "")
         if picked:
             resolved[role] = picked
             continue
-        resolved[role] = pool[pool_index % len(pool)]
-        pool_index += 1
+        resolved[role] = selected
     return resolved
 
 

@@ -36,6 +36,10 @@ Local chat server and browser/terminal clients for Ollama models, with optional 
   - live websocket progress/stage events
   - artifacts written only under `data/devflow_runs/<job_id>/`
   - single ZIP download containing exactly `code_pack.md` and `documentation.md`
+- Upload review materials:
+  - upload local files or ZIP archives
+  - attach uploaded material to chat prompts and devflow runs
+  - server extracts text members and injects review context for the model
 - Local workspace tools from chat:
   - list folders and tree views
   - find files
@@ -160,10 +164,11 @@ Client -> server:
 
 - `{"type":"hello","model":"qwen2.5:7b","actor_id":"anonymous","system_prompt":"...optional..."}`
 - `{"type":"chat","prompt":"..."}`
+- `{"type":"chat","prompt":"...","attachments":["upload_id_1","upload_id_2"]}`
 - `{"type":"set_model","model":"llama3.1:8b"}`
 - `{"type":"reset"}`
 - `{"type":"status"}`
-- `{"type":"devflow_start","prompt":"...","role_models":{"code_model_1":"qwen2.5:7b"}}`
+- `{"type":"devflow_start","prompt":"...","role_models":{"code_model_1":"qwen2.5:7b"},"attachments":["upload_id_1"]}`
 - `{"type":"devflow_status","job_id":"...optional..."}`
 - `{"type":"devflow_cancel","job_id":"...optional..."}`
 
@@ -192,6 +197,8 @@ Server -> client:
 - `/api/models/delete` (POST)
 - `/api/model-stores` (GET)
 - `/api/model-stores/search?store_id=...&q=...` (GET)
+- `/api/uploads` (POST, GET, DELETE clear by actor)
+- `/api/uploads/{upload_id}` (DELETE)
 - `/api/v1/profile/preferences` (GET, PATCH)
 - `/api/v1/profile/preferences/reset` (POST)
 - `/api/v1/admin/platform` (GET, PATCH)

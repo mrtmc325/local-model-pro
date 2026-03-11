@@ -24,6 +24,12 @@ const chatLog = document.getElementById("chatLog");
 const chatForm = document.getElementById("chatForm");
 const promptInput = document.getElementById("promptInput");
 const sendBtn = document.getElementById("sendBtn");
+const reviewUploadInput = document.getElementById("reviewUploadInput");
+const reviewUploadPickBtn = document.getElementById("reviewUploadPickBtn");
+const reviewUploadBtn = document.getElementById("reviewUploadBtn");
+const clearUploadsBtn = document.getElementById("clearUploadsBtn");
+const uploadMeta = document.getElementById("uploadMeta");
+const uploadList = document.getElementById("uploadList");
 const mainDevflowToggle = document.getElementById("mainDevflowToggle");
 const devflowSidePanel = document.getElementById("devflowSidePanel");
 const menuToggleBtn = document.getElementById("menuToggleBtn");
@@ -187,6 +193,7 @@ const state = {
   devflowTimelineItems: [],
   devflowOutputsByKey: {},
   devflowPendingStart: null,
+  uploadedMaterials: [],
 };
 
 function setDrawerOpen(open) {
@@ -233,11 +240,23 @@ function adminHeaders(baseHeaders = {}) {
 async function apiJson(path, options = {}) {
   const response = await fetch(path, options);
   let payload = {};
+  let rawText = "";
   try {
-    payload = await response.json();
+    rawText = await response.text();
   } catch (_err) {
-    payload = {};
+    rawText = "";
   }
+
+  if (rawText.trim()) {
+    try {
+      payload = JSON.parse(rawText);
+    } catch (_err) {
+      const preview = rawText.replace(/\s+/g, " ").trim().slice(0, 160);
+      const suffix = preview ? `: ${preview}` : "";
+      throw new Error(`Invalid JSON response from ${path}${suffix}`);
+    }
+  }
+
   if (!response.ok) {
     const detail = payload?.detail;
     if (typeof detail === "string" && detail) {
@@ -266,6 +285,174 @@ function setDevflowMeta(text) {
   }
   if (devflowMainMeta) {
     devflowMainMeta.textContent = text;
+  }
+}
+
+function uploadIds() {
+  return state.uploadedMaterials.map((item) => String(item.upload_id || "").trim()).filter(Boolean);
+}
+
+function setUploadMeta(text) {
+  if (uploadMeta) {
+    uploadMeta.textContent = String(text || "");
+  }
+}
+
+function renderUploadList() {
+  if (!uploadList) {
+    return;
+  }
+  uploadList.innerHTML = "";
+  const uploads = Array.isArray(state.uploadedMaterials) ? state.uploadedMaterials : [];
+  if (!uploads.length) {
+    uploadList.hidden = true;
+    setUploadMeta("No uploaded files attached.");
+    return;
+  }
+  uploadList.hidden = false;
+  uploads.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "upload-item";
+
+    const meta = document.createElement("div");
+    meta.className = "upload-item-meta";
+
+    const title = document.createElement("div");
+    title.className = "upload-item-title";
+    title.textContent = `${String(item.filename || "upload")} (${String(item.kind || "file")})`;
+
+    const summary = document.createElement("div");
+    summary.className = "upload-item-summary";
+    summary.textContent = String(item.summary || "");
+
+    meta.appendChild(title);
+    meta.appendChild(summary);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "tool-action secondary";
+    removeBtn.dataset.uploadId = String(item.upload_id || "");
+    removeBtn.textContent = "Remove";
+
+    row.appendChild(meta);
+    row.appendChild(removeBtn);
+    uploadList.appendChild(row);
+  });
+  setUploadMeta(`${uploads.length} uploaded file/ZIP item(s) attached to prompts.`);
+}
+
+function upsertUploadedMaterial(upload) {
+  const uploadId = String(upload?.upload_id || "").trim();
+  if (!uploadId) {
+    return;
+  }
+  const next = {
+    upload_id: uploadId,
+    filename: String(upload?.filename || "upload"),
+    kind: String(upload?.kind || "file"),
+    summary: String(upload?.summary || ""),
+  };
+  const existingIndex = state.uploadedMaterials.findIndex(
+    (item) => String(item.upload_id || "") === uploadId
+  );
+  if (existingIndex >= 0) {
+    state.uploadedMaterials[existingIndex] = next;
+  } else {
+    state.uploadedMaterials.push(next);
+  }
+  renderUploadList();
+}
+
+async function loadUploadedMaterials() {
+  try {
+    const actorId = currentActorId();
+    const payload = await apiJson(`/api/uploads?actor_id=${encodeURIComponent(actorId)}`);
+    const uploads = Array.isArray(payload.uploads) ? payload.uploads : [];
+    state.uploadedMaterials = uploads
+      .map((item) => ({
+        upload_id: String(item.upload_id || "").trim(),
+        filename: String(item.filename || "upload"),
+        kind: String(item.kind || "file"),
+        summary: String(item.summary || ""),
+      }))
+      .filter((item) => item.upload_id);
+    renderUploadList();
+  } catch (error) {
+    setUploadMeta(`Upload list error: ${error.message}`);
+  }
+}
+
+async function removeUploadedMaterial(uploadId) {
+  const id = String(uploadId || "").trim();
+  if (!id) {
+    return;
+  }
+  try {
+    await apiJson(
+      `/api/uploads/${encodeURIComponent(id)}?actor_id=${encodeURIComponent(currentActorId())}`,
+      {
+        method: "DELETE",
+      }
+    );
+    state.uploadedMaterials = state.uploadedMaterials.filter(
+      (item) => String(item.upload_id || "") !== id
+    );
+    renderUploadList();
+  } catch (error) {
+    setUploadMeta(`Remove upload error: ${error.message}`);
+  }
+}
+
+async function clearUploadedMaterials() {
+  try {
+    await apiJson(`/api/uploads?actor_id=${encodeURIComponent(currentActorId())}`, {
+      method: "DELETE",
+    });
+    state.uploadedMaterials = [];
+    renderUploadList();
+  } catch (error) {
+    setUploadMeta(`Clear uploads error: ${error.message}`);
+  }
+}
+
+async function uploadSelectedMaterials() {
+  if (!reviewUploadInput) {
+    return;
+  }
+  const files = Array.from(reviewUploadInput.files || []);
+  if (!files.length) {
+    setUploadMeta("Pick one or more files before uploading.");
+    return;
+  }
+  if (reviewUploadBtn) {
+    reviewUploadBtn.disabled = true;
+  }
+  try {
+    for (const file of files) {
+      const body = new FormData();
+      body.append("actor_id", currentActorId());
+      body.append("file", file);
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        body,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.detail || `Upload failed (${response.status})`);
+      }
+      const upload = payload?.upload;
+      if (upload && typeof upload === "object") {
+        upsertUploadedMaterial(upload);
+      }
+    }
+    reviewUploadInput.value = "";
+    setUploadMeta(`Uploaded ${files.length} file(s).`);
+  } catch (error) {
+    setUploadMeta(`Upload failed: ${error.message}`);
+  } finally {
+    if (reviewUploadBtn) {
+      reviewUploadBtn.disabled = false;
+    }
   }
 }
 
@@ -643,6 +830,7 @@ function startDevflowRun(options = {}) {
     selected_model: primaryModel,
     role_models,
     fallback_models,
+    attachments: uploadIds(),
   };
 
   state.devflowTimelineItems = [];
@@ -1467,6 +1655,7 @@ async function loadProfilePreferences() {
       profileActorInput.value = state.profileLoadedActor;
     }
     applyProfilePreferences(state.profilePreferences);
+    await loadUploadedMaterials();
     loadDevflowRoleSlots();
     setProfileMeta(
       `Loaded actor=${state.profileLoadedActor} version=${state.profileVersion}`
@@ -1757,11 +1946,7 @@ async function loadAdminData() {
 async function loadModels() {
   refreshModelsBtn.disabled = true;
   try {
-    const response = await fetch("/api/models");
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Failed to read model list");
-    }
+    const payload = await apiJson("/api/models");
 
     const models = Array.isArray(payload.models) ? payload.models : [];
     state.availableModels = models
@@ -1795,11 +1980,7 @@ async function loadModelStores() {
     return;
   }
   try {
-    const response = await fetch("/api/model-stores");
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Failed to load model stores");
-    }
+    const payload = await apiJson("/api/model-stores");
     state.modelStores = Array.isArray(payload.stores) ? payload.stores : [];
     renderStoreOptions();
   } catch (error) {
@@ -2243,7 +2424,12 @@ function sendChatPrompt(rawPrompt) {
 
   try {
     const reasoning_mode = String(reasoningViewSelect?.value || "summary");
-    sendWs({ type: "chat", prompt, reasoning_mode });
+    sendWs({
+      type: "chat",
+      prompt,
+      reasoning_mode,
+      attachments: uploadIds(),
+    });
   } catch (error) {
     addMessage("system", `Send failed: ${error.message}`);
     setBusy(false);
@@ -2312,6 +2498,40 @@ refreshModelsBtn.addEventListener("click", loadModels);
 applyModelBtn.addEventListener("click", applyModel);
 resetBtn.addEventListener("click", resetConversation);
 chatForm.addEventListener("submit", sendPrompt);
+if (reviewUploadPickBtn) {
+  reviewUploadPickBtn.addEventListener("click", () => {
+    reviewUploadInput?.click();
+  });
+}
+if (reviewUploadBtn) {
+  reviewUploadBtn.addEventListener("click", () => {
+    void uploadSelectedMaterials();
+  });
+}
+if (clearUploadsBtn) {
+  clearUploadsBtn.addEventListener("click", () => {
+    void clearUploadedMaterials();
+  });
+}
+if (reviewUploadInput) {
+  reviewUploadInput.addEventListener("change", () => {
+    const count = Number(reviewUploadInput.files?.length || 0);
+    setUploadMeta(count > 0 ? `${count} file(s) selected; click Upload.` : "No uploaded files attached.");
+  });
+}
+if (uploadList) {
+  uploadList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLButtonElement)) {
+      return;
+    }
+    const uploadId = String(target.dataset.uploadId || "").trim();
+    if (!uploadId) {
+      return;
+    }
+    void removeUploadedMaterial(uploadId);
+  });
+}
 if (menuToggleBtn) {
   menuToggleBtn.addEventListener("click", toggleDrawer);
 }
@@ -2616,6 +2836,7 @@ resetDevflowView();
 if (profileActorInput) {
   profileActorInput.value = state.profileLoadedActor;
 }
+renderUploadList();
 loadModels();
 loadModelStores();
 loadProfilePreferences();

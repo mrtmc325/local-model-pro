@@ -30,6 +30,11 @@ class Settings:
     fs_find_max_results: int = int(os.getenv("FS_FIND_MAX_RESULTS", "60"))
     fs_summary_max_files: int = int(os.getenv("FS_SUMMARY_MAX_FILES", "8"))
     fs_summary_file_chars: int = int(os.getenv("FS_SUMMARY_FILE_CHARS", "2400"))
+    upload_max_bytes: int = int(os.getenv("UPLOAD_MAX_BYTES", "26214400"))
+    upload_max_files_in_zip: int = int(os.getenv("UPLOAD_MAX_FILES_IN_ZIP", "120"))
+    upload_member_max_bytes: int = int(os.getenv("UPLOAD_MEMBER_MAX_BYTES", "1048576"))
+    upload_max_context_chars: int = int(os.getenv("UPLOAD_MAX_CONTEXT_CHARS", "120000"))
+    upload_store_retention: int = int(os.getenv("UPLOAD_STORE_RETENTION", "300"))
     admin_state_path: str = str(
         Path(
             os.getenv(
@@ -47,7 +52,8 @@ class Settings:
     admin_api_token: str = os.getenv("ADMIN_API_TOKEN", "").strip()
     devflow_enabled: bool = _env_bool("DEVFLOW_ENABLED", "true")
     devflow_max_concurrent_jobs: int = int(os.getenv("DEVFLOW_MAX_CONCURRENT_JOBS", "1"))
-    devflow_role_timeout_seconds: int = int(os.getenv("DEVFLOW_ROLE_TIMEOUT_SECONDS", "90"))
+    devflow_role_timeout_seconds: int = int(os.getenv("DEVFLOW_ROLE_TIMEOUT_SECONDS", "120"))
+    devflow_retry_count: int = int(os.getenv("DEVFLOW_RETRY_COUNT", "0"))
     devflow_run_retention: int = int(os.getenv("DEVFLOW_RUN_RETENTION", "30"))
     devflow_doc_inline_max_input_chars: int = int(
         os.getenv("DEVFLOW_DOC_INLINE_MAX_INPUT_CHARS", "5000")

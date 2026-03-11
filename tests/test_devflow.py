@@ -10,14 +10,21 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from local_model_pro.admin_profile_store import AdminProfileStore
-from local_model_pro.devflow import DevflowJob, ROLE_ORDER, resolve_role_models, write_devflow_artifacts
+from local_model_pro.devflow import (
+    DevflowJob,
+    ROLE_ORDER,
+    resolve_role_models,
+    write_devflow_artifacts,
+)
 from local_model_pro.server import (
     _job_payload,
+    _request_devflow_cancel,
     _run_devflow_job,
     _upsert_devflow_job,
     app,
     devflow_config,
     devflow_jobs,
+    devflow_job_tasks,
     settings,
 )
 
@@ -33,11 +40,11 @@ class DevflowModuleTests(unittest.TestCase):
         self.assertEqual(mapping["intent_reasoner"], "model-x")
         self.assertEqual(mapping["doc_release"], "model-z")
         self.assertEqual(set(mapping.keys()), set(ROLE_ORDER))
-        # Deterministic cycle for missing slots: pool-a -> pool-b -> selected-main -> repeat.
-        self.assertEqual(mapping["intent_knowledge"], "pool-a")
-        self.assertEqual(mapping["intent_feasibility"], "pool-b")
+        # Missing slots default to the selected workflow model for consistency.
+        self.assertEqual(mapping["intent_knowledge"], "selected-main")
+        self.assertEqual(mapping["intent_feasibility"], "selected-main")
         self.assertEqual(mapping["code_model_1"], "selected-main")
-        self.assertEqual(mapping["code_model_2"], "pool-a")
+        self.assertEqual(mapping["code_model_2"], "selected-main")
 
     def test_write_artifacts_creates_exact_zip_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -61,7 +68,6 @@ class DevflowModuleTests(unittest.TestCase):
                 names = sorted(archive.namelist())
             self.assertEqual(names, ["code_pack.md", "documentation.md"])
 
-
 class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp_dir = tempfile.TemporaryDirectory()
@@ -69,9 +75,17 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
         self._orig_retry_count = devflow_config.retry_count
         devflow_config.artifact_dir = Path(self._tmp_dir.name)
         devflow_config.retry_count = 0
+        for task in list(devflow_job_tasks.values()):
+            if not task.done():
+                task.cancel()
+        devflow_job_tasks.clear()
         devflow_jobs.clear()
 
     async def asyncTearDown(self) -> None:
+        for task in list(devflow_job_tasks.values()):
+            if not task.done():
+                task.cancel()
+        devflow_job_tasks.clear()
         devflow_jobs.clear()
         devflow_config.artifact_dir = self._orig_artifact_dir
         devflow_config.retry_count = self._orig_retry_count
@@ -415,6 +429,35 @@ class DevflowRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("inline documentation for behavior and intent", inline_code.lower())
         self.assertIn('"""Handle GET / requests for this API endpoint.', inline_code)
 
+    async def test_request_devflow_cancel_cancels_registered_task(self) -> None:
+        job = DevflowJob(
+            job_id="job-cancel-task-test",
+            actor_id="actor",
+            prompt="cancel test",
+            selected_model="qwen2.5:7b",
+            role_models={role: "qwen2.5:7b" for role in ROLE_ORDER},
+        )
+        await _upsert_devflow_job(job)
+
+        cancel_seen = {"value": False}
+
+        async def blocker() -> None:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancel_seen["value"] = True
+                raise
+
+        task = asyncio.create_task(blocker())
+        devflow_job_tasks[job.job_id] = task
+
+        cancelled_job = await _request_devflow_cancel(job.job_id)
+        self.assertIsNotNone(cancelled_job)
+        self.assertTrue(bool(cancelled_job and cancelled_job.cancel_requested))
+
+        await asyncio.sleep(0)
+        self.assertTrue(task.cancelled() or cancel_seen["value"])
+
 
 class DevflowWebSocketTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -429,9 +472,17 @@ class DevflowWebSocketTests(unittest.TestCase):
 
         self._orig_artifact_dir = devflow_config.artifact_dir
         devflow_config.artifact_dir = Path(self._tmp_dir.name) / "runs"
+        for task in list(devflow_job_tasks.values()):
+            if not task.done():
+                task.cancel()
+        devflow_job_tasks.clear()
         devflow_jobs.clear()
 
     def tearDown(self) -> None:
+        for task in list(devflow_job_tasks.values()):
+            if not task.done():
+                task.cancel()
+        devflow_job_tasks.clear()
         devflow_jobs.clear()
         devflow_config.artifact_dir = self._orig_artifact_dir
         self._store_patcher.stop()

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 from fastapi.testclient import TestClient
 
 from local_model_pro.admin_profile_store import AdminProfileStore
-from local_model_pro.server import app, pull_jobs, settings
+from local_model_pro.server import app, pull_jobs, settings, uploaded_contexts
 
 
 class ServerChatTests(unittest.TestCase):
@@ -21,8 +23,10 @@ class ServerChatTests(unittest.TestCase):
         )
         self._store_patcher = mock.patch("local_model_pro.server.admin_profile_store", new=temp_store)
         self._store_patcher.start()
+        uploaded_contexts.clear()
 
     def tearDown(self) -> None:
+        uploaded_contexts.clear()
         self._store_patcher.stop()
         self._tmp_dir.cleanup()
 
@@ -51,6 +55,85 @@ class ServerChatTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["chat"], True)
         self.assertEqual(payload["capabilities"]["model_switching"], True)
         self.assertEqual(payload["capabilities"]["local_tools"], True)
+        self.assertEqual(payload["capabilities"]["file_upload_review"], True)
+
+    def test_upload_text_file_and_list_delete(self) -> None:
+        client = TestClient(app)
+
+        upload_response = client.post(
+            "/api/uploads",
+            files={"file": ("hello.py", b"print('hello')\n", "text/plain")},
+            data={"actor_id": "anonymous"},
+        )
+        self.assertEqual(upload_response.status_code, 200)
+        upload_payload = upload_response.json()
+        upload = upload_payload.get("upload", {})
+        upload_id = str(upload.get("upload_id", ""))
+        self.assertTrue(upload_id)
+        self.assertEqual(upload.get("kind"), "file")
+        self.assertEqual(upload.get("included_files"), 1)
+
+        list_response = client.get("/api/uploads?actor_id=anonymous")
+        self.assertEqual(list_response.status_code, 200)
+        list_payload = list_response.json()
+        self.assertEqual(list_payload.get("count"), 1)
+        self.assertEqual(list_payload.get("uploads", [])[0].get("upload_id"), upload_id)
+
+        delete_response = client.delete(f"/api/uploads/{upload_id}?actor_id=anonymous")
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertEqual(delete_response.json().get("status"), "deleted")
+
+    def test_upload_zip_uses_text_members_for_chat_attachment(self) -> None:
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("src/main.py", "def add(a, b):\n    return a + b\n")
+            archive.writestr("README.md", "# Sample\n")
+        archive_bytes = archive_buffer.getvalue()
+
+        async def fake_stream_chat(
+            _self: object,
+            *,
+            model: str,
+            messages: list[dict[str, str]],
+            temperature: float,
+            num_ctx: int,
+            think: bool | str | None = None,
+        ):
+            _ = (model, temperature, num_ctx, think)
+            final_user = messages[-1]["content"]
+            self.assertIn("Uploaded file/ZIP context for review:", final_user)
+            self.assertIn("src/main.py", final_user)
+            self.assertIn("return a + b", final_user)
+            yield "reviewed"
+
+        client = TestClient(app)
+        upload_response = client.post(
+            "/api/uploads",
+            files={"file": ("sample.zip", archive_bytes, "application/zip")},
+            data={"actor_id": "anonymous"},
+        )
+        self.assertEqual(upload_response.status_code, 200)
+        upload_id = upload_response.json()["upload"]["upload_id"]
+
+        with mock.patch("local_model_pro.server.OllamaClient.stream_chat", new=fake_stream_chat):
+            with client.websocket_connect("/ws/chat") as ws:
+                self._consume_until_ready(ws)
+                ws.send_json({"type": "hello", "model": "qwen2.5:7b", "actor_id": "anonymous"})
+                self._consume_until_ready(ws)
+                ws.send_json(
+                    {
+                        "type": "chat",
+                        "prompt": "Review my code",
+                        "attachments": [upload_id],
+                    }
+                )
+                seen_done = False
+                while True:
+                    message = ws.receive_json()
+                    if message.get("type") == "done":
+                        seen_done = True
+                        break
+                self.assertTrue(seen_done)
 
     def test_api_models(self) -> None:
         async def fake_list_models(_self: object) -> list[dict[str, object]]:

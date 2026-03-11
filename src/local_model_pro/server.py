@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import re
 import shlex
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +16,7 @@ from urllib.parse import quote_plus
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -61,6 +63,7 @@ devflow_config = DevflowRuntimeConfig(
     enabled=settings.devflow_enabled,
     max_concurrent_jobs=max(1, settings.devflow_max_concurrent_jobs),
     role_timeout_seconds=max(5, settings.devflow_role_timeout_seconds),
+    retry_count=max(0, settings.devflow_retry_count),
     run_retention=max(5, settings.devflow_run_retention),
     doc_inline_max_input_chars=max(1000, settings.devflow_doc_inline_max_input_chars),
     doc_git_max_input_chars=max(800, settings.devflow_doc_git_max_input_chars),
@@ -70,6 +73,7 @@ devflow_config = DevflowRuntimeConfig(
 devflow_jobs: dict[str, DevflowJob] = {}
 devflow_jobs_lock = asyncio.Lock()
 devflow_job_semaphore = asyncio.Semaphore(devflow_config.max_concurrent_jobs)
+devflow_job_tasks: dict[str, asyncio.Task[Any]] = {}
 
 
 def _utc_now_iso() -> str:
@@ -118,6 +122,71 @@ class PullJob:
 
 pull_jobs: dict[str, PullJob] = {}
 pull_jobs_lock = asyncio.Lock()
+
+
+@dataclass
+class UploadedReviewContext:
+    upload_id: str
+    actor_id: str
+    filename: str
+    kind: str
+    size_bytes: int
+    file_count: int
+    included_files: int
+    skipped_files: int
+    summary: str
+    context_text: str
+    created_at: str
+
+
+uploaded_contexts: dict[str, UploadedReviewContext] = {}
+uploaded_contexts_lock = asyncio.Lock()
+
+_UPLOAD_TEXT_EXTENSIONS: set[str] = {
+    ".py",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".xml",
+    ".csv",
+    ".tsv",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".html",
+    ".htm",
+    ".css",
+    ".scss",
+    ".sql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".c",
+    ".h",
+    ".hpp",
+    ".cpp",
+    ".cc",
+    ".swift",
+    ".rb",
+    ".php",
+    ".pl",
+    ".vue",
+    ".svelte",
+    ".env",
+    ".dockerfile",
+    ".makefile",
+}
 
 
 @dataclass
@@ -210,6 +279,199 @@ def _safe_actor_id(value: Any) -> str:
     return settings.default_actor_id
 
 
+def _upload_payload(item: UploadedReviewContext) -> dict[str, Any]:
+    return {
+        "upload_id": item.upload_id,
+        "actor_id": item.actor_id,
+        "filename": item.filename,
+        "kind": item.kind,
+        "size_bytes": item.size_bytes,
+        "file_count": item.file_count,
+        "included_files": item.included_files,
+        "skipped_files": item.skipped_files,
+        "summary": item.summary,
+        "created_at": item.created_at,
+    }
+
+
+def _trim_text_block(value: str, *, max_chars: int) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}\n\n[truncated]"
+
+
+def _looks_binary(raw_bytes: bytes) -> bool:
+    return b"\x00" in raw_bytes[:4096]
+
+
+def _decode_text(raw_bytes: bytes) -> str | None:
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            decoded = raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if decoded:
+            return decoded
+    return None
+
+
+def _is_text_path(name: str) -> bool:
+    lowered = name.lower().strip()
+    if lowered.endswith("dockerfile") or lowered.endswith("makefile"):
+        return True
+    suffix = Path(lowered).suffix
+    return suffix in _UPLOAD_TEXT_EXTENSIONS
+
+
+def _build_plain_file_context(filename: str, raw_bytes: bytes) -> tuple[str, int, int, int]:
+    if _looks_binary(raw_bytes):
+        summary = f"Binary file '{filename}' uploaded; binary content is not included in context."
+        return summary, 1, 0, 1
+    decoded = _decode_text(raw_bytes)
+    if decoded is None:
+        summary = f"File '{filename}' could not be decoded as text."
+        return summary, 1, 0, 1
+    body = _trim_text_block(decoded, max_chars=max(2000, settings.upload_max_context_chars))
+    context = f"### FILE: {filename}\n```text\n{body}\n```"
+    return context, 1, 1, 0
+
+
+def _build_zip_context(filename: str, raw_bytes: bytes) -> tuple[str, int, int, int]:
+    lines: list[str] = []
+    file_count = 0
+    included = 0
+    skipped = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                file_count += 1
+                if file_count > max(1, settings.upload_max_files_in_zip):
+                    skipped += 1
+                    continue
+
+                normalized_name = info.filename.replace("\\", "/").strip() or f"file_{file_count}"
+                if info.file_size > max(1024, settings.upload_member_max_bytes):
+                    skipped += 1
+                    lines.append(
+                        f"- skipped `{normalized_name}` (size {info.file_size} bytes exceeds member limit)"
+                    )
+                    continue
+                if not _is_text_path(normalized_name):
+                    skipped += 1
+                    continue
+
+                try:
+                    member_bytes = archive.read(info)
+                except Exception:
+                    skipped += 1
+                    lines.append(f"- skipped `{normalized_name}` (unable to read member)")
+                    continue
+
+                if _looks_binary(member_bytes):
+                    skipped += 1
+                    continue
+
+                decoded = _decode_text(member_bytes)
+                if decoded is None:
+                    skipped += 1
+                    continue
+
+                included += 1
+                body = _trim_text_block(decoded, max_chars=max(500, settings.upload_member_max_bytes))
+                lines.append(f"### FILE: {normalized_name}\n```text\n{body}\n```")
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid ZIP archive: {exc}") from exc
+
+    if not lines:
+        lines.append("No text files were extracted from this ZIP for context.")
+
+    context = "\n\n".join(lines)
+    context = _trim_text_block(context, max_chars=max(2000, settings.upload_max_context_chars))
+    return context, file_count, included, skipped
+
+
+async def _store_uploaded_context(item: UploadedReviewContext) -> None:
+    async with uploaded_contexts_lock:
+        uploaded_contexts[item.upload_id] = item
+        if len(uploaded_contexts) > max(10, settings.upload_store_retention):
+            keys = sorted(uploaded_contexts.keys(), key=lambda key: uploaded_contexts[key].created_at)
+            remove_count = max(0, len(uploaded_contexts) - max(10, settings.upload_store_retention))
+            for key in keys[:remove_count]:
+                uploaded_contexts.pop(key, None)
+
+
+async def _list_uploaded_contexts(*, actor_id: str) -> list[UploadedReviewContext]:
+    async with uploaded_contexts_lock:
+        items = [item for item in uploaded_contexts.values() if item.actor_id == actor_id]
+    return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+
+async def _delete_uploaded_context(*, upload_id: str, actor_id: str) -> UploadedReviewContext | None:
+    async with uploaded_contexts_lock:
+        item = uploaded_contexts.get(upload_id)
+        if item is None:
+            return None
+        if item.actor_id != actor_id:
+            raise HTTPException(status_code=403, detail="Upload belongs to another actor.")
+        uploaded_contexts.pop(upload_id, None)
+        return item
+
+
+def _normalize_attachment_ids(raw_value: Any) -> list[str]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized: list[str] = []
+    for item in raw_value:
+        candidate = str(item).strip()
+        if not candidate:
+            continue
+        if candidate in normalized:
+            continue
+        normalized.append(candidate)
+    return normalized
+
+
+async def _resolve_attachment_context(
+    *,
+    actor_id: str,
+    attachment_ids: list[str],
+) -> tuple[str, list[str], list[str], list[UploadedReviewContext]]:
+    if not attachment_ids:
+        return "", [], [], []
+
+    missing: list[str] = []
+    forbidden: list[str] = []
+    resolved: list[UploadedReviewContext] = []
+    async with uploaded_contexts_lock:
+        for upload_id in attachment_ids:
+            item = uploaded_contexts.get(upload_id)
+            if item is None:
+                missing.append(upload_id)
+                continue
+            if item.actor_id != actor_id:
+                forbidden.append(upload_id)
+                continue
+            resolved.append(item)
+
+    blocks: list[str] = []
+    for item in resolved:
+        blocks.append(
+            (
+                f"[Upload {item.upload_id}] {item.summary}\n"
+                f"Filename: {item.filename}\n"
+                f"Context:\n{item.context_text}"
+            )
+        )
+    context = _trim_text_block(
+        "\n\n".join(blocks),
+        max_chars=max(1500, settings.upload_max_context_chars),
+    )
+    return context, missing, forbidden, resolved
+
+
 def _require_admin_token(x_admin_token: str | None) -> None:
     required_token = settings.admin_api_token.strip()
     if not required_token:
@@ -292,6 +554,7 @@ async def _get_devflow_job(job_id: str) -> DevflowJob | None:
 
 
 async def _request_devflow_cancel(job_id: str) -> DevflowJob | None:
+    task_to_cancel: asyncio.Task[Any] | None = None
     async with devflow_jobs_lock:
         job = devflow_jobs.get(job_id)
         if job is None:
@@ -299,7 +562,10 @@ async def _request_devflow_cancel(job_id: str) -> DevflowJob | None:
         job.cancel_requested = True
         job.updated_at = _utc_now_iso()
         job.message = "Cancellation requested."
-        return job
+        task_to_cancel = devflow_job_tasks.get(job_id)
+    if task_to_cancel is not None and not task_to_cancel.done():
+        task_to_cancel.cancel()
+    return job
 
 
 def _get_store_by_id(store_id: str) -> dict[str, Any] | None:
@@ -593,7 +859,22 @@ async def _run_devflow_job(
             }
         )
 
-    async def call_role(model_name: str, role_prompt: str) -> str:
+    def role_timeout_for(role_name: str) -> int:
+        base = max(5, int(devflow_config.role_timeout_seconds))
+        if role_name in CODING_ROLES:
+            return max(base, int(base * 1.35))
+        if role_name.startswith("doc_"):
+            return max(45, int(base * 0.85))
+        return base
+
+    def role_num_ctx_for(role_name: str) -> int:
+        if role_name in CODING_ROLES:
+            return 6144
+        if role_name.startswith("doc_"):
+            return 4096
+        return 4096
+
+    async def call_role(role_name: str, model_name: str, role_prompt: str) -> str:
         return await asyncio.wait_for(
             ollama.chat(
                 model=model_name,
@@ -608,9 +889,9 @@ async def _run_devflow_job(
                     {"role": "user", "content": role_prompt},
                 ],
                 temperature=0.2,
-                num_ctx=8192,
+                num_ctx=role_num_ctx_for(role_name),
             ),
-            timeout=devflow_config.role_timeout_seconds,
+            timeout=role_timeout_for(role_name),
         )
 
     async def run_role(
@@ -650,7 +931,7 @@ async def _run_devflow_job(
             role=role,
             role_model=model_name,
             role_prompt=role_prompt,
-            role_call=call_role,
+            role_call=lambda active_model, active_prompt: call_role(role, active_model, active_prompt),
             retries=effective_retries,
         )
         job.outputs[output_key] = output
@@ -1143,13 +1424,24 @@ async def _run_devflow_job(
             normalized = f"{normalized[:2200].rstrip()}\n\n- [truncated]"
         return normalized.strip()
 
-    def round_bundle(label: str, mapping: dict[str, str]) -> str:
+    def round_bundle(
+        label: str,
+        mapping: dict[str, str],
+        *,
+        max_chars_per_role: int = 2200,
+        max_total_chars: int = 9000,
+    ) -> str:
         lines = [f"{label}:"]
         for key in sorted(mapping.keys()):
             lines.append(f"- {key}:")
-            lines.append(mapping[key])
+            lines.append(_trim_text(mapping[key], max_chars=max_chars_per_role))
             lines.append("")
-        return "\n".join(lines).strip()
+        return _trim_text("\n".join(lines).strip(), max_chars=max_total_chars)
+
+    scope_guard = (
+        "Primary rule: the original user request is the source of truth. "
+        "Do not drift scope, invent unrelated features, or ignore explicit constraints."
+    )
 
     async with devflow_job_semaphore:
         try:
@@ -1172,7 +1464,9 @@ async def _run_devflow_job(
                 output_key="intent_reasoner",
                 status_message="Analyzing request intent and logic.",
                 role_prompt=(
-                    "Explain in long form what the user is asking for and decompose required logic into subparts.\n\n"
+                    "Explain what the user is asking for and decompose required logic into concise subparts.\n"
+                    "Return 6-10 bullets maximum.\n"
+                    f"{scope_guard}\n\n"
                     f"User request:\n{job.prompt}"
                 ),
             )
@@ -1182,7 +1476,9 @@ async def _run_devflow_job(
                 output_key="intent_knowledge",
                 status_message="Building general knowledge framing.",
                 role_prompt=(
-                    "Describe in general-knowledge terms what this programming request is about.\n\n"
+                    "Describe in concise technical terms what this programming request is about.\n"
+                    "Return 5-8 bullets maximum.\n"
+                    f"{scope_guard}\n\n"
                     f"User request:\n{job.prompt}"
                 ),
             )
@@ -1194,6 +1490,7 @@ async def _run_devflow_job(
                 role_prompt=(
                     "Convert the user request and analysis into a natural-language-to-code feasibility prompt. "
                     "Include constraints, architecture hints, and implementation goals.\n\n"
+                    f"{scope_guard}\n\n"
                     f"Intent reasoner output:\n{intent_reasoner}\n\n"
                     f"Intent knowledge output:\n{intent_knowledge}\n\n"
                     f"Original request:\n{job.prompt}"
@@ -1209,13 +1506,19 @@ async def _run_devflow_job(
                     status_message=f"{role} generating first code attempt.",
                     role_prompt=(
                         "Generate code solution attempt #1 from this feasibility prompt. "
-                        "Return concrete code with brief notes if needed.\n\n"
+                        "Return concrete code with brief notes if needed. Keep response concise.\n"
+                        f"{scope_guard}\n\n"
                         f"Feasibility prompt:\n{intent_feasibility}"
                     ),
                 )
 
             round2: dict[str, str] = {}
-            round1_bundle = round_bundle("Round 1 outputs", round1)
+            round1_bundle = round_bundle(
+                "Round 1 outputs",
+                round1,
+                max_chars_per_role=1800,
+                max_total_chars=7000,
+            )
             for role in CODING_ROLES:
                 round2[role] = await run_role(
                     stage="coding_round_2",
@@ -1224,19 +1527,26 @@ async def _run_devflow_job(
                     status_message=f"{role} revising against all round-1 outputs.",
                     role_prompt=(
                         "Generate code solution attempt #2 by reviewing and comparing all round-1 attempts. "
-                        "Resolve conflicts and improve quality.\n\n"
+                        "Resolve conflicts and improve quality. Keep response concise.\n"
+                        f"{scope_guard}\n\n"
                         f"{round1_bundle}\n\nOriginal request:\n{job.prompt}"
                     ),
                 )
 
-            round2_bundle = round_bundle("Round 2 outputs", round2)
+            round2_bundle = round_bundle(
+                "Round 2 outputs",
+                round2,
+                max_chars_per_role=2000,
+                max_total_chars=7800,
+            )
             round3_model1 = await run_role(
                 stage="coding_round_3",
                 role="code_model_1",
                 output_key="round3.code_model_1",
                 status_message="Round-3 chain: model 1 isolating canonical solution.",
                 role_prompt=(
-                    "Round 3 chain step 1: ingest all round-2 outputs and isolate the best canonical code.\n\n"
+                    "Round 3 chain step 1: ingest all round-2 outputs and isolate the best canonical code.\n"
+                    f"{scope_guard}\n\n"
                     f"{round2_bundle}\n\nOriginal request:\n{job.prompt}"
                 ),
             )
@@ -1247,6 +1557,7 @@ async def _run_devflow_job(
                 status_message="Round-3 chain: model 2 refining with model 1 output.",
                 role_prompt=(
                     "Round 3 chain step 2: ingest all round-2 outputs plus model-1 round-3 output and produce improved code.\n\n"
+                    f"{scope_guard}\n\n"
                     f"{round2_bundle}\n\nModel1 round3 output:\n{round3_model1}\n\nOriginal request:\n{job.prompt}"
                 ),
             )
@@ -1258,6 +1569,7 @@ async def _run_devflow_job(
                 role_prompt=(
                     "Round 3 chain step 3: ingest all round-2 outputs plus model-1 and model-2 round-3 outputs. "
                     "Produce the final canonical code.\n\n"
+                    f"{scope_guard}\n\n"
                     f"{round2_bundle}\n\nModel1 round3 output:\n{round3_model1}\n\n"
                     f"Model2 round3 output:\n{round3_model2}\n\nOriginal request:\n{job.prompt}"
                 ),
@@ -1305,6 +1617,7 @@ async def _run_devflow_job(
                     "5) For FastAPI route handlers, explicitly mention HTTP method and route path in comment or docstring.\n"
                     "6) Do not emit placeholder text such as 'inline documentation for behavior and intent'.\n"
                     "7) Do not include prose outside the code block.\n"
+                    f"{scope_guard}\n"
                     "Self-check before responding: no duplicate consecutive comment lines and no missing function docstrings.\n\n"
                     f"{inline_doc_context}"
                 ),
@@ -1335,6 +1648,7 @@ async def _run_devflow_job(
                     "- Commit body: 3-6 bullets.\n"
                     "- Validation checklist: 4-8 bullets.\n"
                     "- Risk notes: 2-4 bullets.\n\n"
+                    f"{scope_guard}\n\n"
                     f"{git_notes_context}"
                 ),
                 retries=0,
@@ -1360,6 +1674,7 @@ async def _run_devflow_job(
                 status_message="Generating release notes.",
                 role_prompt=(
                     "Generate release notes for this generated code including highlights, compatibility, and risk notes.\n\n"
+                    f"{scope_guard}\n\n"
                     f"{final_code_context}"
                 ),
                 retries=0,
@@ -1410,6 +1725,45 @@ async def _run_devflow_job(
                     "download_url": f"/api/devflow/jobs/{job.job_id}/download",
                 }
             )
+        except asyncio.CancelledError:
+            cancel_reason = "Cancelled by user." if job.cancel_requested else "Cancelled."
+            job.status = "failed"
+            job.stage = "failed"
+            job.message = f"Programming workflow cancelled: {cancel_reason}"
+            job.error = cancel_reason
+            job.updated_at = _utc_now_iso()
+            job.finished_at = _utc_now_iso()
+            if job.outputs:
+                code_pack = build_code_pack_markdown(prompt=job.prompt, outputs=job.outputs)
+                documentation = build_documentation_markdown(prompt=job.prompt, outputs=job.outputs)
+                artifacts = write_devflow_artifacts(
+                    base_dir=devflow_config.artifact_dir,
+                    job=job,
+                    code_pack=code_pack,
+                    documentation=documentation,
+                )
+                job.artifacts = artifacts
+                job.run_dir = artifacts.get("run_dir")
+            if job.run_dir:
+                metadata_path = Path(job.run_dir) / "run_metadata.json"
+                metadata_path.write_text(
+                    json.dumps(_job_payload(job), indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                job.artifacts["metadata"] = str(metadata_path)
+            await _upsert_devflow_job(job)
+            await emit_event(
+                {
+                    "type": "devflow_error",
+                    **_job_payload(job),
+                    "download_url": (
+                        f"/api/devflow/jobs/{job.job_id}/download"
+                        if job.artifacts.get("zip")
+                        else None
+                    ),
+                }
+            )
+            return
         except Exception as exc:
             error_text = str(exc).strip() or "Unknown error"
             job.status = "failed"
@@ -1649,6 +2003,8 @@ async def service_info() -> dict[str, Any]:
             "delete_model": "/api/models/delete",
             "model_stores": "/api/model-stores",
             "model_store_search": "/api/model-stores/search?store_id=...&q=...",
+            "uploads": "/api/uploads",
+            "upload_delete": "/api/uploads/{upload_id}?actor_id=...",
             "profile_preferences": "/api/v1/profile/preferences",
             "profile_preferences_reset": "/api/v1/profile/preferences/reset",
             "admin_users": "/api/v1/admin/users",
@@ -1673,6 +2029,7 @@ async def service_info() -> dict[str, Any]:
             "profile_settings": True,
             "admin_settings": True,
             "programming_development_flow": devflow_config.enabled,
+            "file_upload_review": True,
             "filesystem_tools_enabled": settings.filesystem_tools_enabled,
             "terminal_tools_enabled": settings.terminal_tools_enabled,
             "workspace_root": settings.workspace_root,
@@ -1844,6 +2201,97 @@ async def model_store_search(store_id: str, q: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/uploads")
+async def upload_review_material(
+    actor_id: str = Form(default=settings.default_actor_id),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    clean_actor_id = _safe_actor_id(actor_id)
+    filename = Path(str(file.filename or "upload.bin")).name
+    raw_bytes = await file.read()
+    await file.close()
+
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw_bytes) > max(1024, settings.upload_max_bytes):
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Upload exceeds max size ({settings.upload_max_bytes} bytes). "
+                f"Received: {len(raw_bytes)} bytes."
+            ),
+        )
+
+    is_zip = filename.lower().endswith(".zip")
+    if is_zip:
+        context_text, file_count, included, skipped = _build_zip_context(filename, raw_bytes)
+        kind = "zip"
+    else:
+        context_text, file_count, included, skipped = _build_plain_file_context(filename, raw_bytes)
+        kind = "file"
+
+    upload_id = str(uuid.uuid4())
+    summary = (
+        f"{kind.upper()} '{filename}' uploaded. "
+        f"files={file_count}, included={included}, skipped={skipped}"
+    )
+    item = UploadedReviewContext(
+        upload_id=upload_id,
+        actor_id=clean_actor_id,
+        filename=filename,
+        kind=kind,
+        size_bytes=len(raw_bytes),
+        file_count=file_count,
+        included_files=included,
+        skipped_files=skipped,
+        summary=summary,
+        context_text=context_text,
+        created_at=_utc_now_iso(),
+    )
+    await _store_uploaded_context(item)
+
+    return {"upload": _upload_payload(item)}
+
+
+@app.get("/api/uploads")
+async def list_uploaded_materials(
+    actor_id: str = Query(default=settings.default_actor_id),
+) -> dict[str, Any]:
+    clean_actor_id = _safe_actor_id(actor_id)
+    items = await _list_uploaded_contexts(actor_id=clean_actor_id)
+    return {
+        "actor_id": clean_actor_id,
+        "count": len(items),
+        "uploads": [_upload_payload(item) for item in items],
+    }
+
+
+@app.delete("/api/uploads/{upload_id}")
+async def delete_uploaded_material(
+    upload_id: str,
+    actor_id: str = Query(default=settings.default_actor_id),
+) -> dict[str, Any]:
+    clean_actor_id = _safe_actor_id(actor_id)
+    item = await _delete_uploaded_context(upload_id=upload_id.strip(), actor_id=clean_actor_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Upload not found.")
+    return {"status": "deleted", "upload_id": item.upload_id}
+
+
+@app.delete("/api/uploads")
+async def clear_uploaded_materials(
+    actor_id: str = Query(default=settings.default_actor_id),
+) -> dict[str, Any]:
+    clean_actor_id = _safe_actor_id(actor_id)
+    async with uploaded_contexts_lock:
+        to_delete = [key for key, item in uploaded_contexts.items() if item.actor_id == clean_actor_id]
+        for key in to_delete:
+            uploaded_contexts.pop(key, None)
+    return {"status": "cleared", "actor_id": clean_actor_id, "deleted": len(to_delete)}
+
+
 @app.get("/ws/chat")
 async def chat_ws_http_hint() -> dict[str, Any]:
     return {
@@ -1876,6 +2324,9 @@ async def chat_ws_http_hint() -> dict[str, Any]:
         ],
         "local_tool_commands": ["/tools", "/ls", "/tree", "/find", "/read", "/summary", "/run", "/run!"],
         "chat_reasoning_mode": ["hidden", "summary", "full"],
+        "chat_optional_fields": {
+            "attachments": ["upload_id_1", "upload_id_2"],
+        },
     }
 
 
@@ -1969,6 +2420,48 @@ async def chat_ws(websocket: WebSocket) -> None:
                     continue
                 actor_id = _safe_actor_id(incoming.get("actor_id") or session.actor_id)
                 session.actor_id = actor_id
+                attachment_ids = _normalize_attachment_ids(incoming.get("attachments"))
+                attachment_context = ""
+                resolved_attachments: list[UploadedReviewContext] = []
+                if attachment_ids:
+                    (
+                        attachment_context,
+                        missing_attachment_ids,
+                        forbidden_attachment_ids,
+                        resolved_attachments,
+                    ) = await _resolve_attachment_context(
+                        actor_id=actor_id,
+                        attachment_ids=attachment_ids,
+                    )
+                    if missing_attachment_ids:
+                        await ws_send(
+                            {
+                                "type": "error",
+                                "message": (
+                                    "Attachment(s) not found: "
+                                    + ", ".join(sorted(missing_attachment_ids))
+                                ),
+                            }
+                        )
+                        continue
+                    if forbidden_attachment_ids:
+                        await ws_send(
+                            {
+                                "type": "error",
+                                "message": (
+                                    "Attachment(s) are not accessible for this actor: "
+                                    + ", ".join(sorted(forbidden_attachment_ids))
+                                ),
+                            }
+                        )
+                        continue
+                    if attachment_context:
+                        prompt = (
+                            f"{prompt}\n\n"
+                            "Uploaded project materials for review are attached below. "
+                            "Use them as primary source context for this workflow.\n\n"
+                            f"{attachment_context}"
+                        )
                 selected_model = (
                     _safe_text(incoming.get("selected_model"), field_name="selected_model")
                     if isinstance(incoming.get("selected_model"), str) and str(incoming.get("selected_model")).strip()
@@ -2017,6 +2510,16 @@ async def chat_ws(websocket: WebSocket) -> None:
                         **_job_payload(job),
                     }
                 )
+                if resolved_attachments:
+                    await ws_send(
+                        {
+                            "type": "info",
+                            "message": (
+                                f"Using {len(resolved_attachments)} uploaded file/ZIP context item(s) "
+                                "for this devflow run."
+                            ),
+                        }
+                    )
 
                 async def emit_devflow(payload: dict[str, Any]) -> None:
                     if not websocket_open:
@@ -2034,10 +2537,12 @@ async def chat_ws(websocket: WebSocket) -> None:
                     )
                 )
                 devflow_background_tasks.add(task)
+                devflow_job_tasks[job.job_id] = task
 
                 def _on_task_done(done_task: asyncio.Task[Any]) -> None:
                     nonlocal active_devflow_job_id
                     devflow_background_tasks.discard(done_task)
+                    devflow_job_tasks.pop(job.job_id, None)
                     if active_devflow_job_id == job.job_id:
                         active_devflow_job_id = None
 
@@ -2182,6 +2687,42 @@ async def chat_ws(websocket: WebSocket) -> None:
             except ValueError as exc:
                 await ws_send({"type": "error", "message": str(exc)})
                 continue
+            is_tool_prompt = prompt.strip().startswith("/")
+            attachment_ids = _normalize_attachment_ids(incoming.get("attachments"))
+            attachment_context = ""
+            resolved_attachments: list[UploadedReviewContext] = []
+            if attachment_ids and not is_tool_prompt:
+                (
+                    attachment_context,
+                    missing_attachment_ids,
+                    forbidden_attachment_ids,
+                    resolved_attachments,
+                ) = await _resolve_attachment_context(
+                    actor_id=session.actor_id,
+                    attachment_ids=attachment_ids,
+                )
+                if missing_attachment_ids:
+                    await ws_send(
+                        {
+                            "type": "error",
+                            "message": (
+                                "Attachment(s) not found: "
+                                + ", ".join(sorted(missing_attachment_ids))
+                            ),
+                        }
+                    )
+                    continue
+                if forbidden_attachment_ids:
+                    await ws_send(
+                        {
+                            "type": "error",
+                            "message": (
+                                "Attachment(s) are not accessible for this actor: "
+                                + ", ".join(sorted(forbidden_attachment_ids))
+                            ),
+                        }
+                    )
+                    continue
             profile_snapshot = admin_profile_store.get_preferences(session.actor_id)
             default_reasoning_mode = str(
                 profile_snapshot.preferences.get("chat", {}).get("reasoning_mode_default", "summary")
@@ -2202,12 +2743,29 @@ async def chat_ws(websocket: WebSocket) -> None:
             )
 
             request_id = str(uuid.uuid4())
-            session.messages.append({"role": "user", "content": prompt})
+            prompt_for_model = prompt
+            if attachment_context:
+                prompt_for_model = (
+                    f"{prompt}\n\n"
+                    "Uploaded file/ZIP context for review:\n"
+                    f"{attachment_context}\n\n"
+                    "Use this attached context to answer or review code."
+                )
+            session.messages.append({"role": "user", "content": prompt_for_model})
 
             await ws_send({"type": "start", "request_id": request_id})
+            if resolved_attachments:
+                await ws_send(
+                    {
+                        "type": "info",
+                        "message": (
+                            f"Using {len(resolved_attachments)} uploaded file/ZIP context item(s) in this reply."
+                        ),
+                    }
+                )
 
             assistant_chunks: list[str] = []
-            if prompt.strip().startswith("/"):
+            if is_tool_prompt:
                 try:
                     if tools is None:
                         raise WorkspaceToolError("Local tools are unavailable in this session.")

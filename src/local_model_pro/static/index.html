@@ -653,6 +653,22 @@
               When enabled, Send starts a Devflow run from this chat prompt.
             </div>
           </div>
+          <div class="upload-toolbar">
+            <input
+              id="reviewUploadInput"
+              class="visually-hidden-input"
+              type="file"
+              multiple
+              accept=".zip,.py,.md,.txt,.json,.yaml,.yml,.toml,.ini,.cfg,.conf,.xml,.csv,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.sql,.sh,.bash,.zsh,.go,.rs,.java,.kt,.c,.h,.hpp,.cpp,.cc,.swift,.rb,.php,.pl,.vue,.svelte"
+            />
+            <button id="reviewUploadPickBtn" class="tool-action secondary" type="button">
+              Pick Files/ZIP
+            </button>
+            <button id="reviewUploadBtn" class="tool-action" type="button">Upload</button>
+            <button id="clearUploadsBtn" class="tool-action secondary" type="button">Clear</button>
+          </div>
+          <div id="uploadMeta" class="field-help">No uploaded files attached.</div>
+          <div id="uploadList" class="upload-list"></div>
           <form id="chatForm" class="composer">
             <textarea
               id="promptInput"
